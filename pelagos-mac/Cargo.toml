@@ -15,4 +15,5 @@ serde_json.workspace = true
 log.workspace = true
 env_logger.workspace = true
 thiserror.workspace = true
-clap = { version = "3", features = ["derive"] }
+libc.workspace = true
+clap = { version = "4", features = ["derive", "env"] }

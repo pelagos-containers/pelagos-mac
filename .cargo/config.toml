@@ -1,0 +1,16 @@
+# Cargo workspace configuration for pelagos-mac.
+#
+# Host (macOS):
+#   cargo build -p pelagos-mac --release
+#
+# Guest (Linux ARM64) — must use rustup's cargo, not Homebrew's:
+#   PATH=~/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/opt/homebrew/bin:/usr/bin:$PATH \
+#     cargo zigbuild -p pelagos-guest --target aarch64-unknown-linux-gnu --release
+#
+# Why the explicit PATH: Homebrew installs its own cargo/rustc that lacks the
+# rustup cross-compilation sysroots.  cargo-zigbuild must run under rustup's
+# cargo so it can find ~/.rustup/toolchains/.../lib/rustlib/aarch64-unknown-linux-gnu.
+
+# macOS host builds default to the native target.
+[build]
+target = "aarch64-apple-darwin"

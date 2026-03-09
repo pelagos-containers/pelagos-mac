@@ -6,9 +6,11 @@ description = "Apple Virtualization Framework bindings for pelagos-mac"
 
 # macOS only — will not compile on Linux
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.5"
-objc2-foundation = { version = "0.2", features = ["all"] }
-objc2-virtualization = { version = "0.2", features = ["all"] }
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["alloc"] }
+objc2-virtualization = { version = "0.3", features = ["alloc"] }
+block2 = "0.6"
+dispatch2 = "0.3"
 
 [dependencies]
 serde.workspace = true

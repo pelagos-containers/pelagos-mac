@@ -6,12 +6,16 @@
 
 ## Current State
 
-Repo scaffolded. Cargo workspace created with three crates:
-- `pelagos-vz` — AVF binding layer (stub, `todo!()`)
-- `pelagos-guest` — vsock daemon (protocol types defined, main is `todo!()`)
-- `pelagos-mac` — macOS CLI (stub, `todo!()`)
+Tasks 0.1–0.6 implemented. All host and guest crates compile clean (zero warnings,
+clippy -D warnings). Release binaries build for both targets.
 
-No code has been executed on macOS yet. The pilot phase has not started.
+**Key implementation decisions made:**
+- vsock access is in-process via `VZVirtioSocketDevice::connectToPort` (AVF API),
+  not a filesystem Unix socket. `VmConfig.vsock_socket` field removed.
+- Cross-compilation requires rustup's cargo (not Homebrew's) — documented in
+  `.cargo/config.toml` and in `scripts/build-vm-image.sh`.
+
+**Not yet run on macOS hardware.** The pilot phase has not been executed end-to-end.
 
 ---
 
@@ -21,76 +25,84 @@ No code has been executed on macOS yet. The pilot phase has not started.
 `objc2-virtualization` and round-trip a vsock command to a Rust guest daemon.
 
 **Success criteria:**
-- `pelagos-mac run alpine /bin/echo hello` prints "hello" on the macOS terminal
+- `pelagos --kernel out/vmlinuz --initrd out/initramfs.gz --disk out/root.img run alpine /bin/echo hello` prints "hello" on the macOS terminal
 - No Go binary involved at any layer
 - virtiofsd file sharing: a host directory is visible inside the VM
 
-### Task 0.1 — Verify objc2-virtualization crate versions
+### Task 0.1 — ✅ Verify objc2-virtualization crate versions
 
-Check current versions of `objc2`, `objc2-foundation`, `objc2-virtualization` on
-crates.io. Update `pelagos-vz/Cargo.toml` with correct versions. Confirm the crate
-exposes `VZVirtualMachine`, `VZLinuxBootLoader`, `VZVirtioSocketDevice`.
+Versions pinned: `objc2 0.6`, `objc2-foundation 0.3`, `objc2-virtualization 0.3`,
+`block2 0.6`, `dispatch2 0.3`.
 
-### Task 0.2 — Implement pelagos-vz: boot a minimal Linux VM
+All required AVF types confirmed present in objc2-virtualization 0.3.2:
+`VZVirtualMachine`, `VZLinuxBootLoader`, `VZVirtioSocketDevice`,
+`VZVirtioFileSystemDeviceConfiguration`, `VZNATNetworkDeviceAttachment`, etc.
 
-Implement `Vm::start()` in `pelagos-vz/src/vm.rs` using `objc2-virtualization`:
+### Task 0.2 — ✅ Implement pelagos-vz: boot a minimal Linux VM
 
-1. Create `VZLinuxBootLoader` with kernel path, initrd path, command line
-2. Create `VZVirtualMachineConfiguration` with CPU count and memory
-3. Add `VZVirtioBlockDeviceConfiguration` for the disk
-4. Add `VZVirtioNetworkDeviceConfiguration` with NAT attachment
-5. Add `VZVirtioSocketDeviceConfiguration` for vsock
-6. Validate configuration, instantiate `VZVirtualMachine`
-7. Start the VM on a dispatch queue; wait for started state
+`pelagos-vz/src/vm.rs` fully implemented:
+- `VmConfig` / `VmConfigBuilder` — ergonomic configuration API
+- `Vm::start()` — creates all AVF devices, validates configuration,
+  instantiates `VZVirtualMachine` with a private serial dispatch queue,
+  calls `startWithCompletionHandler`, blocks on a condvar until callback fires
+- `Vm::connect_vsock()` — in-process vsock connect via `VZVirtioSocketDevice`,
+  returns an `OwnedFd` ready for JSON I/O
+- `Vm::stop()` — clean shutdown via `stopWithCompletionHandler`
 
-Reference: `Code-Hex/vz` Go bindings — `vz.go`, `virtualization_13.m` for the ObjC
-call sequence.
+Key pattern: AVF async callbacks bridged to sync Rust via `Arc<Mutex<Option<Result>>>` +
+`Arc<Condvar>`, dispatched through the VM's serial `DispatchQueue`.
 
-**VM image needed:** a minimal Alpine Linux ARM64 disk image with:
-- Static kernel (extract from Alpine ISO or build with buildroot)
-- pelagos-guest binary at `/usr/local/bin/pelagos-guest`
-- init script that starts pelagos-guest on boot
-- pelagos binary at `/usr/local/bin/pelagos`
+### Task 0.3 — ✅ Implement pelagos-guest: vsock listener
 
-See `scripts/build-vm-image.sh` (to be written).
+`pelagos-guest/src/main.rs` fully implemented:
+- AF_VSOCK listener using `libc` directly (Linux only, with macOS stubs for cargo check)
+- JSON command dispatch for `GuestCommand::Run` and `GuestCommand::Ping`
+- `Run`: spawns `pelagos run <image>`, streams stdout/stderr via mpsc channel,
+  writes `{"exit": N}` as terminal message
+- `Ping`: responds `{"pong": true}`
+- Cross-compiled to `aarch64-unknown-linux-gnu` via `cargo-zigbuild`
 
-### Task 0.3 — Implement pelagos-guest: vsock listener
+### Task 0.4 — ✅ Implement vsock client in pelagos-mac
 
-Implement `main()` in `pelagos-guest/src/main.rs`:
+Implemented in `pelagos-mac/src/main.rs` as `run_command()` and `ping_command()`:
+- Calls `vm.connect_vsock()` to get an OwnedFd
+- Serializes `GuestCommand` as newline-delimited JSON
+- Reads `GuestResponse` stream, relays stdout/stderr to terminal
+- Returns the container's exit code
 
-1. Open `AF_VSOCK` socket, bind to `VSOCK_PORT` (1024), listen
-2. For each accepted connection:
-   - Read newline-delimited JSON `GuestCommand`
-   - Dispatch: `Ping` → write `{"pong":true}\n`; `Run` → spawn pelagos, stream output
-3. For `Run`: fork `pelagos run <image> -- <args>` with the given env
-4. Stream stdout/stderr as `{"stream":"stdout","data":"..."}\n`
-5. Write `{"exit":<code>}\n` on process exit
+### Task 0.5 — ✅ Wire up the CLI
 
-Cross-compile and test inside a QEMU VM before baking into disk image.
+`pelagos-mac/src/main.rs` — clap 4 derive CLI:
+- `pelagos --kernel K --initrd I --disk D [--memory M] [--cpus N] run <image> [args...]`
+- `pelagos ... ping`
+- Boots VM on startup; no PID-file persistence yet (each invocation boots a fresh VM)
 
-### Task 0.4 — Implement vsock client in pelagos-mac
+**PID-file / persistent VM deferred to Phase 1.**
 
-Implement the host-side vsock client that:
-1. Connects to the Unix socket exposed by AVF for the vsock device
-2. Serializes a `GuestCommand::Run` as JSON, writes with newline
-3. Reads the response stream, prints stdout/stderr to the terminal
-4. Returns the exit code
-
-### Task 0.5 — Wire up the CLI
-
-Minimal `pelagos run <image> [args...]` subcommand:
-1. Boot the VM if not already running (check for PID file)
-2. Connect over vsock
-3. Send `GuestCommand::Run`, relay output, exit with container's exit code
-
-### Task 0.6 — Build VM image script
+### Task 0.6 — ✅ Build VM image script
 
 `scripts/build-vm-image.sh`:
-- Downloads Alpine Linux ARM64 minimal ISO
-- Extracts kernel + initrd
-- Creates a raw disk image, installs Alpine
-- Copies pelagos-guest + pelagos binaries
-- Installs startup service
+- Downloads Alpine Linux ARM64 virt ISO
+- Extracts kernel + initrd via hdiutil (macOS) or 7z
+- Creates 2 GiB raw disk image
+- Documents manual Alpine setup steps (QEMU-based automated install also scaffolded)
+- Copies pelagos-guest binary and installs OpenRC service
+
+**Remaining manual step:** run `scripts/build-vm-image.sh` to produce `out/{vmlinuz,initramfs.gz,root.img}`.
+Requires: `brew install qemu` and a completed Alpine install into the disk image.
+
+---
+
+## Next Steps Before Pilot Validation
+
+1. **Run `scripts/build-vm-image.sh`** — produces the VM disk image artifacts
+2. **Code-sign pelagos binary** with `com.apple.security.virtualization` entitlement
+3. **Test end-to-end:**
+   ```bash
+   pelagos --kernel out/vmlinuz --initrd out/initramfs.gz --disk out/root.img ping
+   pelagos --kernel out/vmlinuz --initrd out/initramfs.gz --disk out/root.img run alpine /bin/echo hello
+   ```
+4. **Fix runtime issues** (expected: boot parameters, vsock timing, device naming)
 
 ---
 
@@ -98,6 +110,7 @@ Minimal `pelagos run <image> [args...]` subcommand:
 
 After Phase 0 is validated:
 
+- PID file / persistent VM (don't reboot on every invocation)
 - virtiofs bind mounts in `pelagos run -v host:container`
 - Rosetta for x86_64 images
 - VM lifecycle management (persistent VM, auto-boot, clean shutdown)
@@ -111,12 +124,14 @@ After Phase 0 is validated:
 ## Notes and Risks
 
 - `objc2-virtualization` is auto-generated from Xcode SDK headers — complete but not
-  ergonomic. Expect to write thin wrapper methods around raw ObjC calls.
+  ergonomic. The `pelagos-vz` wrapper handles the boilerplate.
 - The `com.apple.security.virtualization` entitlement is required. Ad-hoc signing
   works for development; check the Xcode entitlement plist format early.
 - virtiofsd (host side) must be running before the VM tries to mount. Coordinate
-  startup order carefully.
-- The vsock device in AVF is exposed as a Unix domain socket on the host. The path is
-  configured at VM creation time and must be cleaned up between runs.
+  startup order carefully. (virtiofsd not yet wired in — Phase 1 item.)
+- vsock connect: `VZVirtioSocketDevice::connectToPort_completionHandler` connects
+  host→guest. The guest must already be listening when the host connects — add a
+  retry/backoff loop in `connect_vsock()` after pilot validation.
 - macOS 13.5+ required for full feature set (virtiofs, Rosetta, EFI boot).
-  macOS 12 fallback (drop virtiofs + Rosetta) is possible but deferred.
+- Cross-compilation note: use rustup's cargo (not Homebrew's) for the Linux guest.
+  See `.cargo/config.toml` for the exact command.

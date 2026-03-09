@@ -12,8 +12,4 @@ serde.workspace = true
 serde_json.workspace = true
 log.workspace = true
 env_logger.workspace = true
-
-# vsock on Linux: AF_VSOCK via nix
-[target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.31", features = ["net", "process", "signal"] }
-libc = "*"
+libc.workspace = true
