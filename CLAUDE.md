@@ -118,6 +118,27 @@ For distribution, a Developer ID signature + notarization is required.
 
 ---
 
+## Git Workflow
+
+**Feature branch workflow — never push directly to `master`.**
+
+For every task, fix, or meaningful change:
+
+1. Create a branch from `master`:
+   ```bash
+   git checkout master && git pull
+   git checkout -b <type>/<short-description>
+   # e.g. fix/vsock-fd-lifetime, feat/virtiofs-mount, chore/update-deps
+   ```
+2. Commit work on the branch (one or more commits).
+3. Open a PR against `master` via `gh pr create`.
+4. Reference any related issues in the PR body (`Closes #N`).
+5. Merge via the PR (squash or merge commit — either is fine).
+
+Branch naming: `feat/`, `fix/`, `chore/`, `docs/` prefixes.
+
+---
+
 ## File Placement Rules
 
 - **Documentation / design docs** → `docs/`
@@ -143,11 +164,11 @@ WebFetch — use them freely without asking.
 
 ### User Macros
 
-**"Make it so!"** — Clean up, comment, commit, and push:
+**"Make it so!"** — Clean up, comment, commit, and open a PR:
 1. Remove any temporary debug code or dead comments
 2. Ensure `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` pass
-3. Commit with a descriptive message
-4. Push to remote
+3. Commit with a descriptive message on the current feature branch
+4. Push the branch and open a PR against `master` via `gh pr create`
 
 **"So Long and Thanks for all the Fish"** — Wrap up session, document state, commit, push:
 1. Update `ONGOING_TASKS.md` with current date, git SHA, what was completed, what remains
