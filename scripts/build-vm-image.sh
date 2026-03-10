@@ -45,10 +45,8 @@ PELAGOS_BIN="$WORK/pelagos-aarch64-linux"
 PELAGOS_URL="https://github.com/skeptomai/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-aarch64-linux"
 
 # Mozilla CA bundle — needed by the statically-linked musl pelagos binary for TLS.
-# Prefer the Homebrew-managed bundle; fall back to downloading from curl.se.
-CA_BUNDLE_SRC="/opt/homebrew/share/ca-certificates/cacert.pem"
-CA_BUNDLE_URL="https://curl.se/ca/cacert.pem"
-CA_BUNDLE="$WORK/cacert.pem"
+# Sourced from certs/cacert.pem in this repo (update with scripts/update-certs.sh).
+CA_BUNDLE="$SCRIPT_DIR/../certs/cacert.pem"
 
 # ---------------------------------------------------------------------------
 echo "[1/8] Setting up output directories"
@@ -161,16 +159,10 @@ fi
 echo "[6/8] Staging Mozilla CA bundle (for TLS inside VM)"
 # ---------------------------------------------------------------------------
 if [ ! -f "$CA_BUNDLE" ]; then
-    if [ -f "$CA_BUNDLE_SRC" ]; then
-        cp "$CA_BUNDLE_SRC" "$CA_BUNDLE"
-        echo "  Copied from Homebrew: $CA_BUNDLE"
-    else
-        curl -L --progress-bar -o "$CA_BUNDLE" "$CA_BUNDLE_URL"
-        echo "  Downloaded: $CA_BUNDLE"
-    fi
-else
-    echo "  (cached: $CA_BUNDLE)"
+    echo "ERROR: certs/cacert.pem not found. Run scripts/update-certs.sh to fetch it." >&2
+    exit 1
 fi
+echo "  (using repo bundle: $CA_BUNDLE)"
 
 # ---------------------------------------------------------------------------
 echo "[7/8] Building custom initramfs"
