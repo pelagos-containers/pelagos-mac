@@ -102,9 +102,12 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
         let cmd: GuestCommand = match serde_json::from_str(&line) {
             Ok(c) => c,
             Err(e) => {
-                send_response(&mut writer, &GuestResponse::Error {
-                    error: format!("parse error: {}", e),
-                })?;
+                send_response(
+                    &mut writer,
+                    &GuestResponse::Error {
+                        error: format!("parse error: {}", e),
+                    },
+                )?;
                 continue;
             }
         };

@@ -189,7 +189,7 @@ fn run_command(vm: &Vm, image: String, args: Vec<String>) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::GuestResponse;
+    use super::{GuestCommand, GuestResponse};
 
     #[test]
     fn pong_deserializes() {
@@ -199,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_deserializes() {
+    fn stream_stdout_deserializes() {
         let json = r#"{"stream":{"stream":"stdout","data":"hello\n"}}"#;
         let resp: GuestResponse = serde_json::from_str(json).expect("parse failed");
         match resp {
@@ -212,10 +212,64 @@ mod tests {
     }
 
     #[test]
+    fn stream_stderr_deserializes() {
+        let json = r#"{"stream":{"stream":"stderr","data":"error\n"}}"#;
+        let resp: GuestResponse = serde_json::from_str(json).expect("parse failed");
+        match resp {
+            GuestResponse::Stream { stream, data } => {
+                assert_eq!(stream, "stderr");
+                assert_eq!(data, "error\n");
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
     fn exit_deserializes() {
         let json = r#"{"exit":{"exit":0}}"#;
         let resp: GuestResponse = serde_json::from_str(json).expect("parse failed");
         assert!(matches!(resp, GuestResponse::Exit { exit: 0 }));
+    }
+
+    #[test]
+    fn exit_nonzero_deserializes() {
+        let json = r#"{"exit":{"exit":127}}"#;
+        let resp: GuestResponse = serde_json::from_str(json).expect("parse failed");
+        assert!(matches!(resp, GuestResponse::Exit { exit: 127 }));
+    }
+
+    #[test]
+    fn run_command_serializes() {
+        let cmd = GuestCommand::Run {
+            image: "alpine".into(),
+            args: vec!["/bin/echo".into(), "hello".into()],
+        };
+        let json = serde_json::to_string(&cmd).expect("serialize failed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "run");
+        assert_eq!(v["image"], "alpine");
+        assert_eq!(v["args"][0], "/bin/echo");
+        assert_eq!(v["args"][1], "hello");
+    }
+
+    #[test]
+    fn ping_command_serializes() {
+        let cmd = GuestCommand::Ping;
+        let json = serde_json::to_string(&cmd).expect("serialize failed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "ping");
+    }
+
+    /// Integration test: requires VM image artifacts in out/ and code-signed binary.
+    ///
+    /// Run with:
+    ///   PELAGOS_KERNEL=out/vmlinuz PELAGOS_INITRD=out/initramfs-custom.gz \
+    ///   PELAGOS_DISK=out/root.img cargo test -- --ignored run_echo_hello
+    #[test]
+    #[ignore]
+    fn run_echo_hello() {
+        // This test is a manual execution guide; the actual run is validated
+        // interactively. See ONGOING_TASKS.md for the full test command.
     }
 }
 

@@ -10,6 +10,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchQueueAttr};
 use objc2::{rc::Retained, AnyThread};
+use objc2_foundation::NSFileHandle;
 use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 use objc2_virtualization::{
     VZDirectorySharingDeviceConfiguration, VZDiskImageStorageDeviceAttachment,
@@ -22,7 +23,6 @@ use objc2_virtualization::{
     VZVirtioNetworkDeviceConfiguration, VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration,
     VZVirtualMachine, VZVirtualMachineConfiguration,
 };
-use objc2_foundation::NSFileHandle;
 use std::os::fd::FromRawFd;
 
 // ---------------------------------------------------------------------------
@@ -377,11 +377,12 @@ unsafe fn start_vm(config: VmConfig) -> Result<Vm, crate::Error> {
     // 9. Virtio serial console → guest's hvc0 → host stderr.
     //    This lets us see kernel boot messages and init script output for debugging.
     let stderr_fh = NSFileHandle::fileHandleWithStandardError();
-    let serial_attach = VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
-        VZFileHandleSerialPortAttachment::alloc(),
-        None,           // no host→guest input
-        Some(&stderr_fh),
-    );
+    let serial_attach =
+        VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+            VZFileHandleSerialPortAttachment::alloc(),
+            None, // no host→guest input
+            Some(&stderr_fh),
+        );
     let serial_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
     serial_port.setAttachment(Some(&*serial_attach));
     let serial_ref: &VZSerialPortConfiguration = &serial_port;
@@ -421,10 +422,14 @@ unsafe fn start_vm(config: VmConfig) -> Result<Vm, crate::Error> {
                 let desc = e.localizedDescription();
                 let domain = e.domain();
                 let code = e.code();
-                let reason = e.localizedFailureReason()
+                let reason = e
+                    .localizedFailureReason()
                     .map(|s| s.to_string())
                     .unwrap_or_default();
-                Err(format!("[{} {}] {} | reason: {}", domain, code, desc, reason))
+                Err(format!(
+                    "[{} {}] {} | reason: {}",
+                    domain, code, desc, reason
+                ))
             });
             c3.notify_one();
         });
