@@ -35,7 +35,7 @@ ALPINE_ARCH="aarch64"
 ALPINE_ISO="alpine-virt-${ALPINE_VERSION}.0-${ALPINE_ARCH}.iso"
 ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/releases/${ALPINE_ARCH}/${ALPINE_ISO}"
 
-GUEST_BIN="$REPO_ROOT/target/aarch64-unknown-linux-gnu/release/pelagos-guest"
+GUEST_BIN="$REPO_ROOT/target/aarch64-unknown-linux-musl/release/pelagos-guest"
 DISK_IMG="$OUT/root.img"
 INITRAMFS_OUT="$OUT/initramfs-custom.gz"
 KERNEL_OUT="$OUT/vmlinuz"
@@ -69,16 +69,25 @@ if [ ! -f "$KERNEL_OUT" ] || [ ! -f "$WORK/initramfs-virt" ]; then
     RAW_VZ="$ISO_BOOT/boot/vmlinuz-virt"
 
     # Alpine 6.x kernels use arm64 zboot format: an EFI/PE stub ("MZ"+"zimg" magic)
-    # that wraps a gzip-compressed arm64 Image. VZLinuxBootLoader does not support
-    # zboot; extract the embedded gzip payload (a plain gzip'd arm64 Image) instead.
+    # that wraps a gzip-compressed arm64 Image. VZLinuxBootLoader on macOS 26+ does not
+    # accept gzip-compressed kernels; extract the zboot payload and decompress to a raw
+    # arm64 Image (starts with MZ magic + ARMd at 0x38).
     if python3 - "$RAW_VZ" "$KERNEL_OUT" <<'PY'
-import struct, sys, shutil
+import struct, sys, shutil, gzip
 src, dst = sys.argv[1], sys.argv[2]
 with open(src, 'rb') as f:
     hdr = f.read(32)
 if hdr[4:8] != b'zimg':
-    shutil.copy(src, dst)
-    print(f"  kernel format: plain arm64 Image / gzip")
+    # Not zboot; check if it's gzip-compressed and decompress if so.
+    if hdr[:2] == b'\x1f\x8b':
+        with open(src, 'rb') as f:
+            raw = gzip.decompress(f.read())
+        with open(dst, 'wb') as f:
+            f.write(raw)
+        print(f"  kernel format: gzip → raw arm64 Image ({len(raw)//1024//1024} MiB)")
+    else:
+        shutil.copy(src, dst)
+        print(f"  kernel format: plain arm64 Image")
     sys.exit(0)
 offset = struct.unpack_from('<I', hdr, 8)[0]
 size   = struct.unpack_from('<I', hdr, 12)[0]
@@ -87,8 +96,11 @@ print(f"  zboot kernel: {comp}-compressed payload at offset {offset}, {size} byt
 with open(src, 'rb') as f:
     f.seek(offset)
     payload = f.read(size)
+# Decompress the payload (gzip) to get the raw arm64 Image.
+raw = gzip.decompress(payload)
 with open(dst, 'wb') as f:
-    f.write(payload)
+    f.write(raw)
+print(f"  decompressed: {len(raw)//1024//1024} MiB raw arm64 Image")
 PY
     then
         : # python3 handled the copy/extraction
@@ -117,7 +129,7 @@ if [ ! -f "$GUEST_BIN" ]; then
         "$RUSTUP_CARGO" zigbuild \
             --manifest-path "$REPO_ROOT/Cargo.toml" \
             -p pelagos-guest \
-            --target aarch64-unknown-linux-gnu \
+            --target aarch64-unknown-linux-musl \
             --release
     echo "  Built: $GUEST_BIN"
 else
@@ -128,36 +140,59 @@ fi
 echo "[5/6] Building custom initramfs"
 # ---------------------------------------------------------------------------
 if [ ! -f "$INITRAMFS_OUT" ]; then
-    ADDITIONS="$WORK/additions"
-    rm -rf "$ADDITIONS"
-    mkdir -p "$ADDITIONS/proc" \
-             "$ADDITIONS/sys" \
-             "$ADDITIONS/dev" \
-             "$ADDITIONS/usr/local/bin"
+    KVER="6.12.1-3-virt"
 
-    # Custom init script — runs as PID 1 when the kernel uses rdinit=/pelagos-init.
-    cat > "$ADDITIONS/pelagos-init" <<'INIT_EOF'
+    # --- Extract vsock modules from the modloop squashfs ---
+    MODLOOP="$WORK/modloop-virt"
+    if [ ! -f "$MODLOOP" ]; then
+        bsdtar -xf "$WORK/$ALPINE_ISO" -C "$WORK" boot/modloop-virt
+        mv "$WORK/boot/modloop-virt" "$MODLOOP"
+        rmdir "$WORK/boot" 2>/dev/null || true
+    fi
+    MODLOOP_DIR="$WORK/modloop_extracted"
+    if [ ! -d "$MODLOOP_DIR/modules" ]; then
+        rm -rf "$MODLOOP_DIR"
+        unsquashfs -force -d "$MODLOOP_DIR" "$MODLOOP" 2>/dev/null || true
+    fi
+    VSOCK_SRC="$MODLOOP_DIR/modules/$KVER/kernel/net/vmw_vsock"
+
+    # --- Extract the Alpine initramfs and patch it in-place ---
+    # bsdtar handles all Alpine's special files (symlinks, device nodes, etc.)
+    # macOS can't create /dev device nodes without root; that's fine — our init
+    # mounts devtmpfs which recreates them from the kernel at boot.
+    INITRD_TMP="$WORK/initramfs_tmp"
+    rm -rf "$INITRD_TMP"
+    mkdir -p "$INITRD_TMP"
+    bsdtar -xpf "$WORK/initramfs-virt" -C "$INITRD_TMP" 2>/dev/null || true
+
+    # Add vsock modules
+    mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/net/vmw_vsock"
+    for ko in vsock.ko vmw_vsock_virtio_transport_common.ko vmw_vsock_virtio_transport.ko; do
+        if [ -f "$VSOCK_SRC/$ko" ]; then
+            cp "$VSOCK_SRC/$ko" "$INITRD_TMP/lib/modules/$KVER/kernel/net/vmw_vsock/$ko"
+        else
+            echo "  WARNING: $ko not found — vsock may not work" >&2
+        fi
+    done
+
+    # Add guest daemon
+    mkdir -p "$INITRD_TMP/usr/local/bin"
+    cp "$GUEST_BIN" "$INITRD_TMP/usr/local/bin/pelagos-guest"
+    chmod 755 "$INITRD_TMP/usr/local/bin/pelagos-guest"
+
+    # Replace /init: mounts vfs, loads vsock modules, execs pelagos-guest.
+    # Without root= in cmdline the kernel uses the initramfs as root and runs /init.
+    cat > "$INITRD_TMP/init" <<INIT_EOF
 #!/bin/sh
-mount -t proc proc /proc 2>/dev/null || true
-mount -t sysfs sysfs /sys 2>/dev/null || true
-mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
-sleep 1
+busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vsock.ko 2>/dev/null || true
+busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko 2>/dev/null || true
+busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko 2>/dev/null || true
 exec /usr/local/bin/pelagos-guest
 INIT_EOF
-    chmod 755 "$ADDITIONS/pelagos-init"
+    chmod 755 "$INITRD_TMP/init"
 
-    # Guest daemon binary.
-    cp "$GUEST_BIN" "$ADDITIONS/usr/local/bin/pelagos-guest"
-    chmod 755 "$ADDITIONS/usr/local/bin/pelagos-guest"
-
-    # Create the additions as an uncompressed newc cpio archive.
-    ADDITIONS_CPIO="$WORK/additions.cpio"
-    (cd "$ADDITIONS" && bsdtar --format=newc -cf - .) > "$ADDITIONS_CPIO"
-
-    # Concatenate: Alpine initramfs + our additions.
-    # The kernel processes each cpio archive in the concatenated stream in order;
-    # later files overwrite earlier ones if they have the same path.
-    cat "$WORK/initramfs-virt" "$ADDITIONS_CPIO" > "$INITRAMFS_OUT"
+    # Repack as a single gzip'd newc cpio (no concatenation needed).
+    (cd "$INITRD_TMP" && bsdtar --format=newc -cf - .) | gzip -9 > "$INITRAMFS_OUT"
 
     echo "  initramfs: $INITRAMFS_OUT"
 else
@@ -184,3 +219,4 @@ echo "  initramfs: $INITRAMFS_OUT"
 echo "  disk:      $DISK_IMG"
 echo ""
 echo "Next: make build && make sign && make test-e2e"
+echo "(kernel cmdline: console=hvc0  — no root=, initramfs is root, /init is pelagos)"

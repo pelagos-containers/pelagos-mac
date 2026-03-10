@@ -12,8 +12,8 @@
 //! Response (guest → host): `{"stream":"stdout","data":"hello\n"}` …
 //!                           `{"exit":0}`
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::io::{FromRawFd, OwnedFd};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::io::OwnedFd;
 use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
@@ -58,7 +58,6 @@ pub enum StreamKind {
 
 fn main() {
     env_logger::init();
-
     let listener = create_vsock_listener(VSOCK_PORT).expect("failed to create vsock listener");
     log::info!("pelagos-guest listening on vsock port {}", VSOCK_PORT);
 
@@ -70,11 +69,10 @@ fn main() {
                 continue;
             }
         };
-        std::thread::spawn(move || {
-            if let Err(e) = handle_connection(conn_fd) {
-                log::error!("connection handler error: {}", e);
-            }
-        });
+        log::debug!("accepted connection");
+        if let Err(e) = handle_connection(conn_fd) {
+            log::error!("connection handler error: {}", e);
+        }
     }
 }
 
@@ -82,16 +80,19 @@ fn main() {
 // Connection handler
 // ---------------------------------------------------------------------------
 
-fn handle_connection(fd: OwnedFd) -> std::io::Result<()> {
-    use std::os::unix::io::IntoRawFd;
-    let raw = fd.into_raw_fd();
-    // Duplicate the fd so we can have separate read and write halves.
-    let write_fd = unsafe { libc::dup(raw) };
-    if write_fd < 0 {
-        return Err(std::io::Error::last_os_error());
+fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
+    // RAII guard — closes fd on all exit paths (early returns, ? propagation).
+    struct ConnFd(libc::c_int);
+    impl Drop for ConnFd {
+        fn drop(&mut self) {
+            unsafe { libc::close(self.0) };
+        }
     }
-    let reader = BufReader::new(unsafe { std::fs::File::from_raw_fd(raw) });
-    let mut writer = unsafe { std::fs::File::from_raw_fd(write_fd) };
+    let _guard = ConnFd(fd);
+
+    // FdReader/FdWriter use libc::read/write directly — no OwnedFd involved.
+    let reader = BufReader::new(FdReader(fd));
+    let mut writer = FdWriter(fd);
 
     for line in reader.lines() {
         let line = line?;
@@ -101,17 +102,16 @@ fn handle_connection(fd: OwnedFd) -> std::io::Result<()> {
         let cmd: GuestCommand = match serde_json::from_str(&line) {
             Ok(c) => c,
             Err(e) => {
-                let resp = GuestResponse::Error {
+                send_response(&mut writer, &GuestResponse::Error {
                     error: format!("parse error: {}", e),
-                };
-                send_response(&mut writer, &resp)?;
+                })?;
                 continue;
             }
         };
-
         match cmd {
             GuestCommand::Ping => {
                 send_response(&mut writer, &GuestResponse::Pong { pong: true })?;
+                return Ok(());
             }
             GuestCommand::Run { image, args, env } => {
                 run_container(&mut writer, &image, &args, &env)?;
@@ -227,6 +227,37 @@ fn run_container(
     Ok(())
 }
 
+/// Reads directly from a raw fd using libc::read — no OwnedFd or File involved.
+struct FdReader(libc::c_int);
+
+impl Read for FdReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = unsafe { libc::read(self.0, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+}
+
+/// Writes directly to a raw fd using libc::write — no OwnedFd or File involved.
+struct FdWriter(libc::c_int);
+
+impl Write for FdWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = unsafe { libc::write(self.0, buf.as_ptr() as *const libc::c_void, buf.len()) };
+        if n < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn send_response(writer: &mut impl Write, resp: &GuestResponse) -> std::io::Result<()> {
     let mut json = serde_json::to_string(resp).map_err(std::io::Error::other)?;
     json.push('\n');
@@ -278,7 +309,7 @@ fn create_vsock_listener(port: u32) -> std::io::Result<OwnedFd> {
 }
 
 #[cfg(target_os = "linux")]
-fn accept_vsock(listener: &OwnedFd) -> std::io::Result<OwnedFd> {
+fn accept_vsock(listener: &OwnedFd) -> std::io::Result<libc::c_int> {
     use std::os::unix::io::AsRawFd;
     let fd = unsafe {
         libc::accept4(
@@ -291,7 +322,7 @@ fn accept_vsock(listener: &OwnedFd) -> std::io::Result<OwnedFd> {
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    Ok(fd)
 }
 
 // Stub for non-Linux builds (e.g. cargo check on macOS).
@@ -304,7 +335,7 @@ fn create_vsock_listener(_port: u32) -> std::io::Result<OwnedFd> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn accept_vsock(_listener: &OwnedFd) -> std::io::Result<OwnedFd> {
+fn accept_vsock(_listener: &OwnedFd) -> std::io::Result<libc::c_int> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "AF_VSOCK is Linux-only",

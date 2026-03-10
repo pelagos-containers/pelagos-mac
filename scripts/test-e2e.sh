@@ -14,7 +14,7 @@ KERNEL="$REPO_ROOT/out/vmlinuz"
 INITRD="$REPO_ROOT/out/initramfs-custom.gz"
 DISK="$REPO_ROOT/out/root.img"
 BINARY="$REPO_ROOT/target/aarch64-apple-darwin/release/pelagos"
-CMDLINE="console=hvc0 rdinit=/pelagos-init"
+CMDLINE="console=hvc0"
 
 PASS=0
 FAIL=0

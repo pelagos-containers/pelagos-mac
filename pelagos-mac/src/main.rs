@@ -101,16 +101,16 @@ fn main() {
         builder = builder.cmdline(cmdline);
     }
     let config = builder.build().unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
+        log::error!("{}", e);
         process::exit(1);
     });
 
-    eprintln!("Booting VM...");
+    log::info!("Booting VM...");
     let vm = Vm::start(config).unwrap_or_else(|e| {
-        eprintln!("VM start failed: {}", e);
+        log::error!("VM start failed: {}", e);
         process::exit(1);
     });
-    eprintln!("VM running.");
+    log::info!("VM running.");
 
     let exit_code = match cli.command {
         Commands::Run { image, args } => run_command(&vm, image, args),
@@ -126,7 +126,7 @@ fn main() {
 
 fn run_command(vm: &Vm, image: String, args: Vec<String>) -> i32 {
     let fd = vm.connect_vsock().unwrap_or_else(|e| {
-        eprintln!("vsock connect failed: {}", e);
+        log::error!("vsock connect failed: {}", e);
         process::exit(1);
     });
 
@@ -139,7 +139,7 @@ fn run_command(vm: &Vm, image: String, args: Vec<String>) -> i32 {
     let mut msg = serde_json::to_string(&cmd).unwrap();
     msg.push('\n');
     if let Err(e) = writer.write_all(msg.as_bytes()) {
-        eprintln!("write error: {}", e);
+        log::error!("write error: {}", e);
         return 1;
     }
 
@@ -168,14 +168,14 @@ fn run_command(vm: &Vm, image: String, args: Vec<String>) -> i32 {
                 break;
             }
             Ok(GuestResponse::Error { error }) => {
-                eprintln!("guest error: {}", error);
+                log::error!("guest error: {}", error);
                 break;
             }
             Ok(resp) => {
-                eprintln!("unexpected response: {:?}", resp);
+                log::warn!("unexpected response: {:?}", resp);
             }
             Err(e) => {
-                eprintln!("parse error: {} (line: {:?})", e, trimmed);
+                log::error!("parse error: {} (line: {:?})", e, trimmed);
                 break;
             }
         }
@@ -221,7 +221,7 @@ mod tests {
 
 fn ping_command(vm: &Vm) -> i32 {
     let fd = vm.connect_vsock().unwrap_or_else(|e| {
-        eprintln!("vsock connect failed: {}", e);
+        log::error!("vsock connect failed: {}", e);
         process::exit(1);
     });
 
@@ -233,14 +233,14 @@ fn ping_command(vm: &Vm) -> i32 {
     let mut msg = serde_json::to_string(&GuestCommand::Ping).unwrap();
     msg.push('\n');
     if let Err(e) = writer.write_all(msg.as_bytes()) {
-        eprintln!("write error: {}", e);
+        log::error!("write error: {}", e);
         return 1;
     }
 
     let mut line = String::new();
     match reader.read_line(&mut line) {
         Ok(0) | Err(_) => {
-            eprintln!("no response from guest");
+            log::error!("no response from guest");
             return 1;
         }
         Ok(_) => {}
@@ -251,7 +251,7 @@ fn ping_command(vm: &Vm) -> i32 {
             0
         }
         other => {
-            eprintln!("unexpected ping response: {:?}", other);
+            log::error!("unexpected ping response: {:?}", other);
             1
         }
     }

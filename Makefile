@@ -7,13 +7,13 @@ all: build sign image
 build:
 	cargo build --release -p pelagos-mac
 
-# Cross-compile the guest daemon for aarch64-unknown-linux-gnu.
+# Cross-compile the guest daemon for aarch64-unknown-linux-musl (static, runs on Alpine).
 # Must use the rustup-managed cargo so the Linux sysroot is available.
 build-guest:
 	PATH="$$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/opt/homebrew/bin:/usr/bin:$$PATH" \
 	    $$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo zigbuild \
 	        -p pelagos-guest \
-	        --target aarch64-unknown-linux-gnu \
+	        --target aarch64-unknown-linux-musl \
 	        --release
 
 # Ad-hoc code-sign the binary with the AVF entitlement.

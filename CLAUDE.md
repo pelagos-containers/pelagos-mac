@@ -179,3 +179,17 @@ WebFetch — use them freely without asking.
 
 Never include time estimates in documentation, plans, or commit messages.
 Use effort descriptors: "Quick", "Moderate Effort", "Significant Work".
+
+---
+
+## Coding Style
+
+### Logging
+- **Never use `eprintln!` or `println!` for diagnostic output.** Use the `log` crate macros:
+  - `log::error!` — errors that require attention
+  - `log::warn!`  — recoverable problems
+  - `log::info!`  — normal lifecycle events (startup, shutdown, connections)
+  - `log::debug!` — internal state useful during development
+  - `log::trace!` — very high-frequency detail
+- `println!` is permitted only for deliberate CLI output (e.g. printing "pong" to stdout).
+- All crates already depend on `log`; use `env_logger` for initialization on both host and guest.

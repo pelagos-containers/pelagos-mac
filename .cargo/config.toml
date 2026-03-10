@@ -14,3 +14,7 @@
 # macOS host builds default to the native target.
 [build]
 target = "aarch64-apple-darwin"
+
+# Cross-compilation: zig cc as the linker for the musl guest binary.
+[target.aarch64-unknown-linux-musl]
+linker = "scripts/zig-aarch64-linux-musl.sh"

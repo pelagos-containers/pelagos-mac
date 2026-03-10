@@ -13,13 +13,16 @@ use objc2::{rc::Retained, AnyThread};
 use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 use objc2_virtualization::{
     VZDirectorySharingDeviceConfiguration, VZDiskImageStorageDeviceAttachment,
-    VZEntropyDeviceConfiguration, VZLinuxBootLoader, VZNATNetworkDeviceAttachment,
-    VZNetworkDeviceConfiguration, VZSharedDirectory, VZSingleDirectoryShare, VZSocketDevice,
-    VZSocketDeviceConfiguration, VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
+    VZEntropyDeviceConfiguration, VZFileHandleSerialPortAttachment, VZGenericPlatformConfiguration,
+    VZLinuxBootLoader, VZNATNetworkDeviceAttachment, VZNetworkDeviceConfiguration,
+    VZPlatformConfiguration, VZSerialPortConfiguration, VZSharedDirectory, VZSingleDirectoryShare,
+    VZSocketDevice, VZSocketDeviceConfiguration, VZStorageDeviceConfiguration,
+    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
     VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
     VZVirtioNetworkDeviceConfiguration, VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration,
     VZVirtualMachine, VZVirtualMachineConfiguration,
 };
+use objc2_foundation::NSFileHandle;
 use std::os::fd::FromRawFd;
 
 // ---------------------------------------------------------------------------
@@ -186,7 +189,7 @@ impl Vm {
                 Err(e) => {
                     last_err = e.to_string();
                     if attempt < MAX_ATTEMPTS {
-                        eprintln!("vsock: attempt {}/{}, retrying...", attempt, MAX_ATTEMPTS);
+                        log::debug!("vsock: attempt {}/{}, retrying...", attempt, MAX_ATTEMPTS);
                         std::thread::sleep(std::time::Duration::from_secs(1));
                     }
                 }
@@ -220,7 +223,21 @@ impl Vm {
                         Err("null connection".into())
                     } else {
                         let fd = unsafe { (&*conn).fileDescriptor() };
-                        Ok(fd)
+                        if fd < 0 {
+                            Err(format!("invalid fileDescriptor: {}", fd))
+                        } else {
+                            // dup() here so we own the fd independently of the
+                            // VZVirtioSocketConnection object.  AVF closes the
+                            // connection's fd when the ObjC object is deallocated
+                            // (ARC), which can happen as soon as this block
+                            // returns.  dup() gives us a copy that outlives it.
+                            let owned = unsafe { libc::dup(fd) };
+                            if owned < 0 {
+                                Err(format!("dup failed: {}", std::io::Error::last_os_error()))
+                            } else {
+                                Ok(owned)
+                            }
+                        }
                     });
                     c3.notify_one();
                 },
@@ -299,6 +316,11 @@ unsafe fn start_vm(config: VmConfig) -> Result<Vm, crate::Error> {
     vm_config.setCPUCount(config.cpus);
     vm_config.setMemorySize((config.memory_mib as u64) * 1024 * 1024);
 
+    // 3a. Generic platform (required for Linux VMs with VZLinuxBootLoader).
+    let platform = VZGenericPlatformConfiguration::new();
+    let platform_ref: &VZPlatformConfiguration = &platform;
+    vm_config.setPlatform(platform_ref);
+
     // 4. Virtio block storage.
     let disk_url = file_url(&config.disk);
     let disk_attach = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
@@ -352,7 +374,20 @@ unsafe fn start_vm(config: VmConfig) -> Result<Vm, crate::Error> {
         vm_config.setDirectorySharingDevices(&NSArray::from_slice(&refs));
     }
 
-    // 9. Validate.
+    // 9. Virtio serial console → guest's hvc0 → host stderr.
+    //    This lets us see kernel boot messages and init script output for debugging.
+    let stderr_fh = NSFileHandle::fileHandleWithStandardError();
+    let serial_attach = VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+        VZFileHandleSerialPortAttachment::alloc(),
+        None,           // no host→guest input
+        Some(&stderr_fh),
+    );
+    let serial_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
+    serial_port.setAttachment(Some(&*serial_attach));
+    let serial_ref: &VZSerialPortConfiguration = &serial_port;
+    vm_config.setSerialPorts(&NSArray::from_slice(&[serial_ref]));
+
+    // 10. Validate.
     vm_config
         .validateWithError()
         .map_err(|e| crate::Error::Config(e.localizedDescription().to_string()))?;
@@ -382,8 +417,14 @@ unsafe fn start_vm(config: VmConfig) -> Result<Vm, crate::Error> {
             *g = Some(if err.is_null() {
                 Ok(())
             } else {
-                let desc = unsafe { &*err }.localizedDescription();
-                Err(desc.to_string())
+                let e = unsafe { &*err };
+                let desc = e.localizedDescription();
+                let domain = e.domain();
+                let code = e.code();
+                let reason = e.localizedFailureReason()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                Err(format!("[{} {}] {} | reason: {}", domain, code, desc, reason))
             });
             c3.notify_one();
         });
