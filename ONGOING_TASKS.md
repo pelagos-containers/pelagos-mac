@@ -1,6 +1,6 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-03-10, commit pending*
+*Last updated: 2026-03-10, commit 9ef9ee9*
 
 ---
 
@@ -175,9 +175,52 @@ if fd < 0 {
 
 ---
 
-## Phase 1 — Post-Pilot
+## Phase 1 — `pelagos run` End-to-End (Epic #10)
 
-- **Close GitHub issues 2–7** (pending: confirm issues close cleanly against pilot commit)
+### Task 1.1 — ✅ VM init: kernel filesystem mounts (#11, PR #15)
+
+`/init` now mounts devtmpfs, proc, sysfs, and cgroup2 before exec'ing
+`pelagos-guest`. Mountpoints (`/proc`, `/sys`, `/dev`) created in initramfs.
+
+### Task 1.2 — ✅ VM networking: NAT + DHCP + DNS (#12, PR #16)
+
+`/init` brings up `lo` and `eth0` via `busybox udhcpc`. Writes `/etc/resolv.conf`
+(8.8.8.8 / 8.8.4.4). Host side (`VZNATNetworkDeviceAttachment`) was already present
+in `pelagos-vz/src/vm.rs`.
+
+### Task 1.3 — ✅ Bundle pelagos runtime binary (#13, PR #17)
+
+`build-vm-image.sh` now downloads `pelagos-aarch64-linux` (static musl, v0.24.0)
+from the skeptomai/pelagos GitHub release and installs it at `/usr/local/bin/pelagos`
+in the initramfs. Sets `PELAGOS_IMAGE_STORE=/run/pelagos` in `/init`.
+
+### Task 1.4 — ✅ Protocol tests for `pelagos run` (#14, PR #18)
+
+Added unit tests covering `GuestCommand::Run`/`Ping` serialization and
+`GuestResponse::Stream`/`Exit`/`Pong` deserialization. The `run_command` function
+was already implemented in `pelagos-mac/src/main.rs`.
+
+**Next step: rebuild the VM image and test end-to-end:**
+
+```bash
+# Delete cached initramfs to force rebuild with new binaries:
+rm -f out/initramfs-custom.gz out/work/pelagos-aarch64-linux
+
+bash scripts/build-vm-image.sh
+
+codesign --sign - --entitlements pelagos-mac/entitlements.plist --force \
+    target/aarch64-apple-darwin/release/pelagos
+
+RUST_LOG=info ./target/aarch64-apple-darwin/release/pelagos \
+    --kernel out/vmlinuz --initrd out/initramfs-custom.gz --disk out/root.img \
+    --cmdline 'console=hvc0' run alpine /bin/echo hello
+# → hello
+```
+
+---
+
+## Phase 2 — Post-Run
+
 - PID file / persistent VM (don't reboot on every invocation)
 - virtiofs bind mounts in `pelagos run -v host:container`
 - Rosetta for x86_64 images
