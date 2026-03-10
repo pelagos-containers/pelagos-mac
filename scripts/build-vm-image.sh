@@ -303,8 +303,8 @@ busybox mount -t tmpfs tmpfs /tmp
 # attempt; waits up to 30s if it takes longer. Without this gate, pelagos's
 # first outbound TCP connection races with NAT initialization and fails.
 i=0
-while [ \$i -lt 30 ]; do
-    busybox ping -c 1 -W 1 -q 8.8.8.8 >/dev/null 2>&1 && break
+while [ \$i -lt 15 ]; do
+    busybox ping -c 1 -W 3 -q 8.8.8.8 >/dev/null 2>&1 && break
     i=\$((i+1))
 done
 

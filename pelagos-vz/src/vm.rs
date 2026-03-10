@@ -21,7 +21,7 @@ use objc2_virtualization::{
     VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
     VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
     VZVirtioNetworkDeviceConfiguration, VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration,
-    VZVirtualMachine, VZVirtualMachineConfiguration,
+    VZVirtualMachine, VZVirtualMachineConfiguration, VZVirtualMachineState,
 };
 use std::os::fd::FromRawFd;
 
@@ -259,7 +259,16 @@ impl Vm {
         &self.config
     }
 
-    /// Request a clean shutdown (ACPI power-off).
+    /// Request a clean shutdown (ACPI power-off) and wait until the VM
+    /// reaches the Stopped state.
+    ///
+    /// `stopWithCompletionHandler` fires when the *request* is accepted, not
+    /// when the VM has actually halted.  The host-side bridge interface
+    /// (bridge100) used for NAT only detaches after the VM reaches Stopped.
+    /// Returning before that point causes back-to-back VM launches to race
+    /// with the previous VM's bridge teardown, producing intermittent NAT
+    /// failures in the next VM's init.  We poll `vm.state` after the stop
+    /// request completes to ensure bridge100 is fully gone before we return.
     pub fn stop(&self) -> Result<(), crate::Error> {
         let vm = Arc::clone(&self.vm);
         let queue = &self.queue.0;
@@ -290,7 +299,30 @@ impl Vm {
         while g.is_none() {
             g = cvar.wait(g).unwrap();
         }
-        g.take().unwrap().map_err(crate::Error::Runtime)
+        g.take().unwrap().map_err(crate::Error::Runtime)?;
+
+        // Poll until the VM reaches Stopped (or Error) state.  The OS tears
+        // down bridge100 only after Stopped; this ensures the next VM starts
+        // with a clean network slate.
+        let queue2 = &self.queue.0;
+        loop {
+            let vm_clone = Arc::clone(&self.vm);
+            let state_holder: Arc<Mutex<VZVirtualMachineState>> =
+                Arc::new(Mutex::new(VZVirtualMachineState::Running));
+            let state_holder2 = Arc::clone(&state_holder);
+            queue2.exec_sync(move || {
+                let state = unsafe { vm_clone.0.state() };
+                *state_holder2.lock().unwrap() = state;
+            });
+            let state = *state_holder.lock().unwrap();
+            if state == VZVirtualMachineState::Stopped
+                || state == VZVirtualMachineState::Error
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        Ok(())
     }
 }
 
