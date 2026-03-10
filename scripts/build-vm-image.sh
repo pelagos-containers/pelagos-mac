@@ -306,9 +306,15 @@ echo 'nameserver 8.8.4.4' >> /etc/resolv.conf
 busybox mkdir -p /tmp /run /run/pelagos
 busybox mount -t tmpfs tmpfs /tmp
 
-# Wait for the AVF NAT to be ready for outbound TCP connections.
-# Without this, the first connect() to Docker Hub races with NAT initialization.
-busybox ping -c 3 -W 5 -q 8.8.8.8 >/dev/null 2>&1 || true
+# Gate on network readiness: loop until the first ping to 8.8.8.8 succeeds,
+# then exit immediately. Exits in ~1-2s when the AVF NAT is ready on first
+# attempt; waits up to 30s if it takes longer. Without this gate, pelagos's
+# first outbound TCP connection races with NAT initialization and fails.
+i=0
+while [ \$i -lt 30 ]; do
+    busybox ping -c 1 -W 1 -q 8.8.8.8 >/dev/null 2>&1 && break
+    i=\$((i+1))
+done
 
 export PELAGOS_IMAGE_STORE=/run/pelagos
 

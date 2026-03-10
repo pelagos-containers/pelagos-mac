@@ -133,51 +133,70 @@ fn run_container(
     let pelagos = std::env::var("PELAGOS_BIN").unwrap_or_else(|_| "/usr/local/bin/pelagos".into());
 
     // Pull the image before running — pelagos run does not auto-pull.
-    let mut pull = match Command::new(&pelagos)
-        .arg("image")
-        .arg("pull")
-        .arg(image)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
+    // Retry up to 3 times with 2-second backoff: the AVF NAT may not be ready
+    // for outbound TCP immediately after the network interface comes up.
+    const PULL_ATTEMPTS: u32 = 10;
+    let mut pull_error = String::new();
+    let mut pulled = false;
+    for attempt in 1..=PULL_ATTEMPTS {
+        let mut pull = match Command::new(&pelagos)
+            .arg("image")
+            .arg("pull")
+            .arg(image)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                send_response(
+                    writer,
+                    &GuestResponse::Error {
+                        error: format!("image pull spawn failed: {}", e),
+                    },
+                )?;
+                return Ok(());
+            }
+        };
+        // Collect pull output and relay it line-by-line as stderr stream.
+        let pull_stderr = pull.stderr.take().unwrap();
+        let pull_stdout = pull.stdout.take().unwrap();
+        for l in BufReader::new(pull_stderr)
+            .lines()
+            .chain(BufReader::new(pull_stdout).lines())
+            .flatten()
+        {
             send_response(
                 writer,
-                &GuestResponse::Error {
-                    error: format!("image pull spawn failed: {}", e),
+                &GuestResponse::Stream {
+                    stream: StreamKind::Stderr,
+                    data: l + "\n",
                 },
             )?;
-            return Ok(());
         }
-    };
-    // Collect pull output and relay it line-by-line as stderr stream.
-    let pull_stderr = pull.stderr.take().unwrap();
-    let pull_stdout = pull.stdout.take().unwrap();
-    for l in BufReader::new(pull_stderr)
-        .lines()
-        .chain(BufReader::new(pull_stdout).lines())
-        .flatten()
-    {
-        send_response(
-            writer,
-            &GuestResponse::Stream {
-                stream: StreamKind::Stderr,
-                data: l + "\n",
-            },
-        )?;
+        let pull_status = pull.wait()?;
+        if pull_status.success() {
+            pulled = true;
+            break;
+        }
+        pull_error = format!(
+            "image pull failed (exit {})",
+            pull_status.code().unwrap_or(-1)
+        );
+        if attempt < PULL_ATTEMPTS {
+            log::warn!(
+                "pull attempt {}/{} failed, retrying in 2s: {}",
+                attempt,
+                PULL_ATTEMPTS,
+                pull_error
+            );
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
     }
-    let pull_status = pull.wait()?;
-    if !pull_status.success() {
+    if !pulled {
         send_response(
             writer,
-            &GuestResponse::Error {
-                error: format!(
-                    "image pull failed (exit {})",
-                    pull_status.code().unwrap_or(-1)
-                ),
-            },
+            &GuestResponse::Error { error: pull_error },
         )?;
         return Ok(());
     }
