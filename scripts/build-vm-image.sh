@@ -175,6 +175,9 @@ if [ ! -f "$INITRAMFS_OUT" ]; then
         fi
     done
 
+    # Ensure kernel vfs mountpoints exist (Alpine initramfs may already have them).
+    mkdir -p "$INITRD_TMP/proc" "$INITRD_TMP/sys" "$INITRD_TMP/dev"
+
     # Add guest daemon
     mkdir -p "$INITRD_TMP/usr/local/bin"
     cp "$GUEST_BIN" "$INITRD_TMP/usr/local/bin/pelagos-guest"
@@ -184,9 +187,19 @@ if [ ! -f "$INITRAMFS_OUT" ]; then
     # Without root= in cmdline the kernel uses the initramfs as root and runs /init.
     cat > "$INITRD_TMP/init" <<INIT_EOF
 #!/bin/sh
+
+# Mount kernel virtual filesystems — required by container namespaces and cgroups.
+busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+busybox mount -t proc     proc     /proc 2>/dev/null || true
+busybox mount -t sysfs    sysfs    /sys 2>/dev/null || true
+busybox mkdir -p /sys/fs/cgroup
+busybox mount -t cgroup2  cgroup2  /sys/fs/cgroup 2>/dev/null || true
+
+# Load vsock kernel modules.
 busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vsock.ko 2>/dev/null || true
 busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko 2>/dev/null || true
 busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko 2>/dev/null || true
+
 exec /usr/local/bin/pelagos-guest
 INIT_EOF
     chmod 755 "$INITRD_TMP/init"
