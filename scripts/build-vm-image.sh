@@ -58,18 +58,12 @@ fi
 echo "[3/6] Extracting kernel and initramfs from ISO"
 # ---------------------------------------------------------------------------
 if [ ! -f "$KERNEL_OUT" ] || [ ! -f "$WORK/initramfs-virt" ]; then
-    ISO_MNT="$WORK/iso_mnt"
-    mkdir -p "$ISO_MNT"
-
-    # hdiutil attaches the ISO read-only and returns the mount point.
-    MOUNT_PT=$(hdiutil attach -readonly -nobrowse -mountpoint "$ISO_MNT" \
-        "$WORK/$ALPINE_ISO" 2>/dev/null | awk '{print $NF}' | tail -1)
-    echo "  Mounted ISO at: $MOUNT_PT"
-
-    cp "$ISO_MNT/boot/vmlinuz-virt"   "$KERNEL_OUT"
-    cp "$ISO_MNT/boot/initramfs-virt" "$WORK/initramfs-virt"
-
-    hdiutil detach "$ISO_MNT" 2>/dev/null || true
+    # bsdtar (libarchive, ships with macOS) reads ISO 9660 natively — no mount needed.
+    bsdtar -xf "$WORK/$ALPINE_ISO" -C "$WORK" \
+        boot/vmlinuz-virt boot/initramfs-virt
+    mv "$WORK/boot/vmlinuz-virt"   "$KERNEL_OUT"
+    mv "$WORK/boot/initramfs-virt" "$WORK/initramfs-virt"
+    rmdir "$WORK/boot" 2>/dev/null || true
     echo "  kernel:  $KERNEL_OUT"
     echo "  initrd:  $WORK/initramfs-virt"
 else
