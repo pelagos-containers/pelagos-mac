@@ -200,6 +200,16 @@ busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vsock.ko 2>/dev/null || t
 busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko 2>/dev/null || true
 busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko 2>/dev/null || true
 
+# Configure networking: bring up lo and eth0 via DHCP.
+# AVF provides a NAT device as eth0; busybox udhcpc obtains an address from it.
+busybox ip link set lo up 2>/dev/null || true
+busybox ip link set eth0 up 2>/dev/null || true
+busybox udhcpc -i eth0 -f -q 2>/dev/null || true
+# Write a minimal resolv.conf so DNS resolution works inside the VM.
+busybox mkdir -p /etc
+echo 'nameserver 8.8.8.8' > /etc/resolv.conf
+echo 'nameserver 8.8.4.4' >> /etc/resolv.conf
+
 exec /usr/local/bin/pelagos-guest
 INIT_EOF
     chmod 755 "$INITRD_TMP/init"
