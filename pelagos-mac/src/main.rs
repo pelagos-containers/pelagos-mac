@@ -32,6 +32,10 @@ struct Cli {
     #[arg(long, env = "PELAGOS_DISK")]
     disk: PathBuf,
 
+    /// Kernel command-line arguments (overrides the built-in default)
+    #[arg(long, env = "PELAGOS_CMDLINE")]
+    cmdline: Option<String>,
+
     /// Memory in MiB (default 1024)
     #[arg(long, default_value = "1024")]
     memory: usize,
@@ -92,6 +96,9 @@ fn main() {
         .cpus(cli.cpus);
     if let Some(ref initrd) = cli.initrd {
         builder = builder.initrd(initrd);
+    }
+    if let Some(ref cmdline) = cli.cmdline {
+        builder = builder.cmdline(cmdline);
     }
     let config = builder.build().unwrap_or_else(|e| {
         eprintln!("error: {}", e);
@@ -174,6 +181,42 @@ fn run_command(vm: &Vm, image: String, args: Vec<String>) -> i32 {
         }
     }
     exit_code
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::GuestResponse;
+
+    #[test]
+    fn pong_deserializes() {
+        let json = r#"{"pong":{"pong":true}}"#;
+        let resp: GuestResponse = serde_json::from_str(json).expect("parse failed");
+        assert!(matches!(resp, GuestResponse::Pong { pong: true }));
+    }
+
+    #[test]
+    fn stream_deserializes() {
+        let json = r#"{"stream":{"stream":"stdout","data":"hello\n"}}"#;
+        let resp: GuestResponse = serde_json::from_str(json).expect("parse failed");
+        match resp {
+            GuestResponse::Stream { stream, data } => {
+                assert_eq!(stream, "stdout");
+                assert_eq!(data, "hello\n");
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn exit_deserializes() {
+        let json = r#"{"exit":{"exit":0}}"#;
+        let resp: GuestResponse = serde_json::from_str(json).expect("parse failed");
+        assert!(matches!(resp, GuestResponse::Exit { exit: 0 }));
+    }
 }
 
 fn ping_command(vm: &Vm) -> i32 {

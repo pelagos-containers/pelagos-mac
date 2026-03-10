@@ -174,8 +174,29 @@ impl Vm {
     }
 
     /// Open a vsock connection to `port` inside the guest.
-    /// Returns a socket file descriptor ready for read/write.
+    ///
+    /// Retries up to 30 times with a 1-second delay between attempts to allow
+    /// the guest daemon time to start after the VM boots.
     pub fn connect_vsock(&self) -> Result<std::os::unix::io::OwnedFd, crate::Error> {
+        const MAX_ATTEMPTS: u32 = 30;
+        let mut last_err = String::new();
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.try_connect_vsock() {
+                Ok(fd) => return Ok(fd),
+                Err(e) => {
+                    last_err = e.to_string();
+                    if attempt < MAX_ATTEMPTS {
+                        eprintln!("vsock: attempt {}/{}, retrying...", attempt, MAX_ATTEMPTS);
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
+                }
+            }
+        }
+        Err(crate::Error::Runtime(last_err))
+    }
+
+    /// Single vsock connection attempt; called by `connect_vsock`.
+    fn try_connect_vsock(&self) -> Result<std::os::unix::io::OwnedFd, crate::Error> {
         let port = self.config.vsock_port;
         let sock = Arc::clone(&self.sock_dev);
         let queue = &self.queue.0;
@@ -316,10 +337,8 @@ unsafe fn start_vm(config: VmConfig) -> Result<Vm, crate::Error> {
         let host_url = file_url(host_path);
         let shared_dir =
             VZSharedDirectory::initWithURL_readOnly(VZSharedDirectory::alloc(), &host_url, false);
-        let share = VZSingleDirectoryShare::initWithDirectory(
-            VZSingleDirectoryShare::alloc(),
-            &shared_dir,
-        );
+        let share =
+            VZSingleDirectoryShare::initWithDirectory(VZSingleDirectoryShare::alloc(), &shared_dir);
         let fs_config = VZVirtioFileSystemDeviceConfiguration::initWithTag(
             VZVirtioFileSystemDeviceConfiguration::alloc(),
             &make_nsstring(tag),

@@ -101,7 +101,9 @@ fn handle_connection(fd: OwnedFd) -> std::io::Result<()> {
         let cmd: GuestCommand = match serde_json::from_str(&line) {
             Ok(c) => c,
             Err(e) => {
-                let resp = GuestResponse::Error { error: format!("parse error: {}", e) };
+                let resp = GuestResponse::Error {
+                    error: format!("parse error: {}", e),
+                };
                 send_response(&mut writer, &resp)?;
                 continue;
             }
@@ -125,8 +127,7 @@ fn run_container(
     args: &[String],
     env: &std::collections::HashMap<String, String>,
 ) -> std::io::Result<()> {
-    let pelagos = std::env::var("PELAGOS_BIN")
-        .unwrap_or_else(|_| "/usr/local/bin/pelagos".into());
+    let pelagos = std::env::var("PELAGOS_BIN").unwrap_or_else(|_| "/usr/local/bin/pelagos".into());
 
     let mut cmd = Command::new(&pelagos);
     cmd.arg("run").arg(image);
@@ -142,7 +143,12 @@ fn run_container(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            send_response(writer, &GuestResponse::Error { error: e.to_string() })?;
+            send_response(
+                writer,
+                &GuestResponse::Error {
+                    error: e.to_string(),
+                },
+            )?;
             return Ok(());
         }
     };
@@ -165,7 +171,9 @@ fn run_container(
         let reader = BufReader::new(stdout_pipe);
         for line in reader.lines() {
             match line {
-                Ok(l) => { let _ = tx_out.send(Chunk::Out(l + "\n")); }
+                Ok(l) => {
+                    let _ = tx_out.send(Chunk::Out(l + "\n"));
+                }
                 Err(_) => break,
             }
         }
@@ -177,7 +185,9 @@ fn run_container(
         let reader = BufReader::new(stderr_pipe);
         for line in reader.lines() {
             match line {
-                Ok(l) => { let _ = tx_err.send(Chunk::Err(l + "\n")); }
+                Ok(l) => {
+                    let _ = tx_err.send(Chunk::Err(l + "\n"));
+                }
                 Err(_) => break,
             }
         }
@@ -189,10 +199,22 @@ fn run_container(
     while done_count < 2 {
         match rx.recv() {
             Ok(Chunk::Out(data)) => {
-                send_response(writer, &GuestResponse::Stream { stream: StreamKind::Stdout, data })?;
+                send_response(
+                    writer,
+                    &GuestResponse::Stream {
+                        stream: StreamKind::Stdout,
+                        data,
+                    },
+                )?;
             }
             Ok(Chunk::Err(data)) => {
-                send_response(writer, &GuestResponse::Stream { stream: StreamKind::Stderr, data })?;
+                send_response(
+                    writer,
+                    &GuestResponse::Stream {
+                        stream: StreamKind::Stderr,
+                        data,
+                    },
+                )?;
             }
             Ok(Chunk::Done) => done_count += 1,
             Err(_) => break,
@@ -206,8 +228,7 @@ fn run_container(
 }
 
 fn send_response(writer: &mut impl Write, resp: &GuestResponse) -> std::io::Result<()> {
-    let mut json = serde_json::to_string(resp)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let mut json = serde_json::to_string(resp).map_err(std::io::Error::other)?;
     json.push('\n');
     writer.write_all(json.as_bytes())?;
     writer.flush()
@@ -221,13 +242,7 @@ fn send_response(writer: &mut impl Write, resp: &GuestResponse) -> std::io::Resu
 fn create_vsock_listener(port: u32) -> std::io::Result<OwnedFd> {
     use std::os::unix::io::FromRawFd;
 
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_VSOCK,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
+    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -294,4 +309,51 @@ fn accept_vsock(_listener: &OwnedFd) -> std::io::Result<OwnedFd> {
         std::io::ErrorKind::Unsupported,
         "AF_VSOCK is Linux-only",
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::{GuestCommand, GuestResponse};
+
+    #[test]
+    fn ping_deserializes() {
+        let json = r#"{"cmd":"ping"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        assert!(matches!(cmd, GuestCommand::Ping));
+    }
+
+    #[test]
+    fn run_deserializes() {
+        let json = r#"{"cmd":"run","image":"alpine","args":["/bin/echo","hello"]}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        match cmd {
+            GuestCommand::Run { image, args, .. } => {
+                assert_eq!(image, "alpine");
+                assert_eq!(args, vec!["/bin/echo", "hello"]);
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pong_serializes() {
+        let resp = GuestResponse::Pong { pong: true };
+        let json = serde_json::to_string(&resp).expect("serialize failed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["pong"]["pong"], true);
+    }
+
+    #[test]
+    fn error_serializes() {
+        let resp = GuestResponse::Error {
+            error: "oops".into(),
+        };
+        let json = serde_json::to_string(&resp).expect("serialize failed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["error"]["error"], "oops");
+    }
 }
