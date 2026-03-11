@@ -217,6 +217,40 @@ fi
 pelagos vm stop > /dev/null 2>&1 || true
 sleep 1
 
+# ---------------------------------------------------------------------------
+# Test 7: exec (non-TTY stdin forwarding)
+#
+# Restart daemon (no mounts) before exec tests.
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== test 7: exec (non-tty) ==="
+# Ensure daemon is running (no mounts needed for exec).
+pelagos ping > /dev/null 2>&1 || true
+sleep 1
+
+# Simple exec: output from echo
+OUT=$(pelagos exec alpine /bin/echo hello)
+echo "$OUT" | grep -v "^\["
+if echo "$OUT" | grep -q "^hello$"; then
+    pass "exec: output correct"
+else
+    fail "exec: expected 'hello', got: $(echo "$OUT" | grep -v '^\[')"
+fi
+
+# Stdin forwarding: pipe data to cat
+OUT=$(echo "hello from stdin" | pelagos exec alpine cat)
+echo "$OUT" | grep -v "^\["
+if echo "$OUT" | grep -q "hello from stdin"; then
+    pass "exec: stdin forwarded and echoed back"
+else
+    fail "exec: expected 'hello from stdin', got: $(echo "$OUT" | grep -v '^\[')"
+fi
+
+# Stop daemon so lifecycle tests get a clean slate.
+pelagos vm stop > /dev/null 2>&1 || true
+sleep 1
+
 fi  # end of functional tests
 
 # ---------------------------------------------------------------------------
