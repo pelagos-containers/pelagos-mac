@@ -119,6 +119,11 @@ pub enum GuestCommand {
         #[serde(default)]
         force: bool,
     },
+    /// Open a shell directly in the VM (no container, no namespaces).
+    Shell {
+        #[serde(default)]
+        tty: bool,
+    },
     Ping,
 }
 
@@ -260,6 +265,17 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                     cmd.arg("--force");
                 }
                 spawn_and_stream(&mut writer, cmd)?;
+            }
+            GuestCommand::Shell { tty } => {
+                // Send ready ack — switches the connection to framed binary protocol.
+                send_response(&mut writer, &GuestResponse::Ready { ready: true })?;
+                let cmd = Command::new("/bin/sh");
+                if tty {
+                    handle_exec_tty(fd, cmd)?;
+                } else {
+                    handle_exec_piped(fd, cmd)?;
+                }
+                return Ok(());
             }
         }
     }
@@ -579,22 +595,7 @@ fn handle_exec(
         send_response(&mut tmp_writer, &GuestResponse::Ready { ready: true })?;
     }
 
-    if tty {
-        handle_exec_tty(fd, &pelagos, image, args, env)
-    } else {
-        handle_exec_piped(fd, &pelagos, image, args, env)
-    }
-}
-
-/// Non-TTY exec: spawn with piped stdin/stdout/stderr, forward via frames.
-fn handle_exec_piped(
-    fd: libc::c_int,
-    pelagos: &str,
-    image: &str,
-    args: &[String],
-    env: &std::collections::HashMap<String, String>,
-) -> std::io::Result<()> {
-    let mut cmd = Command::new(pelagos);
+    let mut cmd = Command::new(&pelagos);
     cmd.arg("run").arg(image);
     if !args.is_empty() {
         cmd.args(args);
@@ -602,6 +603,16 @@ fn handle_exec_piped(
     for (k, v) in env {
         cmd.env(k, v);
     }
+
+    if tty {
+        handle_exec_tty(fd, cmd)
+    } else {
+        handle_exec_piped(fd, cmd)
+    }
+}
+
+/// Non-TTY exec: spawn with piped stdin/stdout/stderr, forward via frames.
+fn handle_exec_piped(fd: libc::c_int, mut cmd: Command) -> std::io::Result<()> {
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -706,13 +717,7 @@ fn handle_exec_piped(
 }
 
 /// TTY exec: allocate a pseudo-TTY, spawn child with it, forward via frames.
-fn handle_exec_tty(
-    fd: libc::c_int,
-    pelagos: &str,
-    image: &str,
-    args: &[String],
-    env: &std::collections::HashMap<String, String>,
-) -> std::io::Result<()> {
+fn handle_exec_tty(fd: libc::c_int, mut cmd: Command) -> std::io::Result<()> {
     use std::os::unix::io::FromRawFd;
 
     // Open a pseudo-TTY.
@@ -735,15 +740,7 @@ fn handle_exec_tty(
         return Ok(());
     }
 
-    // Spawn child with slave as stdin/stdout/stderr.
-    let mut cmd = Command::new(pelagos);
-    cmd.arg("run").arg(image);
-    if !args.is_empty() {
-        cmd.args(args);
-    }
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
+    // Set slave as stdin/stdout/stderr and configure PTY session.
     unsafe {
         cmd.stdin(Stdio::from_raw_fd(slave_fd));
         cmd.stdout(Stdio::from_raw_fd(slave_fd));
@@ -1125,6 +1122,20 @@ mod tests {
         let json = r#"{"cmd":"rm","name":"mybox","force":true}"#;
         let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
         assert!(matches!(cmd, GuestCommand::Rm { name, force: true } if name == "mybox"));
+    }
+
+    #[test]
+    fn shell_deserializes() {
+        let json = r#"{"cmd":"shell","tty":true}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        assert!(matches!(cmd, GuestCommand::Shell { tty: true }));
+    }
+
+    #[test]
+    fn shell_defaults_tty_false() {
+        let json = r#"{"cmd":"shell"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        assert!(matches!(cmd, GuestCommand::Shell { tty: false }));
     }
 
     #[test]
