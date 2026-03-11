@@ -11,6 +11,18 @@
 //! Request  (host → guest): `{"cmd":"run","image":"alpine","args":[...],"env":{}}`
 //! Response (guest → host): `{"stream":"stdout","data":"hello\n"}` …
 //!                           `{"exit":0}`
+//!
+//! # Exec protocol
+//!
+//! After JSON handshake, both sides switch to framed binary:
+//!   [type: u8][length: u32 big-endian][data: length bytes]
+//!
+//! Frame types:
+//!   0 = Stdin  (host → guest)
+//!   1 = Stdout (guest → host)
+//!   2 = Stderr (guest → host)
+//!   3 = Exit   (guest → host, 4 bytes i32 big-endian)
+//!   4 = Resize (host → guest, 4 bytes u16 rows + u16 cols big-endian)
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::io::OwnedFd;
@@ -19,6 +31,34 @@ use std::process::{Command, Stdio};
 use serde::{Deserialize, Serialize};
 
 pub const VSOCK_PORT: u32 = 1024;
+
+// ---------------------------------------------------------------------------
+// Framed binary protocol constants
+// ---------------------------------------------------------------------------
+
+const FRAME_STDIN: u8 = 0;
+const FRAME_STDOUT: u8 = 1;
+const FRAME_STDERR: u8 = 2;
+const FRAME_EXIT: u8 = 3;
+const FRAME_RESIZE: u8 = 4;
+
+fn send_frame(w: &mut impl Write, frame_type: u8, data: &[u8]) -> std::io::Result<()> {
+    w.write_all(&[frame_type])?;
+    w.write_all(&(data.len() as u32).to_be_bytes())?;
+    w.write_all(data)?;
+    w.flush()
+}
+
+fn recv_frame(r: &mut impl Read) -> std::io::Result<(u8, Vec<u8>)> {
+    let mut type_buf = [0u8; 1];
+    r.read_exact(&mut type_buf)?;
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    let mut data = vec![0u8; len];
+    r.read_exact(&mut data)?;
+    Ok((type_buf[0], data))
+}
 
 // ---------------------------------------------------------------------------
 // Protocol types
@@ -44,6 +84,14 @@ pub enum GuestCommand {
         #[serde(default)]
         mounts: Vec<GuestMount>,
     },
+    Exec {
+        image: String,
+        args: Vec<String>,
+        #[serde(default)]
+        env: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        tty: bool,
+    },
     Ping,
 }
 
@@ -54,6 +102,7 @@ pub enum GuestResponse {
     Exit { exit: i32 },
     Pong { pong: bool },
     Error { error: String },
+    Ready { ready: bool },
 }
 
 #[derive(Debug, Serialize, Clone, Copy)]
@@ -132,26 +181,26 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
             GuestCommand::Run { image, args, env, mounts } => {
                 run_container(&mut writer, &image, &args, &env, &mounts)?;
             }
+            GuestCommand::Exec { image, args, env, tty } => {
+                handle_exec(fd, &image, &args, &env, tty)?;
+                return Ok(());
+            }
         }
     }
     Ok(())
 }
 
-fn run_container(
-    writer: &mut impl Write,
-    image: &str,
-    args: &[String],
-    env: &std::collections::HashMap<String, String>,
-    mounts: &[GuestMount],
-) -> std::io::Result<()> {
+// ---------------------------------------------------------------------------
+// Pull helper (shared by run_container and handle_exec)
+// ---------------------------------------------------------------------------
+
+/// Pull the image, streaming stderr lines back via the provided writer.
+/// Returns Ok(true) on success, Ok(false) on failure (error response sent).
+fn pull_image(writer: &mut impl Write, image: &str) -> std::io::Result<bool> {
     let pelagos = std::env::var("PELAGOS_BIN").unwrap_or_else(|_| "/usr/local/bin/pelagos".into());
 
-    // Pull the image before running — pelagos run does not auto-pull.
-    // Retry up to 3 times with 2-second backoff: the AVF NAT may not be ready
-    // for outbound TCP immediately after the network interface comes up.
     const PULL_ATTEMPTS: u32 = 10;
     let mut pull_error = String::new();
-    let mut pulled = false;
     for attempt in 1..=PULL_ATTEMPTS {
         let mut pull = match Command::new(&pelagos)
             .arg("image")
@@ -169,10 +218,9 @@ fn run_container(
                         error: format!("image pull spawn failed: {}", e),
                     },
                 )?;
-                return Ok(());
+                return Ok(false);
             }
         };
-        // Collect pull output and relay it line-by-line as stderr stream.
         let pull_stderr = pull.stderr.take().unwrap();
         let pull_stdout = pull.stdout.take().unwrap();
         for l in BufReader::new(pull_stderr)
@@ -190,8 +238,7 @@ fn run_container(
         }
         let pull_status = pull.wait()?;
         if pull_status.success() {
-            pulled = true;
-            break;
+            return Ok(true);
         }
         pull_error = format!(
             "image pull failed (exit {})",
@@ -207,11 +254,23 @@ fn run_container(
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
     }
-    if !pulled {
-        send_response(
-            writer,
-            &GuestResponse::Error { error: pull_error },
-        )?;
+    send_response(
+        writer,
+        &GuestResponse::Error { error: pull_error },
+    )?;
+    Ok(false)
+}
+
+fn run_container(
+    writer: &mut impl Write,
+    image: &str,
+    args: &[String],
+    env: &std::collections::HashMap<String, String>,
+    mounts: &[GuestMount],
+) -> std::io::Result<()> {
+    let pelagos = std::env::var("PELAGOS_BIN").unwrap_or_else(|_| "/usr/local/bin/pelagos".into());
+
+    if !pull_image(writer, image)? {
         return Ok(());
     }
 
@@ -327,6 +386,316 @@ fn run_container(
     let status = child.wait()?;
     let code = status.code().unwrap_or(-1);
     send_response(writer, &GuestResponse::Exit { exit: code })?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Exec handler
+// ---------------------------------------------------------------------------
+
+fn handle_exec(
+    fd: libc::c_int,
+    image: &str,
+    args: &[String],
+    env: &std::collections::HashMap<String, String>,
+    tty: bool,
+) -> std::io::Result<()> {
+    let pelagos = std::env::var("PELAGOS_BIN").unwrap_or_else(|_| "/usr/local/bin/pelagos".into());
+
+    // Pull the image before sending ready; relay stderr as JSON stream so the
+    // host can display pull progress while waiting.
+    {
+        let mut tmp_writer = FdWriter(fd);
+        if !pull_image(&mut tmp_writer, image)? {
+            return Ok(());
+        }
+    }
+
+    // Send ready ack — both sides now switch to framed binary protocol.
+    {
+        let mut tmp_writer = FdWriter(fd);
+        send_response(&mut tmp_writer, &GuestResponse::Ready { ready: true })?;
+    }
+
+    if tty {
+        handle_exec_tty(fd, &pelagos, image, args, env)
+    } else {
+        handle_exec_piped(fd, &pelagos, image, args, env)
+    }
+}
+
+/// Non-TTY exec: spawn with piped stdin/stdout/stderr, forward via frames.
+fn handle_exec_piped(
+    fd: libc::c_int,
+    pelagos: &str,
+    image: &str,
+    args: &[String],
+    env: &std::collections::HashMap<String, String>,
+) -> std::io::Result<()> {
+    let mut cmd = Command::new(pelagos);
+    cmd.arg("run").arg(image);
+    if !args.is_empty() {
+        cmd.args(args);
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let mut w = FdWriter(fd);
+            let err = format!("exec spawn failed: {}", e);
+            let _ = send_frame(&mut w, FRAME_STDERR, err.as_bytes());
+            let _ = send_frame(&mut w, FRAME_EXIT, &1i32.to_be_bytes());
+            return Ok(());
+        }
+    };
+
+    let child_stdin = child.stdin.take().unwrap();
+    let child_stdout = child.stdout.take().unwrap();
+    let child_stderr = child.stderr.take().unwrap();
+
+    use std::sync::{Arc, Mutex};
+
+    // Shared writer protected by a mutex so stdin-reader and stdout/stderr threads
+    // can all write frames concurrently.
+    let writer = Arc::new(Mutex::new(FdWriter(fd)));
+
+    // Stdin thread: read FRAME_STDIN frames from vsock, write to child stdin.
+    let w_stdin = Arc::clone(&writer);
+    let stdin_thread = std::thread::spawn(move || {
+        let mut child_stdin = child_stdin;
+        let mut reader = FdReader(fd);
+        loop {
+            match recv_frame(&mut reader) {
+                Ok((FRAME_STDIN, data)) => {
+                    if data.is_empty() {
+                        break; // zero-length = EOF signal; drop child_stdin below
+                    }
+                    if child_stdin.write_all(&data).is_err() {
+                        break;
+                    }
+                }
+                Ok((FRAME_RESIZE, _)) => {
+                    // No PTY in piped mode; ignore resize frames.
+                }
+                Ok(_) | Err(_) => break,
+            }
+        }
+        drop(child_stdin); // signal EOF to child
+        drop(w_stdin); // keep Arc alive until we're done
+    });
+
+    // Stdout thread: read child stdout, send as FRAME_STDOUT.
+    let w_out = Arc::clone(&writer);
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let mut src = child_stdout;
+        loop {
+            match src.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut w = w_out.lock().unwrap();
+                    if send_frame(&mut *w, FRAME_STDOUT, &buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // Stderr thread: read child stderr, send as FRAME_STDERR.
+    let w_err = Arc::clone(&writer);
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let mut src = child_stderr;
+        loop {
+            match src.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut w = w_err.lock().unwrap();
+                    if send_frame(&mut *w, FRAME_STDERR, &buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // Wait for stdout/stderr to drain, then collect exit code.
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
+    let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+
+    // Send exit frame.
+    let mut w = writer.lock().unwrap();
+    let _ = send_frame(&mut *w, FRAME_EXIT, &code.to_be_bytes());
+
+    // The stdin thread may be blocked on recv_frame; drop the writer lock so
+    // it can finish, then just let it be — the fd will be closed on return.
+    drop(w);
+    drop(stdin_thread); // detach; fd close will unblock it
+
+    Ok(())
+}
+
+/// TTY exec: allocate a pseudo-TTY, spawn child with it, forward via frames.
+fn handle_exec_tty(
+    fd: libc::c_int,
+    pelagos: &str,
+    image: &str,
+    args: &[String],
+    env: &std::collections::HashMap<String, String>,
+) -> std::io::Result<()> {
+    use std::os::unix::io::FromRawFd;
+
+    // Open a pseudo-TTY.
+    let mut master_fd: libc::c_int = -1;
+    let mut slave_fd: libc::c_int = -1;
+    let ret = unsafe {
+        libc::openpty(
+            &mut master_fd,
+            &mut slave_fd,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ret < 0 {
+        let mut w = FdWriter(fd);
+        let err = format!("openpty failed: {}", std::io::Error::last_os_error());
+        let _ = send_frame(&mut w, FRAME_STDERR, err.as_bytes());
+        let _ = send_frame(&mut w, FRAME_EXIT, &1i32.to_be_bytes());
+        return Ok(());
+    }
+
+    // Spawn child with slave as stdin/stdout/stderr.
+    let mut cmd = Command::new(pelagos);
+    cmd.arg("run").arg(image);
+    if !args.is_empty() {
+        cmd.args(args);
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    unsafe {
+        cmd.stdin(Stdio::from_raw_fd(slave_fd));
+        cmd.stdout(Stdio::from_raw_fd(slave_fd));
+        cmd.stderr(Stdio::from_raw_fd(slave_fd));
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            unsafe {
+                libc::close(master_fd);
+                libc::close(slave_fd);
+            }
+            let mut w = FdWriter(fd);
+            let err = format!("exec spawn failed: {}", e);
+            let _ = send_frame(&mut w, FRAME_STDERR, err.as_bytes());
+            let _ = send_frame(&mut w, FRAME_EXIT, &1i32.to_be_bytes());
+            return Ok(());
+        }
+    };
+
+    // Close slave in parent — child owns it now.
+    unsafe { libc::close(slave_fd) };
+
+    use std::sync::{Arc, Mutex};
+
+    // Dup master_fd so the read and write sides each have their own fd.
+    let master_read_fd = unsafe { libc::dup(master_fd) };
+    if master_read_fd < 0 {
+        unsafe { libc::close(master_fd) };
+        let _ = child.wait();
+        let mut w = FdWriter(fd);
+        let _ = send_frame(&mut w, FRAME_EXIT, &1i32.to_be_bytes());
+        return Ok(());
+    }
+
+    let master_write = Arc::new(Mutex::new(master_fd));
+    let master_write2 = Arc::clone(&master_write);
+
+    // Stdin/resize thread: read frames from vsock, write to master or ioctl.
+    let stdin_thread = std::thread::spawn(move || {
+        let mut reader = FdReader(fd);
+        loop {
+            match recv_frame(&mut reader) {
+                Ok((FRAME_STDIN, data)) => {
+                    let mfd = master_write2.lock().unwrap();
+                    let ret = unsafe {
+                        libc::write(
+                            *mfd,
+                            data.as_ptr() as *const libc::c_void,
+                            data.len(),
+                        )
+                    };
+                    if ret < 0 {
+                        break;
+                    }
+                }
+                Ok((FRAME_RESIZE, data)) if data.len() == 4 => {
+                    let rows = u16::from_be_bytes([data[0], data[1]]);
+                    let cols = u16::from_be_bytes([data[2], data[3]]);
+                    let ws = libc::winsize {
+                        ws_row: rows,
+                        ws_col: cols,
+                        ws_xpixel: 0,
+                        ws_ypixel: 0,
+                    };
+                    let mfd = master_write2.lock().unwrap();
+                    unsafe { libc::ioctl(*mfd, libc::TIOCSWINSZ, &ws) };
+                }
+                Ok(_) | Err(_) => break,
+            }
+        }
+    });
+
+    // Master-read thread: read from master (child's output), send FRAME_STDOUT.
+    let writer = Arc::new(Mutex::new(FdWriter(fd)));
+    let w_out = Arc::clone(&writer);
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = unsafe {
+                libc::read(
+                    master_read_fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+            if n <= 0 {
+                break;
+            }
+            let mut w = w_out.lock().unwrap();
+            if send_frame(&mut *w, FRAME_STDOUT, &buf[..n as usize]).is_err() {
+                break;
+            }
+        }
+        unsafe { libc::close(master_read_fd) };
+    });
+
+    // Wait for child to exit.
+    let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+
+    // Close master write fd — this will cause the read thread to get EOF.
+    {
+        let mfd = master_write.lock().unwrap();
+        unsafe { libc::close(*mfd) };
+    }
+
+    let _ = stdout_thread.join();
+    drop(stdin_thread); // detach
+
+    // Send exit frame.
+    let mut w = writer.lock().unwrap();
+    let _ = send_frame(&mut *w, FRAME_EXIT, &code.to_be_bytes());
+
     Ok(())
 }
 
@@ -475,6 +844,33 @@ mod tests {
     }
 
     #[test]
+    fn exec_deserializes() {
+        let json = r#"{"cmd":"exec","image":"alpine","args":["sh"],"tty":true}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        match cmd {
+            GuestCommand::Exec { image, args, tty, .. } => {
+                assert_eq!(image, "alpine");
+                assert_eq!(args, vec!["sh"]);
+                assert!(tty);
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn exec_deserializes_defaults() {
+        let json = r#"{"cmd":"exec","image":"alpine","args":["cat"]}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        match cmd {
+            GuestCommand::Exec { tty, env, .. } => {
+                assert!(!tty);
+                assert!(env.is_empty());
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
     fn run_with_mounts_deserializes() {
         let json = r#"{"cmd":"run","image":"alpine","args":["cat","/data/f"],"mounts":[{"tag":"share0","container_path":"/data"}]}"#;
         let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
@@ -498,6 +894,14 @@ mod tests {
     }
 
     #[test]
+    fn ready_serializes() {
+        let resp = GuestResponse::Ready { ready: true };
+        let json = serde_json::to_string(&resp).expect("serialize failed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["ready"]["ready"], true);
+    }
+
+    #[test]
     fn error_serializes() {
         let resp = GuestResponse::Error {
             error: "oops".into(),
@@ -505,5 +909,18 @@ mod tests {
         let json = serde_json::to_string(&resp).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["error"]["error"], "oops");
+    }
+
+    #[test]
+    fn frame_roundtrip() {
+        use super::{recv_frame, send_frame, FRAME_STDOUT};
+        use std::io::Cursor;
+        let payload = b"hello exec";
+        let mut buf = Vec::new();
+        send_frame(&mut buf, FRAME_STDOUT, payload).unwrap();
+        let mut cursor = Cursor::new(buf);
+        let (ft, data) = recv_frame(&mut cursor).unwrap();
+        assert_eq!(ft, FRAME_STDOUT);
+        assert_eq!(data, payload);
     }
 }
