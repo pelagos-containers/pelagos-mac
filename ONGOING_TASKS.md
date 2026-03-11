@@ -1,6 +1,6 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-03-10, post-Phase-1*
+*Last updated: 2026-03-11, post-Phase-2-networking*
 
 ---
 
@@ -222,11 +222,15 @@ twice in a row on real hardware (2026-03-10).
 
 ---
 
-## Phase 2 — Post-Run
+## Phase 2 — Post-Run ✅
 
-- PID file / persistent VM (don't reboot on every invocation)
-- virtiofs bind mounts in `pelagos run -v host:container`
-- Rosetta for x86_64 images
+- ✅ PID file / persistent VM — PR #27, all 5 e2e tests pass (cold start ~1.2s, warm run ~0.1s)
+- ✅ virtiofs bind mounts in `pelagos run -v host:container` — PR #28
+- ✅ Stable networking via socket_vmnet — PR #34, all 8 e2e tests pass; fixes issue #26
+- ~~Rosetta for x86_64 images~~ — **won't fix** (low and dwindling priority)
+
+## Phase 3 — Next
+
 - `pelagos build`, `pelagos image pull` forwarded to guest
 - `pelagos exec`, `pelagos ps`, `pelagos logs`
 - Signed `.pkg` installer
@@ -247,27 +251,14 @@ twice in a row on real hardware (2026-03-10).
 - The `com.apple.security.virtualization` entitlement is required at runtime; the
   binary must be signed before execution.
 
-### ⚠️ Known: PF/NAT state degrades after ~5 VM runs (issue #26)
+### ✅ Resolved: PF/NAT state degradation (issue #26)
 
-`VZNATNetworkDeviceAttachment` uses macOS `InternetSharing` to manage `bridge100`
-and install packet-filter (PF) NAT masquerade rules. After several VM lifecycles,
-InternetSharing loses its PF device connection:
+`VZNATNetworkDeviceAttachment` degraded after ~17 VM restarts per session due to
+InternetSharing's PF anchor losing its kernel connection (macOS 26 bug, unrecoverable
+without reboot).
 
-```
-InternetSharing: [com.apple.pf:framework] connection error: Connection invalid
-```
+**Fix (PR #34):** migrated to `socket_vmnet` (`VZFileHandleNetworkDeviceAttachment`
+with a relay thread pair). `socket_vmnet` uses `vmnet.framework` directly at the
+kernel level — no PF anchors, nothing to degrade. All 8 e2e tests pass.
 
-When this happens, ICMP (ping) still routes but all TCP connections from inside
-the VM fail, causing `pelagos image pull` to fail with "error sending request".
-
-**Workaround:**
-```bash
-sudo pfctl -f /etc/pf.conf
-```
-
-This reloads PF from scratch and lets InternetSharing re-establish cleanly.
-Symptoms: image pulls all fail with "error sending request for url (https://...)".
-`launchctl stop/start com.apple.InternetSharing` does NOT fix it.
-
-**Long-term fix:** persistent VM (Phase 2 Task D) sidesteps this entirely by
-reusing one VM across many `pelagos run` calls instead of booting fresh each time.
+**Prerequisite:** `brew install socket_vmnet && sudo brew services start socket_vmnet`
