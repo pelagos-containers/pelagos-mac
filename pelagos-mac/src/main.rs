@@ -289,7 +289,10 @@ fn main() {
         } => {
             let image = image.clone();
             let args = args.clone();
-            let tty = tty || unsafe { libc::isatty(libc::STDIN_FILENO) } != 0;
+            // Auto-detect: enable TTY only when stdout is a real terminal.
+            // Checking STDOUT (not STDIN) correctly handles `OUT=$(pelagos exec ...)`:
+            // stdout is a pipe, so TTY is skipped even when stdin is a terminal.
+            let tty = tty || unsafe { libc::isatty(libc::STDOUT_FILENO) } != 0;
             let daemon_args = daemon_args_from_cli(&cli);
             if let Err(e) = daemon::ensure_running(&daemon_args) {
                 log::error!("failed to start VM daemon: {}", e);

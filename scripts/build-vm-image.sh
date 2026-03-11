@@ -264,6 +264,8 @@ UDHCPC
 
 # Mount kernel virtual filesystems — required by container namespaces and cgroups.
 busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+busybox mkdir -p /dev/pts
+busybox mount -t devpts   devpts   /dev/pts 2>/dev/null || true
 busybox mount -t proc     proc     /proc 2>/dev/null || true
 busybox mount -t sysfs    sysfs    /sys 2>/dev/null || true
 busybox mkdir -p /sys/fs/cgroup
