@@ -283,13 +283,21 @@ busybox insmod /lib/modules/$KVER/kernel/net/core/failover.ko 2>/dev/null || tru
 busybox insmod /lib/modules/$KVER/kernel/drivers/net/net_failover.ko 2>/dev/null || true
 busybox insmod /lib/modules/$KVER/kernel/drivers/net/virtio_net.ko 2>/dev/null || true
 
-# Configure networking: static IP on the AVF NAT subnet (192.168.64.0/24).
-# The Alpine virt kernel lacks AF_PACKET support (CONFIG_PACKET=n), so udhcpc
-# cannot be used. AVF NAT always uses 192.168.64.0/24 with gateway .1.
+# Configure networking via DHCP (socket_vmnet provides a DHCP server through
+# vmnet.framework shared mode).
+#
+# NOTE: udhcpc requires AF_PACKET (CONFIG_PACKET) for initial DHCP discovery.
+# If this kernel lacks CONFIG_PACKET, udhcpc fails and we fall back to a static
+# IP on vmnet's default shared subnet (192.168.64.0/24, gateway 192.168.64.1).
 busybox ip link set lo up
 busybox ip link set eth0 up
-busybox ip addr add 192.168.64.2/24 dev eth0
-busybox ip route add default via 192.168.64.1
+if busybox udhcpc -i eth0 -s /usr/share/udhcpc/default.script -q -t 5 -T 3 >/dev/null 2>&1; then
+    echo "[pelagos-init] network: DHCP OK"
+else
+    echo "[pelagos-init] network: DHCP failed (CONFIG_PACKET=n?), using static 192.168.105.2/24"
+    busybox ip addr add 192.168.105.2/24 dev eth0
+    busybox ip route add default via 192.168.105.1
+fi
 echo "[pelagos-init] network ready"
 # Write a minimal resolv.conf so DNS resolution works inside the VM.
 busybox mkdir -p /etc

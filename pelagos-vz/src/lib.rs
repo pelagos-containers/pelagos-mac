@@ -20,6 +20,7 @@
 #[cfg(not(target_os = "macos"))]
 compile_error!("pelagos-vz is macOS only");
 
+pub mod socket_vmnet;
 pub mod vm;
 
 use thiserror::Error;

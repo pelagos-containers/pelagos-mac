@@ -14,14 +14,15 @@ use objc2_foundation::NSFileHandle;
 use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 use objc2_virtualization::{
     VZDirectorySharingDeviceConfiguration, VZDiskImageStorageDeviceAttachment,
-    VZEntropyDeviceConfiguration, VZFileHandleSerialPortAttachment, VZGenericPlatformConfiguration,
-    VZLinuxBootLoader, VZNATNetworkDeviceAttachment, VZNetworkDeviceConfiguration,
-    VZPlatformConfiguration, VZSerialPortConfiguration, VZSharedDirectory, VZSingleDirectoryShare,
-    VZSocketDevice, VZSocketDeviceConfiguration, VZStorageDeviceConfiguration,
-    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
-    VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
-    VZVirtioNetworkDeviceConfiguration, VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration,
-    VZVirtualMachine, VZVirtualMachineConfiguration, VZVirtualMachineState,
+    VZEntropyDeviceConfiguration, VZFileHandleNetworkDeviceAttachment,
+    VZFileHandleSerialPortAttachment, VZGenericPlatformConfiguration, VZLinuxBootLoader,
+    VZMACAddress, VZNetworkDeviceConfiguration, VZPlatformConfiguration, VZSerialPortConfiguration,
+    VZSharedDirectory, VZSingleDirectoryShare, VZSocketDevice, VZSocketDeviceConfiguration,
+    VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
+    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
+    VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration,
+    VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration, VZVirtualMachine,
+    VZVirtualMachineConfiguration, VZVirtualMachineState,
 };
 use std::os::fd::FromRawFd;
 
@@ -168,6 +169,8 @@ pub struct Vm {
     sock_dev: Arc<SendSockDev>,
     queue: Arc<SendQueue>,
     config: VmConfig,
+    /// Keeps the socket_vmnet relay threads alive for the VM's lifetime.
+    _relay: crate::socket_vmnet::RelayHandle,
 }
 
 #[derive(Debug)]
@@ -390,10 +393,22 @@ unsafe fn start_vm(config: VmConfig) -> Result<Vm, crate::Error> {
     let storage_ref: &VZStorageDeviceConfiguration = &block_dev;
     vm_config.setStorageDevices(&NSArray::from_slice(&[storage_ref]));
 
-    // 5. Virtio NAT network.
-    let nat = VZNATNetworkDeviceAttachment::new();
+    // 5. socket_vmnet network via VZFileHandleNetworkDeviceAttachment.
+    //    Connects to the socket_vmnet privileged helper (vmnet.framework shared mode),
+    //    bridges its SOCK_STREAM length-prefixed frame protocol to a SOCK_DGRAM
+    //    socketpair that AVF can consume directly.
+    let (vmnet_fd, relay) = crate::socket_vmnet::connect()
+        .map_err(|e| crate::Error::Runtime(format!("socket_vmnet: {}", e)))?;
+    let vmnet_fh = NSFileHandle::initWithFileDescriptor(NSFileHandle::alloc(), vmnet_fd);
+    let net_attach = VZFileHandleNetworkDeviceAttachment::initWithFileHandle(
+        VZFileHandleNetworkDeviceAttachment::alloc(),
+        &vmnet_fh,
+    );
     let net_dev = VZVirtioNetworkDeviceConfiguration::new();
-    net_dev.setAttachment(Some(&*nat));
+    net_dev.setAttachment(Some(&*net_attach));
+    let mac = VZMACAddress::randomLocallyAdministeredAddress();
+    net_dev.setMACAddress(&mac);
+    log::info!("socket_vmnet: VM MAC address {}", mac.string());
     let net_ref: &VZNetworkDeviceConfiguration = &net_dev;
     vm_config.setNetworkDevices(&NSArray::from_slice(&[net_ref]));
 
@@ -534,6 +549,7 @@ unsafe fn start_vm(config: VmConfig) -> Result<Vm, crate::Error> {
         sock_dev: Arc::new(SendSockDev(sock_dev)),
         queue: queue_arc,
         config,
+        _relay: relay,
     })
 }
 

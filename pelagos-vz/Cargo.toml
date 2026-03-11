@@ -8,7 +8,14 @@ description = "Apple Virtualization Framework bindings for pelagos-mac"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["alloc"] }
-objc2-virtualization = { version = "0.3", features = ["alloc", "VZGenericPlatformConfiguration", "VZPlatformConfiguration"] }
+objc2-virtualization = { version = "0.3", features = [
+    "alloc",
+    "VZGenericPlatformConfiguration",
+    "VZPlatformConfiguration",
+    "VZFileHandleNetworkDeviceAttachment",
+    "VZNetworkDeviceAttachment",
+    "VZMACAddress",
+] }
 block2 = "0.6"
 dispatch2 = "0.3"
 
