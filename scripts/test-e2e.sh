@@ -34,6 +34,9 @@ DISK="$REPO_ROOT/out/root.img"
 BINARY="$REPO_ROOT/target/aarch64-apple-darwin/release/pelagos"
 CMDLINE="console=hvc0"
 
+# AWS ECR Public hosts Docker Official Images with no unauthenticated pull rate limits.
+TEST_IMAGE="public.ecr.aws/docker/library/alpine"
+
 MODE="functional"
 if [ "${1:-}" = "--cold" ]; then MODE="cold"; fi
 if [ "${1:-}" = "--warm" ]; then MODE="warm"; fi
@@ -134,7 +137,7 @@ fi
 
 echo ""
 echo "=== test 2: run alpine /bin/echo hello ==="
-OUT=$(pelagos run alpine /bin/echo hello)
+OUT=$(pelagos run "$TEST_IMAGE" /bin/echo hello)
 echo "$OUT" | grep -v "^\["
 if echo "$OUT" | grep -q "^hello$"; then
     pass "output contains 'hello'"
@@ -148,7 +151,7 @@ fi
 
 echo ""
 echo "=== test 3: run alpine /bin/sh -c 'echo foo; echo bar' ==="
-OUT=$(pelagos run alpine /bin/sh -c "echo foo; echo bar")
+OUT=$(pelagos run "$TEST_IMAGE" /bin/sh -c "echo foo; echo bar")
 echo "$OUT" | grep -v "^\["
 if echo "$OUT" | grep -q "^foo$" && echo "$OUT" | grep -q "^bar$"; then
     pass "output contains 'foo' and 'bar'"
@@ -162,7 +165,7 @@ fi
 
 echo ""
 echo "=== test 4: exit code propagation ==="
-pelagos run alpine /bin/false > /dev/null 2>&1; EXIT=$?
+pelagos run "$TEST_IMAGE" /bin/false > /dev/null 2>&1; EXIT=$?
 if [ "$EXIT" -eq 1 ]; then
     pass "exit code 1 propagated correctly"
 else
@@ -177,7 +180,7 @@ echo ""
 echo "=== test 5: three back-to-back runs ==="
 BACK_FAIL=0
 for i in 1 2 3; do
-    OUT=$(pelagos run alpine /bin/echo "run$i")
+    OUT=$(pelagos run "$TEST_IMAGE" /bin/echo "run$i")
     if echo "$OUT" | grep -q "^run${i}$"; then
         echo "  [OK]   run $i: ok"
     else
@@ -206,7 +209,7 @@ pelagos vm stop > /dev/null 2>&1 || true
 sleep 1
 TMPHOST=$(mktemp -d)
 echo "hello from host" > "$TMPHOST/hello.txt"
-OUT=$(pelagos -v "$TMPHOST:/data" run alpine cat /data/hello.txt)
+OUT=$(pelagos -v "$TMPHOST:/data" run "$TEST_IMAGE" cat /data/hello.txt)
 rm -rf "$TMPHOST"
 if echo "$OUT" | grep -q "hello from host"; then
     pass "virtiofs mount: file visible inside container"
@@ -230,7 +233,7 @@ pelagos ping > /dev/null 2>&1 || true
 sleep 1
 
 # Simple exec: output from echo
-OUT=$(pelagos exec alpine /bin/echo hello)
+OUT=$(pelagos exec "$TEST_IMAGE" /bin/echo hello)
 echo "$OUT" | grep -v "^\["
 if echo "$OUT" | grep -q "^hello$"; then
     pass "exec: output correct"
@@ -239,7 +242,7 @@ else
 fi
 
 # Stdin forwarding: pipe data to cat
-OUT=$(echo "hello from stdin" | pelagos exec alpine cat)
+OUT=$(echo "hello from stdin" | pelagos exec "$TEST_IMAGE" cat)
 echo "$OUT" | grep -v "^\["
 if echo "$OUT" | grep -q "hello from stdin"; then
     pass "exec: stdin forwarded and echoed back"
@@ -279,7 +282,7 @@ fi
 
 echo ""
 echo "=== test 7b: exec -t (tty mode) ==="
-OUT=$(pelagos exec -t alpine /bin/echo hello-tty 2>&1 | tr -d '\r')
+OUT=$(pelagos exec -t "$TEST_IMAGE" /bin/echo hello-tty 2>&1 | tr -d '\r')
 echo "$OUT" | grep -v "^\["
 if echo "$OUT" | grep -q "hello-tty"; then
     pass "exec -t: PTY output correct"
@@ -304,7 +307,7 @@ echo "=== test 8: run --detach --name ==="
 pelagos ping > /dev/null 2>&1 || true
 sleep 1
 LC_NAME="pelagos-lc-test-$$"
-OUT=$(pelagos run --detach --name "$LC_NAME" alpine /bin/sh -c "echo lc-output; sleep 15")
+OUT=$(pelagos run --detach --name "$LC_NAME" "$TEST_IMAGE" /bin/sh -c "echo lc-output; sleep 15")
 echo "$OUT" | grep -v "^\["
 if echo "$OUT" | grep -q "$LC_NAME"; then
     pass "run --detach: printed container name '${LC_NAME}'"

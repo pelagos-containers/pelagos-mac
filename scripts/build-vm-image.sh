@@ -203,12 +203,12 @@ if [ ! -f "$INITRAMFS_OUT" ]; then
         [ awk basename cat chgrp chmod chown chroot clear cmp cp cut date dd \
         df diff dirname dmesg du echo env expr false find grep egrep fgrep \
         gunzip gzip head hostname id ifconfig install kill killall ln ls \
-        md5sum mkdir mkfifo mktemp more mount mv nc netstat nslookup od \
+        md5sum mkdir mkfifo mke2fs mktemp more mount mv nc netstat nslookup od \
         paste ping ping6 pkill pgrep printenv printf ps pwd readlink \
         realpath renice reset rm rmdir route sed seq sha256sum sleep sort \
         split stat strings stty su sync tail tar tee test timeout top touch \
         tr true tty umount uname uniq uptime vi watch wc wget which xargs \
-        yes zcat free
+        yes zcat free blkid
     do
         target="$INITRD_TMP/bin/$applet"
         [ -e "$target" ] || ln -sf busybox "$target"
@@ -362,7 +362,19 @@ for kv in \$CMDLINE; do
     esac
 done
 
-export PELAGOS_IMAGE_STORE=/run/pelagos
+# Mount the virtio block device (/dev/vda) as the persistent OCI image cache.
+# On first boot the disk is blank; format it as ext2 then mount.
+# On subsequent boots mount directly (format check via blkid).
+busybox mkdir -p /var/lib/pelagos
+if busybox blkid /dev/vda 2>/dev/null | busybox grep -q ext2; then
+    busybox mount -t ext2 /dev/vda /var/lib/pelagos 2>/dev/null || true
+else
+    echo "[pelagos-init] formatting /dev/vda as ext2 for image cache..."
+    mke2fs -F /dev/vda 2>/dev/null && \
+        busybox mount -t ext2 /dev/vda /var/lib/pelagos 2>/dev/null || true
+fi
+
+export PELAGOS_IMAGE_STORE=/var/lib/pelagos
 
 exec /usr/local/bin/pelagos-guest
 INIT_EOF
@@ -380,10 +392,11 @@ fi
 echo "[8/8] Creating placeholder disk image"
 # ---------------------------------------------------------------------------
 if [ ! -f "$DISK_IMG" ]; then
-    # AVF requires at least one block device in the VM config.
-    # Our init doesn't mount it, so 64 MiB of zeros is sufficient.
-    dd if=/dev/zero of="$DISK_IMG" bs=1m count=64 2>/dev/null
-    echo "  disk: $DISK_IMG (64 MiB placeholder)"
+    # 512 MiB sparse file — formatted as ext2 by the VM on first boot and
+    # mounted at /var/lib/pelagos for the persistent OCI image cache.
+    # Using a sparse file keeps the on-disk footprint near zero until data is written.
+    dd if=/dev/zero of="$DISK_IMG" bs=1m count=0 seek=512 2>/dev/null
+    echo "  disk: $DISK_IMG (512 MiB sparse, formatted on first boot)"
 else
     echo "  (cached: $DISK_IMG)"
 fi
