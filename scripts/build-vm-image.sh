@@ -194,6 +194,26 @@ if [ ! -f "$INITRAMFS_OUT" ]; then
     mkdir -p "$INITRD_TMP"
     bsdtar -xpf "$WORK/initramfs-virt" -C "$INITRD_TMP" 2>/dev/null || true
 
+    # Create busybox applet symlinks in /bin.
+    # Alpine's virt initramfs only ships /bin/sh → busybox; all other applets
+    # must be symlinked explicitly.  busybox --install is not compiled in.
+    # Only create a symlink if one does not already exist (preserves real binaries).
+    echo "  creating busybox applet symlinks"
+    for applet in \
+        [ awk basename cat chgrp chmod chown chroot clear cmp cp cut date dd \
+        df diff dirname dmesg du echo env expr false find grep egrep fgrep \
+        gunzip gzip head hostname id ifconfig install kill killall ln ls \
+        md5sum mkdir mkfifo mktemp more mount mv nc netstat nslookup od \
+        paste ping ping6 pkill pgrep printenv printf ps pwd readlink \
+        realpath renice reset rm rmdir route sed seq sha256sum sleep sort \
+        split stat strings stty su sync tail tar tee test timeout top touch \
+        tr true tty umount uname uniq uptime vi watch wc wget which xargs \
+        yes zcat free
+    do
+        target="$INITRD_TMP/bin/$applet"
+        [ -e "$target" ] || ln -sf busybox "$target"
+    done
+
     # Add vsock modules
     mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/net/vmw_vsock"
     for ko in vsock.ko vmw_vsock_virtio_transport_common.ko vmw_vsock_virtio_transport.ko; do

@@ -257,10 +257,8 @@ fi
 
 echo ""
 echo "=== test 7a: vm shell (non-tty) ==="
-# Use /bin/busybox directly — always present in the Alpine initramfs regardless
-# of whether busybox --install created applet symlinks.
 OUT=$(pelagos vm shell <<'VMEOF'
-/bin/busybox uname -s
+uname -s
 VMEOF
 )
 echo "$OUT" | grep -v "^\["
