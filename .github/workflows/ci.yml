@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    name: Build and test (macOS)
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check -p pelagos-mac -p pelagos-vz
+
+      - name: Build pelagos-mac (release)
+        run: cargo build --release -p pelagos-mac
+
+      - name: Clippy
+        run: cargo clippy -p pelagos-mac -p pelagos-vz -- -D warnings
+
+      - name: Unit tests
+        run: cargo test -p pelagos-mac

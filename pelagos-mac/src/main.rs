@@ -134,10 +134,17 @@ fn main() {
             daemon::run(args); // -> !
         }
 
-        Commands::Vm { sub: VmCommands::Stop } => vm_stop(),
-        Commands::Vm { sub: VmCommands::Status } => vm_status(),
+        Commands::Vm {
+            sub: VmCommands::Stop,
+        } => vm_stop(),
+        Commands::Vm {
+            sub: VmCommands::Status,
+        } => vm_status(),
 
-        Commands::Run { ref image, ref args } => {
+        Commands::Run {
+            ref image,
+            ref args,
+        } => {
             let image = image.clone();
             let args = args.clone();
             let daemon_args = daemon_args_from_cli(&cli);

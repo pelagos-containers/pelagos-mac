@@ -335,9 +335,7 @@ impl Vm {
                 *state_holder2.lock().unwrap() = state;
             });
             let state = *state_holder.lock().unwrap();
-            if state == VZVirtualMachineState::Stopped
-                || state == VZVirtualMachineState::Error
-            {
+            if state == VZVirtualMachineState::Stopped || state == VZVirtualMachineState::Error {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));

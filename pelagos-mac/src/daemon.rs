@@ -31,6 +31,9 @@ use crate::state::StateDir;
 // ---------------------------------------------------------------------------
 
 /// A single virtiofs host→guest mount.
+///
+/// Carried in `DaemonArgs` and persisted in the state dir so that subsequent
+/// CLI invocations can verify they are compatible with the running daemon.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VirtiofsShare {
     /// Host directory to expose.
@@ -55,7 +58,7 @@ pub struct DaemonArgs {
     pub cmdline: String,
     pub memory_mib: usize,
     pub cpus: usize,
-    /// virtiofs shares requested for this invocation.
+    /// virtiofs shares requested for this invocation (may be empty).
     pub virtiofs_shares: Vec<VirtiofsShare>,
 }
 
@@ -190,7 +193,10 @@ pub fn run(args: DaemonArgs) -> ! {
         unsafe {
             // Store flag pointer globally for the C-level signal handler.
             SHUTDOWN_FLAG = Arc::into_raw(flag);
-            libc::signal(libc::SIGTERM, sigterm_handler as *const () as libc::sighandler_t);
+            libc::signal(
+                libc::SIGTERM,
+                sigterm_handler as *const () as libc::sighandler_t,
+            );
         }
     }
 
@@ -320,14 +326,113 @@ fn build_vm_config(args: &DaemonArgs) -> VmConfig {
 
 /// Build the kernel cmdline from DaemonArgs.
 ///
-/// Appends `virtiofs.tags=share0,share1,...` when shares are present so the
-/// guest init script can mount them before exec'ing pelagos-guest.
+/// Delegates to `build_cmdline_from_parts` so the core logic is unit-testable
+/// without constructing a full DaemonArgs.
 fn build_cmdline(args: &DaemonArgs) -> String {
-    let mut cmdline = args.cmdline.clone();
-    if !args.virtiofs_shares.is_empty() {
-        let tags: Vec<&str> = args.virtiofs_shares.iter().map(|s| s.tag.as_str()).collect();
+    build_cmdline_from_parts(&args.cmdline, &args.virtiofs_shares)
+}
+
+/// Append `virtiofs.tags=tag0,tag1,...` to `base` when shares are present.
+///
+/// The guest init script reads this parameter to mount each virtiofs share
+/// before exec'ing pelagos-guest.  Extracted as a pure function for testability.
+pub(crate) fn build_cmdline_from_parts(base: &str, shares: &[VirtiofsShare]) -> String {
+    let mut cmdline = base.to_owned();
+    if !shares.is_empty() {
+        let tags: Vec<&str> = shares.iter().map(|s| s.tag.as_str()).collect();
         cmdline.push_str(" virtiofs.tags=");
         cmdline.push_str(&tags.join(","));
     }
     cmdline
+}
+
+/// Return true when two share lists are configuration-equivalent.
+#[cfg(test)]
+pub(crate) fn mounts_match(a: &[VirtiofsShare], b: &[VirtiofsShare]) -> bool {
+    a == b
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::{build_cmdline_from_parts, mounts_match, VirtiofsShare};
+    use std::path::PathBuf;
+
+    fn share(tag: &str, host: &str, container: &str, ro: bool) -> VirtiofsShare {
+        VirtiofsShare {
+            host_path: PathBuf::from(host),
+            tag: tag.to_owned(),
+            read_only: ro,
+            container_path: container.to_owned(),
+        }
+    }
+
+    #[test]
+    fn cmdline_no_shares() {
+        assert_eq!(build_cmdline_from_parts("console=hvc0", &[]), "console=hvc0");
+    }
+
+    #[test]
+    fn cmdline_one_share() {
+        let shares = vec![share("share0", "/host/data", "/data", false)];
+        assert_eq!(
+            build_cmdline_from_parts("console=hvc0", &shares),
+            "console=hvc0 virtiofs.tags=share0"
+        );
+    }
+
+    #[test]
+    fn cmdline_two_shares() {
+        let shares = vec![
+            share("share0", "/host/data", "/data", false),
+            share("share1", "/host/cfg", "/etc/cfg", true),
+        ];
+        assert_eq!(
+            build_cmdline_from_parts("console=hvc0", &shares),
+            "console=hvc0 virtiofs.tags=share0,share1"
+        );
+    }
+
+    #[test]
+    fn cmdline_preserves_existing_params() {
+        let shares = vec![share("share0", "/host/x", "/x", false)];
+        assert_eq!(
+            build_cmdline_from_parts("console=hvc0 quiet", &shares),
+            "console=hvc0 quiet virtiofs.tags=share0"
+        );
+    }
+
+    #[test]
+    fn mounts_match_empty() {
+        assert!(mounts_match(&[], &[]));
+    }
+
+    #[test]
+    fn mounts_match_identical() {
+        let a = vec![share("share0", "/host/a", "/a", false)];
+        assert!(mounts_match(&a, &a.clone()));
+    }
+
+    #[test]
+    fn mounts_mismatch_different_path() {
+        let a = vec![share("share0", "/host/a", "/a", false)];
+        let b = vec![share("share0", "/host/b", "/a", false)];
+        assert!(!mounts_match(&a, &b));
+    }
+
+    #[test]
+    fn mounts_mismatch_different_length() {
+        let a = vec![share("share0", "/host/a", "/a", false)];
+        assert!(!mounts_match(&a, &[]));
+    }
+
+    #[test]
+    fn mounts_mismatch_readonly_flag() {
+        let a = vec![share("share0", "/host/a", "/a", false)];
+        let b = vec![share("share0", "/host/a", "/a", true)];
+        assert!(!mounts_match(&a, &b));
+    }
 }
