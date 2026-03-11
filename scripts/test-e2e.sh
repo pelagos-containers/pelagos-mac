@@ -247,6 +247,25 @@ else
     fail "exec: expected 'hello from stdin', got: $(echo "$OUT" | grep -v '^\[')"
 fi
 
+# ---------------------------------------------------------------------------
+# Test 7b: exec with explicit -t (TTY / PTY mode)
+#
+# PTY output uses \r\n line endings; strip \r before comparing.
+# This test catches two failure modes that are invisible in non-TTY context:
+#   1. /dev/pts not mounted in the VM (openpty returns ENOENT)
+#   2. TTY auto-detection logic choosing wrong mode
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== test 7b: exec -t (tty mode) ==="
+OUT=$(pelagos exec -t alpine /bin/echo hello-tty 2>&1 | tr -d '\r')
+echo "$OUT" | grep -v "^\["
+if echo "$OUT" | grep -q "hello-tty"; then
+    pass "exec -t: PTY output correct"
+else
+    fail "exec -t: expected 'hello-tty', got: $(echo "$OUT" | grep -v '^\[')"
+fi
+
 # Stop daemon so lifecycle tests get a clean slate.
 pelagos vm stop > /dev/null 2>&1 || true
 sleep 1
