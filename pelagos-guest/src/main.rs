@@ -750,6 +750,24 @@ fn handle_exec_tty(
         cmd.stderr(Stdio::from_raw_fd(slave_fd));
     }
 
+    // In the child (after fork, before exec): become a new session leader and
+    // acquire the PTY slave as the controlling terminal.  Without setsid() the
+    // child inherits the parent's session and TIOCSCTTY fails; without
+    // TIOCSCTTY the shell cannot set up job control and prints
+    // "can't access tty; job control turned off".
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0i32) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
