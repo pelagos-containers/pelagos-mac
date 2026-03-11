@@ -128,6 +128,8 @@ enum VmCommands {
     Stop,
     /// Show persistent VM daemon status
     Status,
+    /// Open an interactive shell directly in the VM (not in a container)
+    Shell,
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +167,11 @@ enum GuestCommand {
         args: Vec<String>,
         #[serde(default)]
         env: std::collections::HashMap<String, String>,
+        tty: bool,
+    },
+    /// Open a shell directly in the VM (no container, no namespaces).
+    Shell {
+        #[serde(skip_serializing_if = "is_false")]
         tty: bool,
     },
     Ps {
@@ -245,6 +252,18 @@ fn main() {
         Commands::Vm {
             sub: VmCommands::Status,
         } => vm_status(),
+        Commands::Vm {
+            sub: VmCommands::Shell,
+        } => {
+            let tty = unsafe { libc::isatty(libc::STDOUT_FILENO) } != 0;
+            let daemon_args = daemon_args_from_cli(&cli);
+            if let Err(e) = daemon::ensure_running(&daemon_args) {
+                log::error!("failed to start VM daemon: {}", e);
+                process::exit(1);
+            }
+            let stream = connect_or_exit();
+            process::exit(exec_command(stream, GuestCommand::Shell { tty }, tty));
+        }
 
         Commands::Run {
             ref image,
@@ -299,7 +318,16 @@ fn main() {
                 process::exit(1);
             }
             let stream = connect_or_exit();
-            process::exit(exec_command(stream, image, args, tty));
+            process::exit(exec_command(
+                stream,
+                GuestCommand::Exec {
+                    image,
+                    args,
+                    env: std::collections::HashMap::new(),
+                    tty,
+                },
+                tty,
+            ));
         }
 
         Commands::Ping => {
@@ -559,17 +587,13 @@ fn ping_command(stream: UnixStream) -> i32 {
 
 /// Run an exec command: send the exec JSON handshake, read ready ack, then
 /// switch to framed binary protocol forwarding stdin/stdout/stderr.
-fn exec_command(stream: UnixStream, image: String, args: Vec<String>, tty: bool) -> i32 {
+/// Send an exec-style command (Exec or Shell) and handle the binary frame protocol.
+/// `tty` controls whether the host terminal is put into raw mode.
+fn exec_command(stream: UnixStream, cmd: GuestCommand, tty: bool) -> i32 {
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
     let mut writer = stream.try_clone().expect("clone stream");
 
-    // Send exec handshake.
-    let cmd = GuestCommand::Exec {
-        image,
-        args,
-        env: std::collections::HashMap::new(),
-        tty,
-    };
+    // Send handshake.
     let mut msg = serde_json::to_string(&cmd).unwrap();
     msg.push('\n');
     if let Err(e) = writer.write_all(msg.as_bytes()) {
@@ -949,6 +973,24 @@ mod tests {
         assert_eq!(v["cmd"], "rm");
         assert_eq!(v["name"], "mybox");
         assert_eq!(v["force"], true);
+    }
+
+    #[test]
+    fn shell_command_serializes() {
+        let cmd = GuestCommand::Shell { tty: true };
+        let json = serde_json::to_string(&cmd).expect("serialize failed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "shell");
+        assert_eq!(v["tty"], true);
+    }
+
+    #[test]
+    fn shell_command_omits_tty_when_false() {
+        let cmd = GuestCommand::Shell { tty: false };
+        let json = serde_json::to_string(&cmd).expect("serialize failed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "shell");
+        assert!(v["tty"].is_null(), "tty should be omitted when false");
     }
 
     #[test]

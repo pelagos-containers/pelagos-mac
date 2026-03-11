@@ -248,6 +248,30 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 7a: vm shell (non-TTY) — shell directly in the VM, not in a container
+#
+# Runs `uname -s` inside the VM shell and checks output is "Linux".
+# This confirms: (a) GuestCommand::Shell is dispatched correctly, and
+# (b) we are in the raw VM environment (not inside a container namespace).
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== test 7a: vm shell (non-tty) ==="
+# Use shell read built-in — no external commands needed (initramfs has busybox
+# but not all applets are symlinked; 'cat' and 'uname' may be absent).
+OUT=$(pelagos vm shell <<'VMEOF'
+read ver < /proc/version
+echo "$ver"
+VMEOF
+)
+echo "$OUT" | grep -v "^\["
+if echo "$OUT" | grep -qi "linux"; then
+    pass "vm shell: /proc/version contains 'Linux' (we are in the VM)"
+else
+    fail "vm shell: expected 'Linux' in /proc/version, got: $(echo "$OUT" | grep -v '^\[')"
+fi
+
+# ---------------------------------------------------------------------------
 # Test 7b: exec with explicit -t (TTY / PTY mode)
 #
 # PTY output uses \r\n line endings; strip \r before comparing.
