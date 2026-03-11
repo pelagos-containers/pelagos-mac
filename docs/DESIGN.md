@@ -487,6 +487,22 @@ management. Those come after the architecture is validated.
 - macOS 13.5+ minimum for full feature set. A macOS 12 fallback (drop virtiofs +
   Rosetta) is possible but not a priority.
 
+### Known operational limitation: PF/NAT state degradation (issue #26)
+
+`VZNATNetworkDeviceAttachment` relies on macOS `InternetSharing` to install NAT
+masquerade rules via the kernel's packet filter (PF). After approximately 5 VM
+lifecycles in a single session, InternetSharing loses its connection to the PF
+device. Symptoms: all outbound TCP from inside the VM fails silently; `pelagos image
+pull` reports "error sending request for url". ICMP (ping) continues working because
+it routes through a different PF rule set.
+
+**Recovery:** `sudo pfctl -f /etc/pf.conf`
+
+This is an OS-level issue with `InternetSharing`'s PF anchor management, not a bug
+in our code. The long-term fix is the persistent VM (Phase 2): with one VM reused
+across many `pelagos run` calls, the VM lifecycle count stays at 1 and the issue
+does not manifest.
+
 ---
 
 ## Recommendation

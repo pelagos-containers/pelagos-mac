@@ -241,8 +241,33 @@ twice in a row on real hardware (2026-03-10).
   for development.
 - vsock connect: `VZVirtioSocketDevice::connectToPort_completionHandler` connects
   host→guest. The guest must be listening before the host connects — `connect_vsock()`
-  includes a 30-attempt retry loop with 1-second backoff.
+  includes a 60-attempt retry loop with 1-second backoff (covers 45s ping-gate worst-case).
 - virtiofsd (host side) not yet wired in — Phase 2 item.
 - macOS 13.5+ required for full feature set.
 - The `com.apple.security.virtualization` entitlement is required at runtime; the
   binary must be signed before execution.
+
+### ⚠️ Known: PF/NAT state degrades after ~5 VM runs (issue #26)
+
+`VZNATNetworkDeviceAttachment` uses macOS `InternetSharing` to manage `bridge100`
+and install packet-filter (PF) NAT masquerade rules. After several VM lifecycles,
+InternetSharing loses its PF device connection:
+
+```
+InternetSharing: [com.apple.pf:framework] connection error: Connection invalid
+```
+
+When this happens, ICMP (ping) still routes but all TCP connections from inside
+the VM fail, causing `pelagos image pull` to fail with "error sending request".
+
+**Workaround:**
+```bash
+sudo pfctl -f /etc/pf.conf
+```
+
+This reloads PF from scratch and lets InternetSharing re-establish cleanly.
+Symptoms: image pulls all fail with "error sending request for url (https://...)".
+`launchctl stop/start com.apple.InternetSharing` does NOT fix it.
+
+**Long-term fix:** persistent VM (Phase 2 Task D) sidesteps this entirely by
+reusing one VM across many `pelagos run` calls instead of booting fresh each time.
