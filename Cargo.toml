@@ -3,6 +3,7 @@ members = [
     "pelagos-vz",
     "pelagos-guest",
     "pelagos-mac",
+    "pelagos-docker",
 ]
 resolver = "2"
 

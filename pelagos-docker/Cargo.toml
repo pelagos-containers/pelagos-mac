@@ -1,0 +1,16 @@
+[package]
+name = "pelagos-docker"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Docker CLI shim for pelagos-mac (devcontainer support)"
+
+[[bin]]
+name = "pelagos-docker"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
