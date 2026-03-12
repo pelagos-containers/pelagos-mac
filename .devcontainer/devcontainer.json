@@ -1,0 +1,5 @@
+{
+  "name": "pelagos-smoke-test",
+  "image": "ubuntu:24.04",
+  "postCreateCommand": "echo 'devcontainer ready'"
+}

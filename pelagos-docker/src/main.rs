@@ -54,6 +54,9 @@ enum DockerCmd {
         /// Bind mount: /host:/container.
         #[arg(short = 'v', long = "volume")]
         volumes: Vec<String>,
+        /// --mount type=bind,source=X,target=Y (newer bind-mount syntax).
+        #[arg(long = "mount")]
+        mounts: Vec<String>,
         /// Environment variable KEY=VALUE.
         #[arg(short = 'e', long = "env")]
         env: Vec<String>,
@@ -61,7 +64,7 @@ enum DockerCmd {
         #[arg(short = 'p', long = "publish")]
         ports: Vec<String>,
         /// Label KEY=VALUE (stored in sidecar, not forwarded to pelagos).
-        #[arg(long = "label")]
+        #[arg(short = 'l', long = "label")]
         labels: Vec<String>,
         /// Override entrypoint.
         #[arg(long)]
@@ -69,9 +72,23 @@ enum DockerCmd {
         /// Remove container on exit (no-op: pelagos containers persist until rm).
         #[arg(long)]
         rm: bool,
+        /// Attach to stdout/stderr (ignored: output is always streamed).
+        #[arg(short = 'a', long = "attach")]
+        attach: Vec<String>,
+        /// Proxy signals to container process (ignored).
+        #[arg(long = "sig-proxy")]
+        sig_proxy: Option<String>,
         /// Image and optional command+args.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         image_and_args: Vec<String>,
+    },
+
+    /// Stream container events (blocks until killed; stub for devcontainer compatibility).
+    Events {
+        #[arg(long)]
+        format: Option<String>,
+        #[arg(long = "filter")]
+        filters: Vec<String>,
     },
 
     /// Execute a command in a running container.
@@ -82,6 +99,12 @@ enum DockerCmd {
         tty: bool,
         #[arg(short = 'e', long = "env")]
         env: Vec<String>,
+        /// User to run the command as (passed through to exec-into).
+        #[arg(short = 'u', long = "user")]
+        user: Option<String>,
+        /// Detach keys (ignored).
+        #[arg(long = "detach-keys")]
+        detach_keys: Option<String>,
         /// Container name followed by command and arguments.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         name_and_args: Vec<String>,
@@ -99,8 +122,10 @@ enum DockerCmd {
 
     /// List containers.
     Ps {
-        #[arg(long)]
+        #[arg(short = 'a', long)]
         all: bool,
+        #[arg(short = 'q', long)]
+        quiet: bool,
         #[arg(long = "filter")]
         filters: Vec<String>,
         #[arg(long)]
@@ -154,11 +179,14 @@ fn main() {
             name,
             detach,
             volumes,
+            mounts,
             env,
             ports,
             labels,
             entrypoint,
             rm: _,
+            attach: _,
+            sig_proxy: _,
             image_and_args,
         } => cmd_run(
             &cfg,
@@ -166,6 +194,7 @@ fn main() {
                 name,
                 detach,
                 volumes,
+                mounts,
                 env,
                 ports,
                 label_args: labels,
@@ -177,22 +206,33 @@ fn main() {
             interactive,
             tty,
             env,
+            user,
+            detach_keys: _,
             name_and_args,
-        } => cmd_exec(&cfg, interactive, tty, &env, &name_and_args),
+        } => cmd_exec(
+            &cfg,
+            interactive,
+            tty,
+            user.as_deref(),
+            &env,
+            &name_and_args,
+        ),
         DockerCmd::Stop { name } => cmd_stop(&cfg, &name),
         DockerCmd::Rm { force, name } => cmd_rm(&cfg, force, &name),
         DockerCmd::Ps {
             all,
+            quiet,
             filters,
             format,
-        } => cmd_ps(&cfg, all, &filters, format.as_deref()),
+        } => cmd_ps(&cfg, all, quiet, &filters, format.as_deref()),
         DockerCmd::Logs { follow, name } => cmd_logs(&cfg, follow, &name),
         DockerCmd::Inspect {
             inspect_type,
             names,
         } => cmd_inspect(&cfg, inspect_type.as_deref(), &names),
-        DockerCmd::Version { format: _ } => cmd_version(),
+        DockerCmd::Version { format } => cmd_version_with_format(format.as_deref()),
         DockerCmd::Info { format: _ } => cmd_info(),
+        DockerCmd::Events { .. } => cmd_events(),
     };
 
     process::exit(exit_code);
@@ -239,6 +279,7 @@ struct RunOpts {
     name: Option<String>,
     detach: bool,
     volumes: Vec<String>,
+    mounts: Vec<String>,
     env: Vec<String>,
     ports: Vec<String>,
     label_args: Vec<String>,
@@ -246,11 +287,35 @@ struct RunOpts {
     image_and_args: Vec<String>,
 }
 
+/// Parse `--mount type=bind,source=X,target=Y[,...]` into a `-v X:Y` string.
+fn parse_mount_as_volume(mount_spec: &str) -> Option<String> {
+    let mut source = None;
+    let mut target = None;
+    for part in mount_spec.split(',') {
+        if let Some(v) = part.strip_prefix("source=") {
+            source = Some(v);
+        } else if let Some(v) = part.strip_prefix("src=") {
+            source = Some(v);
+        } else if let Some(v) = part.strip_prefix("target=") {
+            target = Some(v);
+        } else if let Some(v) = part.strip_prefix("dst=") {
+            target = Some(v);
+        } else if let Some(v) = part.strip_prefix("destination=") {
+            target = Some(v);
+        }
+    }
+    match (source, target) {
+        (Some(s), Some(t)) => Some(format!("{}:{}", s, t)),
+        _ => None,
+    }
+}
+
 fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
     let RunOpts {
         name,
         detach,
         volumes,
+        mounts,
         env,
         ports,
         label_args,
@@ -275,16 +340,30 @@ fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
 
     sub.push("run".into());
 
-    if let Some(ref n) = name {
-        sub.push("--name".into());
-        sub.push(n.into());
-    }
+    // If no --name was given, generate one so labels can be stored correctly.
+    // pelagos auto-assigns names like "pelagos-N" which we don't know in advance.
+    let effective_name: String = name.clone().unwrap_or_else(|| {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_millis();
+        format!("dc-{}", ts)
+    });
+    sub.push("--name".into());
+    sub.push(effective_name.as_str().into());
     if detach {
         sub.push("--detach".into());
     }
     for v in &volumes {
         sub.push("-v".into());
         sub.push(v.into());
+    }
+    // Convert --mount type=bind,source=X,target=Y to -v X:Y.
+    for m in &mounts {
+        if let Some(vol) = parse_mount_as_volume(m) {
+            sub.push("-v".into());
+            sub.push(vol.into());
+        }
     }
     for e in &env {
         sub.push("-e".into());
@@ -305,9 +384,9 @@ fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
         }
     }
 
-    // Store labels in sidecar (resolve container name).
+    // Store labels in sidecar under the effective container name.
     if !label_args.is_empty() {
-        let container_name = name.clone().unwrap_or_else(|| image.clone());
+        let container_name = effective_name.clone();
         let mut label_map = HashMap::new();
         for kv in &label_args {
             if let Some((k, v)) = kv.split_once('=') {
@@ -333,6 +412,7 @@ fn cmd_exec(
     cfg: &Config,
     _interactive: bool,
     tty: bool,
+    user: Option<&str>,
     _env: &[String],
     name_and_args: &[String],
 ) -> i32 {
@@ -350,6 +430,10 @@ fn cmd_exec(
     if tty {
         sub.push("-t".into());
     }
+    if let Some(u) = user {
+        sub.push("--user".into());
+        sub.push(u.into());
+    }
     sub.push(name.into());
     for a in cmd_args {
         sub.push(a.into());
@@ -362,6 +446,17 @@ fn cmd_exec(
             1
         }
     }
+}
+
+fn cmd_version_with_format(format: Option<&str>) -> i32 {
+    // devcontainer calls `docker version --format {{.Server.Version}}` to get a bare version.
+    if let Some(fmt) = format {
+        if fmt.contains("Server.Version") || fmt.contains("server.version") {
+            println!("20.10.0");
+            return 0;
+        }
+    }
+    cmd_version()
 }
 
 fn cmd_version() -> i32 {
@@ -428,6 +523,75 @@ fn cmd_info() -> i32 {
     0
 }
 
+/// `docker events` implementation. Polls `pelagos ps` every 500ms and emits a
+/// JSON start event for each newly-seen container. Blocks until killed.
+///
+/// devcontainer CLI uses `docker events --filter event=start` to detect when
+/// a container has started. Without real-time event support, we poll ps and
+/// emit synthetic start events when new containers appear.
+fn cmd_events() -> i32 {
+    use std::collections::HashSet;
+    use std::io::Write;
+
+    let cfg = match config::Config::load() {
+        Ok(c) => c,
+        Err(_) => {
+            // Can't locate pelagos; block forever so devcontainer CLI can kill us.
+            let mut buf = String::new();
+            let _ = std::io::stdin().read_line(&mut buf);
+            return 0;
+        }
+    };
+
+    let mut known: HashSet<String> = HashSet::new();
+    // Seed with existing containers so we only emit events for NEW ones.
+    if let Ok(out) = run_pelagos(&cfg, &args(&["ps", "--all"])) {
+        let s = String::from_utf8_lossy(&out.stdout);
+        for e in parse_pelagos_ps(&s) {
+            known.insert(e.name);
+        }
+    }
+
+    let stdout = std::io::stdout();
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if let Ok(out) = run_pelagos(&cfg, &args(&["ps", "--all"])) {
+            let s = String::from_utf8_lossy(&out.stdout);
+            for e in parse_pelagos_ps(&s) {
+                if known.insert(e.name.clone()) {
+                    // New container — emit a start event.
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    // Include sidecar labels in Actor.Attributes so devcontainer CLI
+                    // can verify the event belongs to the container it launched.
+                    let mut attrs: HashMap<String, String> = labels::get(&e.name);
+                    attrs.insert("image".into(), e.image.clone());
+                    attrs.insert("name".into(), e.name.clone());
+                    let event = serde_json::json!({
+                        "status": "start",
+                        "id": e.name,
+                        "from": e.image,
+                        "Type": "container",
+                        "Action": "start",
+                        "Actor": {
+                            "ID": e.name,
+                            "Attributes": attrs
+                        },
+                        "scope": "local",
+                        "time": now,
+                        "timeNano": now * 1_000_000_000u64
+                    });
+                    let mut lock = stdout.lock();
+                    let _ = writeln!(lock, "{}", event);
+                    let _ = lock.flush();
+                }
+            }
+        }
+    }
+}
+
 fn cmd_stop(cfg: &Config, name: &str) -> i32 {
     match run_pelagos_inherited(cfg, &args(&["stop", name])) {
         Ok(s) => s.code().unwrap_or(1),
@@ -454,7 +618,7 @@ fn cmd_rm(cfg: &Config, force: bool, name: &str) -> i32 {
     }
 }
 
-fn cmd_ps(cfg: &Config, all: bool, filters: &[String], format: Option<&str>) -> i32 {
+fn cmd_ps(cfg: &Config, all: bool, quiet: bool, filters: &[String], format: Option<&str>) -> i32 {
     let mut sub = args(&["ps"]);
     if all {
         sub.push("--all".into());
@@ -470,12 +634,33 @@ fn cmd_ps(cfg: &Config, all: bool, filters: &[String], format: Option<&str>) -> 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut entries = parse_pelagos_ps(&stdout);
 
-    // Apply --filter name=<value> filters.
+    // Apply --filter filters.
     for f in filters {
         if let Some(val) = f.strip_prefix("name=") {
             entries.retain(|e| e.name.contains(val));
+        } else if let Some(kv) = f.strip_prefix("label=") {
+            // Filter by sidecar label. Format: label=key=value or label=key.
+            entries.retain(|e| {
+                let container_labels = labels::get(&e.name);
+                if let Some((label_key, label_val)) = kv.split_once('=') {
+                    container_labels
+                        .get(label_key)
+                        .map(|v| v == label_val)
+                        .unwrap_or(false)
+                } else {
+                    container_labels.contains_key(kv)
+                }
+            });
         }
         // Other filter types (status=, etc.) silently ignored for now.
+    }
+
+    // -q: output only container IDs (we use names as IDs).
+    if quiet {
+        for e in &entries {
+            println!("{}", e.name);
+        }
+        return 0;
     }
 
     let emit_json = format
@@ -585,6 +770,11 @@ fn cmd_inspect_container(cfg: &Config, names: &[String]) -> i32 {
                 config: ContainerConfig {
                     image: entry.image.clone(),
                     labels: container_labels,
+                    user: String::new(),
+                    env: vec![],
+                    cmd: vec![],
+                    working_dir: String::new(),
+                    entrypoint: None,
                 },
                 mounts: vec![],
                 network_settings: NetworkSettings { ports },
@@ -614,6 +804,14 @@ fn cmd_inspect_image(cfg: &Config, names: &[String]) -> i32 {
         .map(|n| ImageInspect {
             id: n.clone(),
             repo_tags: vec![n.clone()],
+            config: docker_types::ImageConfig {
+                user: String::new(),
+                env: vec![],
+                cmd: vec![],
+                working_dir: String::new(),
+                entrypoint: None,
+                labels: HashMap::new(),
+            },
         })
         .collect();
     println!("{}", serde_json::to_string_pretty(&results).unwrap());

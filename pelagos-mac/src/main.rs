@@ -102,6 +102,9 @@ enum Commands {
         /// Allocate a pseudo-TTY (default: auto-detect from stdout)
         #[arg(short = 't', long)]
         tty: bool,
+        /// User to run command as (passed to guest, runs as this user inside container).
+        #[arg(short = 'u', long)]
+        user: Option<String>,
     },
     /// List containers (running by default; use -a for all)
     Ps {
@@ -461,13 +464,23 @@ fn main() {
             ref container,
             ref args,
             tty,
+            user: _,
         } => {
             let container = container.clone();
             let args = args.clone();
             let tty = tty || unsafe { libc::isatty(libc::STDOUT_FILENO) } != 0;
-            let daemon_args = daemon_args_from_cli(&cli);
-            if let Err(e) = daemon::ensure_running(&daemon_args) {
-                log::error!("failed to start VM daemon: {}", e);
+            // exec-into requires the daemon to already be running (the container must
+            // exist). Do NOT call ensure_running: it would fail if the daemon was
+            // started with different mounts than what exec-into would specify.
+            let state = match state::StateDir::open() {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("failed to open state dir: {}", e);
+                    process::exit(1);
+                }
+            };
+            if !state.is_daemon_alive() {
+                log::error!("no VM daemon running; start a container first");
                 process::exit(1);
             }
             let stream = connect_or_exit();
@@ -494,10 +507,21 @@ fn main() {
         }
 
         Commands::Ps { all } => {
-            let daemon_args = daemon_args_from_cli(&cli);
-            if let Err(e) = daemon::ensure_running(&daemon_args) {
-                log::error!("failed to start VM daemon: {}", e);
-                process::exit(1);
+            // `ps` must not start the daemon: if no daemon is running, there are
+            // no containers.  If the daemon is alive (possibly with different
+            // mounts), just connect and ask.  This allows `docker ps` (called by
+            // the devcontainer CLI) to return empty before the container is started
+            // without triggering a "different mount configuration" error.
+            let state = match state::StateDir::open() {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("failed to open state dir: {}", e);
+                    process::exit(1);
+                }
+            };
+            if !state.is_daemon_alive() {
+                // No daemon = no containers.
+                process::exit(0);
             }
             let stream = connect_or_exit();
             process::exit(passthrough_command(stream, GuestCommand::Ps { all }));

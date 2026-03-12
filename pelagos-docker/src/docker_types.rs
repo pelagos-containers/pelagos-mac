@@ -34,6 +34,11 @@ pub struct ContainerState {
 pub struct ContainerConfig {
     pub image: String,
     pub labels: HashMap<String, String>,
+    pub user: String,
+    pub env: Vec<String>,
+    pub cmd: Vec<String>,
+    pub working_dir: String,
+    pub entrypoint: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -51,7 +56,7 @@ pub struct PortBinding {
 }
 
 // ---------------------------------------------------------------------------
-// Image inspect (minimal stub — devcontainer only checks existence)
+// Image inspect
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
@@ -59,6 +64,18 @@ pub struct PortBinding {
 pub struct ImageInspect {
     pub id: String,
     pub repo_tags: Vec<String>,
+    pub config: ImageConfig,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ImageConfig {
+    pub user: String,
+    pub env: Vec<String>,
+    pub cmd: Vec<String>,
+    pub working_dir: String,
+    pub entrypoint: Option<Vec<String>>,
+    pub labels: HashMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------

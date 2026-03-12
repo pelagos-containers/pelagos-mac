@@ -1,14 +1,14 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-03-12, SHA fb924b7 (post-PR #65)*
+*Last updated: 2026-03-12, SHA dded184 (post-PR #66)*
 
 ---
 
 ## Current State
 
-**Phase 2 + Phase 3 VM Access COMPLETE. Phase 4 largely complete.** The full container
-lifecycle and all three VM access modes work end-to-end on real hardware. All 31 e2e tests
-pass (`bash scripts/test-e2e.sh`).
+**Phase 2 + Phase 3 + Phase 4 COMPLETE.** The full container lifecycle, all three VM access
+modes, and VS Code devcontainer CLI integration all work end-to-end on real hardware. All 31
+e2e tests pass (`bash scripts/test-e2e.sh`).
 
 ### What works today
 
@@ -29,6 +29,7 @@ pass (`bash scripts/test-e2e.sh`).
 | devpts mount + PTY job control | ✅ | PR #38/#40 |
 | `pelagos vm console` (hvc0 serial) | ✅ | PR #51 |
 | `pelagos vm ssh` (dropbear + ed25519 key) | ✅ | PR #52 |
+| `devcontainer up` (VS Code devcontainer CLI) | ✅ | PR #66 |
 
 ---
 
@@ -79,8 +80,10 @@ Goal: make pelagos-mac a backend for the [devcontainer CLI](https://github.com/d
 
 **Remaining Phase 4 work:**
 - issue #60: make pelagos runtime handle DNS natively (no guest-side workaround)
-- devcontainer CLI real integration test: `devcontainer up --docker-path pelagos-docker` against a minimal ubuntu devcontainer (requires npm + @devcontainers/cli)
 - issue #64 closed (PR #65): docker exec, version, info, inspect auto-detect all done
+- devcontainer up smoke test ✅ (PR #66): `devcontainer up --docker-path pelagos-docker` succeeds end-to-end (outcome="success"). All docker shim gaps filled: ps -q/filter, events polling, --mount bind syntax, auto-name, exec -u, ImageConfig.
+
+**Phase 4 complete.** All 31 e2e tests pass. devcontainer CLI integration confirmed working.
 
 See `docs/VM_LIFECYCLE.md` for the VM networking topology (socket_vmnet,
 192.168.105.x subnet).
