@@ -219,6 +219,10 @@ enum VmCommands {
 pub struct GuestMount {
     /// virtiofs tag (e.g. "share0") — already mounted at /mnt/<tag> in the guest.
     pub tag: String,
+    /// Relative path within the virtiofs mount to bind (empty = root of the share).
+    /// Used when a single broad share (e.g. $HOME as share0) covers multiple bind mounts.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subpath: String,
     /// Absolute path inside the container.
     pub container_path: String,
 }
@@ -498,13 +502,45 @@ fn main() {
                 })
                 .collect();
             let daemon_args = daemon_args_from_cli(&cli);
-            // Build the guest-side mount list from the parsed shares.
-            let mounts: Vec<GuestMount> = daemon_args
-                .virtiofs_shares
+            // Build the guest-side mount list from the user's -v flags.
+            // share0 is always $HOME; paths under $HOME use it via a subpath.
+            // Paths outside $HOME have their own shareN entry.
+            let home = std::env::var("HOME").unwrap_or_default();
+            let mounts: Vec<GuestMount> = cli
+                .volumes
                 .iter()
-                .map(|s| GuestMount {
-                    tag: s.tag.clone(),
-                    container_path: s.container_path.clone(),
+                .filter_map(|spec| {
+                    let parts: Vec<&str> = spec.splitn(3, ':').collect();
+                    if parts.len() < 2 {
+                        return None;
+                    }
+                    let host_path = parts[0];
+                    let container_path = parts[1].to_string();
+                    if !home.is_empty()
+                        && (host_path == home || host_path.starts_with(&format!("{}/", home)))
+                    {
+                        // Path is under $HOME — use share0 with a subpath.
+                        let subpath = host_path
+                            .strip_prefix(&format!("{}/", home))
+                            .unwrap_or("")
+                            .to_string();
+                        Some(GuestMount {
+                            tag: "share0".to_string(),
+                            subpath,
+                            container_path,
+                        })
+                    } else {
+                        // Path outside $HOME — find its own share by host path.
+                        let share = daemon_args
+                            .virtiofs_shares
+                            .iter()
+                            .find(|s| s.host_path == PathBuf::from(host_path))?;
+                        Some(GuestMount {
+                            tag: share.tag.clone(),
+                            subpath: String::new(),
+                            container_path,
+                        })
+                    }
                 })
                 .collect();
             if let Err(e) = daemon::ensure_running(&daemon_args) {
@@ -691,6 +727,28 @@ fn main() {
         Commands::Volume { ref sub, ref name } => {
             let sub = sub.clone();
             let name = name.clone();
+            // If no daemon is running there are no volumes.  Return immediately
+            // so devcontainer pre-flight checks don't trigger a full VM boot.
+            let state = match state::StateDir::open() {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("failed to open state dir: {}", e);
+                    process::exit(1);
+                }
+            };
+            if !state.is_daemon_alive() {
+                match sub.as_str() {
+                    "ls" => process::exit(0),
+                    "create" => {
+                        if let Some(n) = &name {
+                            println!("{}", n);
+                        }
+                        process::exit(0);
+                    }
+                    "rm" => process::exit(0),
+                    _ => process::exit(1), // inspect etc. require a running daemon
+                }
+            }
             let daemon_args = daemon_args_from_cli(&cli);
             if let Err(e) = daemon::ensure_running(&daemon_args) {
                 log::error!("failed to start VM daemon: {}", e);
@@ -706,6 +764,28 @@ fn main() {
         Commands::Network { ref sub, ref args } => {
             let sub = sub.clone();
             let args = args.clone();
+            // Same early-return pattern as Volume: pre-flight network checks
+            // should not boot the VM when no daemon is running.
+            let state = match state::StateDir::open() {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("failed to open state dir: {}", e);
+                    process::exit(1);
+                }
+            };
+            if !state.is_daemon_alive() {
+                match sub.as_str() {
+                    "ls" => process::exit(0),
+                    "create" => {
+                        if let Some(n) = args.last() {
+                            println!("{}", n);
+                        }
+                        process::exit(0);
+                    }
+                    "rm" => process::exit(0),
+                    _ => process::exit(1),
+                }
+            }
             let daemon_args = daemon_args_from_cli(&cli);
             if let Err(e) = daemon::ensure_running(&daemon_args) {
                 log::error!("failed to start VM daemon: {}", e);
@@ -751,7 +831,7 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
     });
 
     // Always-on volumes share: ~/.local/share/pelagos/volumes → /var/lib/pelagos/volumes in VM.
-    // This makes named pelagos volumes (images, bind data) persistent across VM restarts.
+    // This makes named pelagos volumes persistent across VM restarts (virtiofs-backed on host).
     let volumes_host = pelagos_volumes_host_path();
     if let Err(e) = std::fs::create_dir_all(&volumes_host) {
         log::warn!(
@@ -760,13 +840,17 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
             e
         );
     }
+    // pelagos-volumes is share0 (fixed tag, handled specially by the init script).
+    // build_virtiofs_shares then injects $HOME as the next share, ensuring every
+    // invocation (run, ps, exec-into, volume ls, etc.) starts the daemon with the
+    // same mount configuration — preventing mount-mismatch errors on daemon reuse.
     let mut virtiofs_shares = vec![daemon::VirtiofsShare {
         host_path: volumes_host,
         tag: "pelagos-volumes".to_string(),
         read_only: false,
         container_path: "/var/lib/pelagos/volumes".to_string(),
     }];
-    virtiofs_shares.extend(parse_volumes(&cli.volumes));
+    virtiofs_shares.extend(build_virtiofs_shares(&cli.volumes));
 
     let port_forwards = parse_ports(&cli.ports);
 
@@ -809,8 +893,69 @@ fn parse_ports(ports: &[String]) -> Vec<daemon::PortForward> {
         .collect()
 }
 
-/// Parse `-v /host/path:/container/path[:ro]` strings into `VirtiofsShare`s.
-/// Tags are assigned as `share0`, `share1`, etc.
+/// Build the virtiofs share list from the user's `-v` flags.
+///
+/// `$HOME` is always injected as the first share (`share0`).  Any user volume
+/// whose host path falls under `$HOME` is covered by this share and does not
+/// get its own entry; paths outside `$HOME` get `share1`, `share2`, etc.
+///
+/// This ensures that every invocation — `ps`, `volume ls`, `run -v ~/x:/y` —
+/// produces the same virtiofs share set, eliminating the "different mount
+/// configuration" error that would otherwise occur when pre-flight commands
+/// start the daemon before `run` does.
+fn build_virtiofs_shares(volumes: &[String]) -> Vec<daemon::VirtiofsShare> {
+    let home = std::env::var("HOME").ok();
+    let home_spec = home.as_deref().map(|h| format!("{}:", h));
+
+    // Determine whether the home share is already the first entry in volumes.
+    // This is true when we are re-invoked as vm-daemon-internal: the daemon
+    // start code passes `--volume $HOME:` first, so we must not add it again.
+    let home_already_present = home_spec
+        .as_ref()
+        .map(|hs| volumes.first().map(|v| v == hs).unwrap_or(false))
+        .unwrap_or(false);
+
+    let mut effective: Vec<String> = Vec::new();
+
+    if home_already_present {
+        // We are vm-daemon-internal: the home share is volumes[0] already.
+        // Keep it verbatim so parse_volumes assigns it share0.
+        effective.push(volumes[0].clone());
+        // Only add paths outside $HOME from the remaining volumes.
+        for v in &volumes[1..] {
+            let host = v.splitn(2, ':').next().unwrap_or("");
+            let under_home = home
+                .as_deref()
+                .map(|h| host == h || host.starts_with(&format!("{}/", h)))
+                .unwrap_or(false);
+            if !under_home {
+                effective.push(v.clone());
+            }
+        }
+    } else {
+        // Normal invocation: inject the home share as share0 first.
+        if let Some(ref hs) = home_spec {
+            effective.push(hs.clone());
+        }
+        // Add user volumes that are outside $HOME as per-path shares.
+        for v in volumes {
+            let host = v.splitn(2, ':').next().unwrap_or("");
+            let under_home = home
+                .as_deref()
+                .map(|h| host == h || host.starts_with(&format!("{}/", h)))
+                .unwrap_or(false);
+            if !under_home {
+                effective.push(v.clone());
+            }
+        }
+    }
+
+    parse_volumes(&effective)
+}
+
+/// Parse a slice of `/host:/container[:ro]` strings into `VirtiofsShare`s.
+/// Tags are assigned as `share0`, `share1`, etc. based on index.
+/// For home-aware share building, call `build_virtiofs_shares` instead.
 fn parse_volumes(volumes: &[String]) -> Vec<daemon::VirtiofsShare> {
     volumes
         .iter()
@@ -1831,6 +1976,7 @@ mod tests {
             args: vec!["cat".into(), "/data/hello.txt".into()],
             mounts: vec![GuestMount {
                 tag: "share0".into(),
+                subpath: String::new(),
                 container_path: "/data".into(),
             }],
             name: None,

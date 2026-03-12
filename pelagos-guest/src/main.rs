@@ -70,6 +70,11 @@ fn recv_frame(r: &mut impl Read) -> std::io::Result<(u8, Vec<u8>)> {
 pub struct GuestMount {
     /// virtiofs tag — the directory is already mounted at `/mnt/<tag>` in the guest.
     pub tag: String,
+    /// Relative subpath within the virtiofs mount (empty = root of the share).
+    /// When the daemon uses a broad share (e.g. $HOME as share0), the subpath
+    /// identifies the specific directory to bind-mount into the container.
+    #[serde(default)]
+    pub subpath: String,
     /// Absolute path inside the container.
     pub container_path: String,
 }
@@ -524,10 +529,20 @@ fn run_container(
         cmd.arg("--detach");
     }
     // Pass each virtiofs guest-side path as a -v bind mount to pelagos run.
+    // If a subpath is specified, the bind source is a subdirectory of the share
+    // (used when $HOME is shared as share0 and individual project dirs are subpaths).
     for mount in mounts {
-        let guest_mnt = format!("/mnt/{}", mount.tag);
+        let guest_src = if mount.subpath.is_empty() {
+            format!("/mnt/{}", mount.tag)
+        } else {
+            format!(
+                "/mnt/{}/{}",
+                mount.tag,
+                mount.subpath.trim_start_matches('/')
+            )
+        };
         cmd.arg("-v")
-            .arg(format!("{}:{}", guest_mnt, mount.container_path));
+            .arg(format!("{}:{}", guest_src, mount.container_path));
     }
     cmd.arg(image);
     if !args.is_empty() {

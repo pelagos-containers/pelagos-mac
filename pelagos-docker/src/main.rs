@@ -386,11 +386,17 @@ struct RunOpts {
 }
 
 /// Parse `--mount type=bind,source=X,target=Y[,...]` into a `-v X:Y` string.
+/// Returns `None` for `type=volume` mounts (named volumes are not host-path
+/// virtiofs shares and are silently skipped — they are managed by the
+/// pelagos runtime inside the VM).
 fn parse_mount_as_volume(mount_spec: &str) -> Option<String> {
+    let mut mount_type: Option<&str> = None;
     let mut source = None;
     let mut target = None;
     for part in mount_spec.split(',') {
-        if let Some(v) = part.strip_prefix("source=") {
+        if let Some(v) = part.strip_prefix("type=") {
+            mount_type = Some(v);
+        } else if let Some(v) = part.strip_prefix("source=") {
             source = Some(v);
         } else if let Some(v) = part.strip_prefix("src=") {
             source = Some(v);
@@ -401,6 +407,10 @@ fn parse_mount_as_volume(mount_spec: &str) -> Option<String> {
         } else if let Some(v) = part.strip_prefix("destination=") {
             target = Some(v);
         }
+    }
+    // Named volumes (type=volume) are not host-path shares; skip them.
+    if mount_type == Some("volume") {
+        return None;
     }
     match (source, target) {
         (Some(s), Some(t)) => Some(format!("{}:{}", s, t)),
