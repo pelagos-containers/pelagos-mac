@@ -45,6 +45,11 @@ PELAGOS_VERSION="0.25.0"
 PELAGOS_BIN="$WORK/pelagos-aarch64-linux"
 PELAGOS_URL="https://github.com/skeptomai/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-aarch64-linux"
 
+PASST_PKG="passt-2025.01.21-r0"
+PASST_APK="$WORK/${PASST_PKG}.apk"
+PASST_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/community/${ALPINE_ARCH}/${PASST_PKG}.apk"
+PASTA_BIN="$WORK/pasta-bin"
+
 DROPBEAR_PKG="dropbear-2024.86-r0"
 DROPBEAR_APK="$WORK/${DROPBEAR_PKG}.apk"
 DROPBEAR_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${DROPBEAR_PKG}.apk"
@@ -254,6 +259,31 @@ if [ ! -f "$LIBZ" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+echo "[5d/8] Downloading pasta (userspace networking for pelagos build)"
+# ---------------------------------------------------------------------------
+# pasta is the userspace-networking binary from the passt package (Alpine community).
+# It enables network access in `pelagos build` RUN steps without bridge/veth modules.
+if [ ! -f "$PASTA_BIN" ]; then
+    if [ ! -f "$PASST_APK" ]; then
+        curl -L --progress-bar -o "$PASST_APK" "$PASST_URL"
+    fi
+    PASST_EXTRACT="$WORK/passt-extract"
+    rm -rf "$PASST_EXTRACT"
+    mkdir -p "$PASST_EXTRACT"
+    bsdtar -xf "$PASST_APK" -C "$PASST_EXTRACT" 2>/dev/null || true
+    if [ -f "$PASST_EXTRACT/usr/bin/pasta" ]; then
+        cp "$PASST_EXTRACT/usr/bin/pasta" "$PASTA_BIN"
+        chmod 755 "$PASTA_BIN"
+        echo "  Extracted pasta: $PASTA_BIN"
+    else
+        echo "ERROR: pasta not found in $PASST_APK" >&2
+        exit 1
+    fi
+else
+    echo "  (cached: $PASTA_BIN)"
+fi
+
+# ---------------------------------------------------------------------------
 echo "[6/8] Staging Mozilla CA bundle (for TLS inside VM)"
 # ---------------------------------------------------------------------------
 if [ ! -f "$CA_BUNDLE" ]; then
@@ -361,6 +391,13 @@ if [ ! -f "$INITRAMFS_OUT" ] \
     cp "$LIBUTMPS"   "$INITRD_TMP/lib/libutmps.so.0.1"
     cp "$LIBSKARNET" "$INITRD_TMP/lib/libskarnet.so.2.14"
     cp "$LIBZ"       "$INITRD_TMP/lib/libz.so.1"
+
+    # Add pasta — userspace networking for `pelagos build` RUN steps.
+    # pasta proxies TCP/UDP through the host (VM) network without needing
+    # bridge/veth kernel modules.
+    mkdir -p "$INITRD_TMP/usr/bin"
+    cp "$PASTA_BIN" "$INITRD_TMP/usr/bin/pasta"
+    chmod 755 "$INITRD_TMP/usr/bin/pasta"
 
     # Stage the host's public key as the VM's authorized_keys so 'pelagos vm ssh'
     # can log in without a password.  The corresponding private key is at
