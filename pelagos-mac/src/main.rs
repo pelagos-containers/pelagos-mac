@@ -133,6 +133,12 @@ enum VmCommands {
     Shell,
     /// Attach to the VM's hvc0 serial console (Ctrl-] to detach)
     Console,
+    /// Open an SSH session to the VM (key-based, no password)
+    Ssh {
+        /// Extra arguments forwarded to ssh (e.g. -- uname -s  or  -- -L 8080:localhost:8080)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra: Vec<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +303,51 @@ fn main() {
                 restore_terminal(t);
             }
             process::exit(exit_code);
+        }
+
+        Commands::Vm {
+            sub: VmCommands::Ssh { ref extra },
+        } => {
+            let extra = extra.clone();
+            let state = match state::StateDir::open() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    process::exit(1);
+                }
+            };
+            if !state.is_daemon_alive() {
+                let daemon_args = daemon_args_from_cli(&cli);
+                if let Err(e) = daemon::ensure_running(&daemon_args) {
+                    log::error!("failed to start VM daemon: {}", e);
+                    process::exit(1);
+                }
+            }
+            if !state.ssh_key_file.exists() {
+                eprintln!(
+                    "error: SSH key not found at {}. Rebuild the VM image with 'make image'.",
+                    state.ssh_key_file.display()
+                );
+                process::exit(1);
+            }
+            let mut cmd = std::process::Command::new("ssh");
+            cmd.arg("-i")
+                .arg(&state.ssh_key_file)
+                .arg("-o")
+                .arg("StrictHostKeyChecking=no")
+                .arg("-o")
+                .arg("UserKnownHostsFile=/dev/null")
+                .arg("-o")
+                .arg("LogLevel=ERROR")
+                .arg("root@192.168.105.2");
+            for arg in &extra {
+                cmd.arg(arg);
+            }
+            let status = cmd.status().unwrap_or_else(|e| {
+                eprintln!("ssh: {}", e);
+                process::exit(1);
+            });
+            process::exit(status.code().unwrap_or(1));
         }
 
         Commands::Run {

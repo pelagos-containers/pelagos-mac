@@ -10,6 +10,9 @@ pub struct StateDir {
     /// Unix socket for the serial console relay (pelagos vm console).
     pub console_sock_file: PathBuf,
     pub mounts_file: PathBuf,
+    /// Ed25519 private key for SSH access to the VM (pelagos vm ssh).
+    /// The corresponding public key is baked into the VM initramfs at build time.
+    pub ssh_key_file: PathBuf,
 }
 
 impl StateDir {
@@ -21,6 +24,7 @@ impl StateDir {
             sock_file: base.join("vm.sock"),
             console_sock_file: base.join("console.sock"),
             mounts_file: base.join("vm.mounts"),
+            ssh_key_file: base.join("vm_key"),
         })
     }
 
@@ -112,6 +116,7 @@ mod tests {
             sock_file: base.join("vm.sock"),
             console_sock_file: base.join("console.sock"),
             mounts_file: base.join("vm.mounts"),
+            ssh_key_file: base.join("vm_key"),
         }
     }
 
@@ -190,6 +195,7 @@ mod tests {
             sock_file: base.join("vm.sock"),
             console_sock_file: base.join("console.sock"),
             mounts_file: base.join("vm.mounts"),
+            ssh_key_file: base.join("vm_key"),
         };
         assert_eq!(s.pid_file, PathBuf::from("/tmp/pelagos-path-test/vm.pid"));
         assert_eq!(s.sock_file, PathBuf::from("/tmp/pelagos-path-test/vm.sock"));
@@ -200,6 +206,10 @@ mod tests {
         assert_eq!(
             s.mounts_file,
             PathBuf::from("/tmp/pelagos-path-test/vm.mounts")
+        );
+        assert_eq!(
+            s.ssh_key_file,
+            PathBuf::from("/tmp/pelagos-path-test/vm_key")
         );
     }
 }

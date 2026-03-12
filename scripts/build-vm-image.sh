@@ -45,6 +45,27 @@ PELAGOS_VERSION="0.24.0"
 PELAGOS_BIN="$WORK/pelagos-aarch64-linux"
 PELAGOS_URL="https://github.com/skeptomai/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-aarch64-linux"
 
+DROPBEAR_PKG="dropbear-2024.86-r0"
+DROPBEAR_APK="$WORK/${DROPBEAR_PKG}.apk"
+DROPBEAR_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${DROPBEAR_PKG}.apk"
+DROPBEAR_BIN="$WORK/dropbear-bin"
+
+UTMPS_LIBS_PKG="utmps-libs-0.1.2.3-r2"
+UTMPS_LIBS_APK="$WORK/${UTMPS_LIBS_PKG}.apk"
+UTMPS_LIBS_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${UTMPS_LIBS_PKG}.apk"
+
+SKALIBS_PKG="skalibs-libs-2.14.3.0-r0"
+SKALIBS_APK="$WORK/${SKALIBS_PKG}.apk"
+SKALIBS_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${SKALIBS_PKG}.apk"
+
+ZLIB_PKG="zlib-1.3.1-r2"
+ZLIB_APK="$WORK/${ZLIB_PKG}.apk"
+ZLIB_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${ZLIB_PKG}.apk"
+
+# SSH key for 'pelagos vm ssh': generated once per user, baked into the initramfs.
+PELAGOS_STATE_DIR="$HOME/.local/share/pelagos"
+SSH_KEY_FILE="$PELAGOS_STATE_DIR/vm_key"
+
 # Mozilla CA bundle — needed by the statically-linked musl pelagos binary for TLS.
 # Sourced from certs/cacert.pem in this repo (update with scripts/update-certs.sh).
 CA_BUNDLE="$SCRIPT_DIR/../certs/cacert.pem"
@@ -157,6 +178,82 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+echo "[5b/8] Generating SSH key pair (for pelagos vm ssh)"
+# ---------------------------------------------------------------------------
+mkdir -p "$PELAGOS_STATE_DIR"
+if [ ! -f "$SSH_KEY_FILE" ]; then
+    ssh-keygen -t ed25519 -N "" -f "$SSH_KEY_FILE" -C "pelagos-vm" -q
+    echo "  Generated: $SSH_KEY_FILE"
+else
+    echo "  (cached: $SSH_KEY_FILE)"
+fi
+
+# ---------------------------------------------------------------------------
+echo "[5c/8] Downloading dropbear SSH server (${DROPBEAR_PKG})"
+# ---------------------------------------------------------------------------
+# Helper to extract a single .so from an APK (gzip'd tar).
+extract_so() {
+    local apk="$1" soname="$2" dest="$3"
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    bsdtar -xf "$apk" -C "$tmpdir" 2>/dev/null || true
+    local found
+    found=$(find "$tmpdir" -name "$soname" 2>/dev/null | head -1)
+    if [ -n "$found" ]; then
+        cp "$found" "$dest"
+        rm -rf "$tmpdir"
+        return 0
+    fi
+    rm -rf "$tmpdir"
+    return 1
+}
+
+if [ ! -f "$DROPBEAR_BIN" ]; then
+    if [ ! -f "$DROPBEAR_APK" ]; then
+        curl -L --progress-bar -o "$DROPBEAR_APK" "$DROPBEAR_URL"
+    fi
+    # APK is a gzip'd tar; extract usr/sbin/dropbear from it.
+    DROPBEAR_EXTRACT="$WORK/dropbear-extract"
+    rm -rf "$DROPBEAR_EXTRACT"
+    mkdir -p "$DROPBEAR_EXTRACT"
+    bsdtar -xf "$DROPBEAR_APK" -C "$DROPBEAR_EXTRACT" 2>/dev/null || true
+    if [ -f "$DROPBEAR_EXTRACT/usr/sbin/dropbear" ]; then
+        cp "$DROPBEAR_EXTRACT/usr/sbin/dropbear" "$DROPBEAR_BIN"
+        chmod 755 "$DROPBEAR_BIN"
+        echo "  Extracted dropbear: $DROPBEAR_BIN"
+    else
+        echo "ERROR: could not extract dropbear from $DROPBEAR_APK" >&2
+        exit 1
+    fi
+else
+    echo "  (cached: $DROPBEAR_BIN)"
+fi
+
+# dropbear runtime deps: libutmps (from utmps-libs), libskarnet (from skalibs-libs), libz (from zlib).
+LIBUTMPS="$WORK/libutmps.so.0.1"
+LIBSKARNET="$WORK/libskarnet.so.2.14"
+LIBZ="$WORK/libz.so.1"
+
+if [ ! -f "$LIBUTMPS" ]; then
+    [ ! -f "$UTMPS_LIBS_APK" ] && curl -L --progress-bar -o "$UTMPS_LIBS_APK" "$UTMPS_LIBS_URL"
+    extract_so "$UTMPS_LIBS_APK" "libutmps.so.0.1" "$LIBUTMPS" || \
+        { echo "ERROR: libutmps.so.0.1 not found in $UTMPS_LIBS_APK" >&2; exit 1; }
+    echo "  Extracted libutmps.so.0.1"
+fi
+if [ ! -f "$LIBSKARNET" ]; then
+    [ ! -f "$SKALIBS_APK" ] && curl -L --progress-bar -o "$SKALIBS_APK" "$SKALIBS_URL"
+    extract_so "$SKALIBS_APK" "libskarnet.so.2.14" "$LIBSKARNET" || \
+        { echo "ERROR: libskarnet.so.2.14 not found in $SKALIBS_APK" >&2; exit 1; }
+    echo "  Extracted libskarnet.so.2.14"
+fi
+if [ ! -f "$LIBZ" ]; then
+    [ ! -f "$ZLIB_APK" ] && curl -L --progress-bar -o "$ZLIB_APK" "$ZLIB_URL"
+    extract_so "$ZLIB_APK" "libz.so.1" "$LIBZ" || \
+        { echo "ERROR: libz.so.1 not found in $ZLIB_APK" >&2; exit 1; }
+    echo "  Extracted libz.so.1"
+fi
+
+# ---------------------------------------------------------------------------
 echo "[6/8] Staging Mozilla CA bundle (for TLS inside VM)"
 # ---------------------------------------------------------------------------
 if [ ! -f "$CA_BUNDLE" ]; then
@@ -253,6 +350,22 @@ if [ ! -f "$INITRAMFS_OUT" ]; then
     chmod 755 "$INITRD_TMP/usr/local/bin/pelagos-guest"
     cp "$PELAGOS_BIN" "$INITRD_TMP/usr/local/bin/pelagos"
     chmod 755 "$INITRD_TMP/usr/local/bin/pelagos"
+
+    # Add dropbear SSH server and its runtime library dependencies.
+    mkdir -p "$INITRD_TMP/usr/sbin"
+    cp "$DROPBEAR_BIN" "$INITRD_TMP/usr/sbin/dropbear"
+    chmod 755 "$INITRD_TMP/usr/sbin/dropbear"
+    cp "$LIBUTMPS"   "$INITRD_TMP/lib/libutmps.so.0.1"
+    cp "$LIBSKARNET" "$INITRD_TMP/lib/libskarnet.so.2.14"
+    cp "$LIBZ"       "$INITRD_TMP/lib/libz.so.1"
+
+    # Stage the host's public key as the VM's authorized_keys so 'pelagos vm ssh'
+    # can log in without a password.  The corresponding private key is at
+    # ~/.local/share/pelagos/vm_key on the host.
+    mkdir -p "$INITRD_TMP/root/.ssh"
+    cp "${SSH_KEY_FILE}.pub" "$INITRD_TMP/root/.ssh/authorized_keys"
+    chmod 700 "$INITRD_TMP/root/.ssh"
+    chmod 600 "$INITRD_TMP/root/.ssh/authorized_keys"
 
     # Write a udhcpc default script so DHCP can configure the interface and default route.
     # Without this script, udhcpc obtains a lease but never applies it (no ip addr, no route).
@@ -375,6 +488,17 @@ else
 fi
 
 export PELAGOS_IMAGE_STORE=/var/lib/pelagos
+
+# Start dropbear SSH server for 'pelagos vm ssh'.
+# Fix ownership: files were staged by the macOS build user (UID != 0).
+# Dropbear enforces that authorized_keys is owned by the connecting user.
+busybox chown -R 0:0 /root 2>/dev/null || true
+# -s: disable password auth (key-only)
+# -R: generate host keys on demand (ephemeral; new keys each boot — acceptable
+#     because the client uses StrictHostKeyChecking=no)
+# -p 22: listen on port 22
+mkdir -p /etc/dropbear
+dropbear -s -R -p 22 2>/dev/null || true
 
 # Start a root shell on hvc0 for 'pelagos vm console' access.
 # Opens /dev/hvc0 as a bidirectional fd and execs /bin/sh with all I/O wired

@@ -289,7 +289,29 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 7c: exec with explicit -t (TTY / PTY mode)
+# Test 7c: vm ssh (non-interactive command)
+#
+# Runs `uname -s` over SSH into the VM and checks output is "Linux".
+# VM must be running (started by test 7a); key is at ~/.local/share/pelagos/vm_key.
+# Uses LogLevel=ERROR so SSH doesn't print banner/warning lines.
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== test 7c: vm ssh (non-interactive) ==="
+OUT=$("$BINARY" \
+    --kernel  "$KERNEL" \
+    --initrd  "$INITRD" \
+    --disk    "$DISK" \
+    --cmdline "$CMDLINE" \
+    vm ssh -- uname -s 2>/dev/null)
+if echo "$OUT" | grep -q "^Linux$"; then
+    pass "vm ssh: 'uname -s' returned 'Linux'"
+else
+    fail "vm ssh: expected 'Linux', got: $OUT"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 7d: exec with explicit -t (TTY / PTY mode)
 #
 # PTY output uses \r\n line endings; strip \r before comparing.
 # This test catches two failure modes that are invisible in non-TTY context:
@@ -298,7 +320,7 @@ fi
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== test 7c: exec -t (tty mode) ==="
+echo "=== test 7d: exec -t (tty mode) ==="
 OUT=$(pelagos exec -t "$TEST_IMAGE" /bin/echo hello-tty 2>&1 | tr -d '\r')
 echo "$OUT" | grep -v "^\["
 if echo "$OUT" | grep -q "hello-tty"; then
