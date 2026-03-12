@@ -277,6 +277,11 @@ fn main() {
         Commands::Vm {
             sub: VmCommands::Console,
         } => {
+            let daemon_args = daemon_args_from_cli(&cli);
+            if let Err(e) = daemon::ensure_running(&daemon_args) {
+                log::error!("failed to start VM daemon: {}", e);
+                process::exit(1);
+            }
             let state = match state::StateDir::open() {
                 Ok(s) => s,
                 Err(e) => {
@@ -285,7 +290,7 @@ fn main() {
                 }
             };
             if !state.console_sock_file.exists() {
-                eprintln!("error: no VM running. Start one with 'pelagos ping'");
+                eprintln!("error: console socket not found (daemon may still be starting)");
                 process::exit(1);
             }
             let stream = match UnixStream::connect(&state.console_sock_file) {
