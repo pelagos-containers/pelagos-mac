@@ -798,9 +798,10 @@ fn handle_build(
     }
 
     // Run pelagos build.
-    // Use --network none: the VM's minimal kernel has no bridge/veth modules or
-    // pasta binary, so the default "auto" mode (bridge) fails. Network access
-    // during RUN steps requires kernel bridge support; revisit when kernel is extended.
+    // Use --network pasta: pasta is a userspace TCP/UDP proxy that works without
+    // bridge/veth kernel modules. Falls back gracefully when RUN steps don't need
+    // network. The default "auto" mode would pick "bridge" (we run as root) which
+    // requires kernel bridge support we don't have in the virt kernel.
     let mut cmd = Command::new(pelagos_bin());
     cmd.arg("build")
         .arg("-t")
@@ -808,7 +809,7 @@ fn handle_build(
         .arg("-f")
         .arg(&dockerfile_path)
         .arg("--network")
-        .arg("none");
+        .arg("pasta");
     for arg in build_args {
         cmd.arg("--build-arg").arg(arg);
     }
