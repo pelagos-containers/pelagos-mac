@@ -184,9 +184,20 @@ enum DockerCmd {
         /// Do not use the cache.
         #[arg(long)]
         no_cache: bool,
+        /// Set the target build stage in a multi-stage Dockerfile.
+        #[arg(long)]
+        target: Option<String>,
         /// Build context path (default: .).
         #[arg(default_value = ".")]
         context: String,
+    },
+
+    /// BuildKit stub — not supported; exits 1 so callers fall back to plain build.
+    #[command(name = "buildx")]
+    Buildx {
+        /// Subcommand and args (ignored).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        _args: Vec<String>,
     },
 
     /// Manage named volumes.
@@ -305,8 +316,18 @@ fn main() {
             file,
             build_args,
             no_cache,
+            target,
             context,
-        } => cmd_build(&cfg, &tag, &file, &build_args, no_cache, &context),
+        } => cmd_build(
+            &cfg,
+            &tag,
+            &file,
+            &build_args,
+            no_cache,
+            target.as_deref(),
+            &context,
+        ),
+        DockerCmd::Buildx { .. } => 1,
         DockerCmd::Volume { sub, name, quiet } => cmd_volume(&cfg, &sub, name.as_deref(), quiet),
         DockerCmd::Network { sub, name, quiet } => cmd_network(&cfg, &sub, name.as_deref(), quiet),
         DockerCmd::Cp { src, dst } => cmd_cp(&cfg, &src, &dst),
@@ -975,6 +996,7 @@ fn cmd_build(
     file: &str,
     build_args: &[String],
     no_cache: bool,
+    target: Option<&str>,
     context: &str,
 ) -> i32 {
     let mut sub: Vec<OsString> = args(&["build", "-t", tag, "-f", file]);
@@ -984,6 +1006,10 @@ fn cmd_build(
     }
     if no_cache {
         sub.push("--no-cache".into());
+    }
+    if let Some(t) = target {
+        sub.push("--target".into());
+        sub.push(t.into());
     }
     sub.push(context.into());
     match run_pelagos_inherited(cfg, &sub) {
