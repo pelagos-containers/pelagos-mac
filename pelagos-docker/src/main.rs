@@ -3,13 +3,7 @@
 //! Accepts a subset of Docker CLI arguments and maps them to pelagos commands,
 //! enabling the devcontainer CLI to use pelagos-mac as a backend via:
 //!
-//!   devcontainer --docker-path $(which pelagos-docker) build
-//!
-//! # Known limitation
-//!
-//! `docker exec` is not supported: it requires exec-into-a-running-container-by-name,
-//! which the pelagos runtime does not yet provide. devcontainer post-create lifecycle
-//! hooks will not work until this is implemented upstream. See issue #56.
+//!   devcontainer --docker-path $(which pelagos-docker) up
 
 mod config;
 mod docker_types;
@@ -80,7 +74,7 @@ enum DockerCmd {
         image_and_args: Vec<String>,
     },
 
-    /// Execute a command in a running container (not yet supported).
+    /// Execute a command in a running container.
     Exec {
         #[arg(short = 'i', long)]
         interactive: bool,
@@ -88,7 +82,7 @@ enum DockerCmd {
         tty: bool,
         #[arg(short = 'e', long = "env")]
         env: Vec<String>,
-        /// Container name and command.
+        /// Container name followed by command and arguments.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         name_and_args: Vec<String>,
     },
@@ -125,6 +119,18 @@ enum DockerCmd {
         #[arg(long = "type")]
         inspect_type: Option<String>,
         names: Vec<String>,
+    },
+
+    /// Show Docker version information (static stub for tooling compatibility).
+    Version {
+        #[arg(short = 'f', long)]
+        format: Option<String>,
+    },
+
+    /// Display system-wide information (static stub for tooling compatibility).
+    Info {
+        #[arg(short = 'f', long)]
+        format: Option<String>,
     },
 }
 
@@ -168,11 +174,11 @@ fn main() {
             },
         ),
         DockerCmd::Exec {
-            interactive: _,
-            tty: _,
-            env: _,
-            name_and_args: _,
-        } => cmd_exec_stub(),
+            interactive,
+            tty,
+            env,
+            name_and_args,
+        } => cmd_exec(&cfg, interactive, tty, &env, &name_and_args),
         DockerCmd::Stop { name } => cmd_stop(&cfg, &name),
         DockerCmd::Rm { force, name } => cmd_rm(&cfg, force, &name),
         DockerCmd::Ps {
@@ -185,6 +191,8 @@ fn main() {
             inspect_type,
             names,
         } => cmd_inspect(&cfg, inspect_type.as_deref(), &names),
+        DockerCmd::Version { format: _ } => cmd_version(),
+        DockerCmd::Info { format: _ } => cmd_info(),
     };
 
     process::exit(exit_code);
@@ -321,13 +329,103 @@ fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
     exit_code
 }
 
-fn cmd_exec_stub() -> i32 {
-    eprintln!(
-        "pelagos-docker: 'docker exec' is not yet supported.\n\
-         It requires exec-into-a-running-container-by-name, which the pelagos \
-         runtime does not yet provide. See issue #56 for tracking."
+fn cmd_exec(
+    cfg: &Config,
+    _interactive: bool,
+    tty: bool,
+    _env: &[String],
+    name_and_args: &[String],
+) -> i32 {
+    let (name, cmd_args) = match name_and_args.split_first() {
+        Some((n, rest)) => (n.as_str(), rest),
+        None => {
+            eprintln!("pelagos-docker exec: missing container name");
+            return 1;
+        }
+    };
+
+    // `pelagos exec-into <container> [cmd...]` — enters running container's namespaces.
+    let mut sub: Vec<OsString> = Vec::new();
+    sub.push("exec-into".into());
+    if tty {
+        sub.push("-t".into());
+    }
+    sub.push(name.into());
+    for a in cmd_args {
+        sub.push(a.into());
+    }
+
+    match run_pelagos_inherited(cfg, &sub) {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("pelagos-docker exec: {}", e);
+            1
+        }
+    }
+}
+
+fn cmd_version() -> i32 {
+    println!(
+        "{}",
+        serde_json::json!({
+            "Client": {
+                "Version": "20.10.0",
+                "ApiVersion": "1.41",
+                "Os": "darwin",
+                "Arch": "arm64",
+                "GoVersion": "go1.21.0",
+                "GitCommit": "pelagos",
+                "BuildTime": "2025-01-01T00:00:00.000000000+00:00"
+            },
+            "Server": {
+                "Engine": {
+                    "Version": "20.10.0",
+                    "ApiVersion": "1.41",
+                    "MinAPIVersion": "1.12",
+                    "GitCommit": "pelagos",
+                    "GoVersion": "go1.21.0",
+                    "Os": "linux",
+                    "Arch": "arm64",
+                    "BuildTime": "2025-01-01T00:00:00.000000000+00:00"
+                }
+            }
+        })
     );
-    1
+    0
+}
+
+fn cmd_info() -> i32 {
+    println!(
+        "{}",
+        serde_json::json!({
+            "ID": "pelagos",
+            "ServerVersion": "20.10.0",
+            "OperatingSystem": "Alpine Linux (VM)",
+            "OSType": "linux",
+            "Architecture": "aarch64",
+            "NCPU": 1,
+            "MemTotal": 1073741824,
+            "Containers": 0,
+            "ContainersRunning": 0,
+            "ContainersPaused": 0,
+            "ContainersStopped": 0,
+            "Images": 0,
+            "DockerRootDir": "/var/lib/docker",
+            "HttpProxy": "",
+            "HttpsProxy": "",
+            "NoProxy": "",
+            "Labels": [],
+            "ExperimentalBuild": false,
+            "RegistryConfig": {
+                "AllowNondistributableArtifactsCIDRs": [],
+                "AllowNondistributableArtifactsHostnames": [],
+                "InsecureRegistryCIDRs": [],
+                "IndexConfigs": {},
+                "Mirrors": []
+            }
+        })
+    );
+    0
 }
 
 fn cmd_stop(cfg: &Config, name: &str) -> i32 {
@@ -429,9 +527,28 @@ fn cmd_inspect(cfg: &Config, inspect_type: Option<&str>, names: &[String]) -> i3
         return 1;
     }
 
-    match inspect_type.unwrap_or("container") {
-        "image" => cmd_inspect_image(cfg, names),
-        _ => cmd_inspect_container(cfg, names),
+    match inspect_type {
+        Some("image") => return cmd_inspect_image(cfg, names),
+        Some("container") => return cmd_inspect_container(cfg, names),
+        _ => {}
+    }
+
+    // Auto-detect: try container first; if none found, treat as image.
+    // devcontainer CLI calls `docker inspect <image>` without --type.
+    let sub = args(&["ps", "--all"]);
+    let known_containers: Vec<String> = run_pelagos(cfg, &sub)
+        .ok()
+        .map(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).into_owned();
+            parse_pelagos_ps(&s).into_iter().map(|e| e.name).collect()
+        })
+        .unwrap_or_default();
+
+    let all_are_containers = names.iter().all(|n| known_containers.contains(n));
+    if all_are_containers {
+        cmd_inspect_container(cfg, names)
+    } else {
+        cmd_inspect_image(cfg, names)
     }
 }
 

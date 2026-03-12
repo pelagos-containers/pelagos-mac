@@ -92,6 +92,17 @@ enum Commands {
         #[arg(short = 't', long)]
         tty: bool,
     },
+    /// Exec a command inside an already-running container (enters its namespaces).
+    ExecInto {
+        /// Running container name
+        container: String,
+        /// Command and arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+        /// Allocate a pseudo-TTY (default: auto-detect from stdout)
+        #[arg(short = 't', long)]
+        tty: bool,
+    },
     /// List containers (running by default; use -a for all)
     Ps {
         /// Show all containers, including exited
@@ -183,6 +194,13 @@ enum GuestCommand {
     },
     Exec {
         image: String,
+        args: Vec<String>,
+        #[serde(default)]
+        env: std::collections::HashMap<String, String>,
+        tty: bool,
+    },
+    ExecInto {
+        container: String,
         args: Vec<String>,
         #[serde(default)]
         env: std::collections::HashMap<String, String>,
@@ -431,6 +449,32 @@ fn main() {
                 stream,
                 GuestCommand::Exec {
                     image,
+                    args,
+                    env: std::collections::HashMap::new(),
+                    tty,
+                },
+                tty,
+            ));
+        }
+
+        Commands::ExecInto {
+            ref container,
+            ref args,
+            tty,
+        } => {
+            let container = container.clone();
+            let args = args.clone();
+            let tty = tty || unsafe { libc::isatty(libc::STDOUT_FILENO) } != 0;
+            let daemon_args = daemon_args_from_cli(&cli);
+            if let Err(e) = daemon::ensure_running(&daemon_args) {
+                log::error!("failed to start VM daemon: {}", e);
+                process::exit(1);
+            }
+            let stream = connect_or_exit();
+            process::exit(exec_command(
+                stream,
+                GuestCommand::ExecInto {
+                    container,
                     args,
                     env: std::collections::HashMap::new(),
                     tty,
