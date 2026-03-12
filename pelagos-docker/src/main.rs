@@ -183,6 +183,9 @@ enum DockerCmd {
         sub: String,
         /// Volume name.
         name: Option<String>,
+        /// Only display volume names.
+        #[arg(short = 'q', long = "quiet")]
+        quiet: bool,
     },
 
     /// Manage named networks.
@@ -191,6 +194,9 @@ enum DockerCmd {
         sub: String,
         /// Network name.
         name: Option<String>,
+        /// Only display network IDs.
+        #[arg(short = 'q', long = "quiet")]
+        quiet: bool,
     },
 
     /// Copy files between the host and a running container.
@@ -284,8 +290,8 @@ fn main() {
             no_cache,
             context,
         } => cmd_build(&cfg, &tag, &file, &build_args, no_cache, &context),
-        DockerCmd::Volume { sub, name } => cmd_volume(&cfg, &sub, name.as_deref()),
-        DockerCmd::Network { sub, name } => cmd_network(&cfg, &sub, name.as_deref()),
+        DockerCmd::Volume { sub, name, quiet } => cmd_volume(&cfg, &sub, name.as_deref(), quiet),
+        DockerCmd::Network { sub, name, quiet } => cmd_network(&cfg, &sub, name.as_deref(), quiet),
         DockerCmd::Cp { src, dst } => cmd_cp(&cfg, &src, &dst),
     };
 
@@ -949,10 +955,26 @@ fn cmd_build(
     }
 }
 
-fn cmd_volume(cfg: &Config, sub: &str, name: Option<&str>) -> i32 {
+fn cmd_volume(cfg: &Config, sub: &str, name: Option<&str>, quiet: bool) -> i32 {
     let mut a: Vec<OsString> = args(&["volume", sub]);
     if let Some(n) = name {
         a.push(n.into());
+    }
+    // -q/--quiet for `volume ls`: capture output and print only the name column.
+    if quiet && sub == "ls" {
+        let out = match run_pelagos(cfg, &a) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("pelagos-docker volume ls: {}", e);
+                return 1;
+            }
+        };
+        for line in String::from_utf8_lossy(&out.stdout).lines().skip(1) {
+            if let Some(name) = line.split_whitespace().last() {
+                println!("{}", name);
+            }
+        }
+        return out.status.code().unwrap_or(0);
     }
     match run_pelagos_inherited(cfg, &a) {
         Ok(s) => s.code().unwrap_or(1),
@@ -976,7 +998,7 @@ fn cmd_cp(cfg: &Config, src: &str, dst: &str) -> i32 {
     }
 }
 
-fn cmd_network(cfg: &Config, sub: &str, name: Option<&str>) -> i32 {
+fn cmd_network(cfg: &Config, sub: &str, name: Option<&str>, quiet: bool) -> i32 {
     let mut a: Vec<OsString> = args(&["network", sub]);
     // `docker network create <name>` auto-assigns a subnet; pelagos requires one explicitly.
     // Pick 10.88.<hash>.0/24 derived from the name so repeated calls are idempotent.
@@ -990,6 +1012,22 @@ fn cmd_network(cfg: &Config, sub: &str, name: Option<&str>) -> i32 {
         }
     } else if let Some(n) = name {
         a.push(n.into());
+    }
+    // -q/--quiet for `network ls`: capture output and print only the name column.
+    if quiet && sub == "ls" {
+        let out = match run_pelagos(cfg, &a) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("pelagos-docker network ls: {}", e);
+                return 1;
+            }
+        };
+        for line in String::from_utf8_lossy(&out.stdout).lines().skip(1) {
+            if let Some(name) = line.split_whitespace().last() {
+                println!("{}", name);
+            }
+        }
+        return out.status.code().unwrap_or(0);
     }
     match run_pelagos_inherited(cfg, &a) {
         Ok(s) => s.code().unwrap_or(1),
