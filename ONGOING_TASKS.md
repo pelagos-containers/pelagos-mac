@@ -1,13 +1,13 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-03-11, SHA 60c9b83 (post-PR #50)*
+*Last updated: 2026-03-12, SHA 6e4f0a0 (post-PR #52)*
 
 ---
 
 ## Current State
 
-**Phase 2 COMPLETE.** The full container lifecycle works end-to-end on real hardware.
-All 16 e2e tests pass (`bash scripts/test-e2e.sh`).
+**Phase 2 + Phase 3 VM Access COMPLETE.** The full container lifecycle and all three
+VM access modes work end-to-end on real hardware. All 18 e2e tests pass (`bash scripts/test-e2e.sh`).
 
 ### What works today
 
@@ -26,42 +26,38 @@ All 16 e2e tests pass (`bash scripts/test-e2e.sh`).
 | Persistent OCI image cache (`/dev/vda` ext2) | ✅ | PR #50 |
 | ECR Public test image (no rate limits) | ✅ | PR #50 |
 | devpts mount + PTY job control | ✅ | PR #38/#40 |
+| `pelagos vm console` (hvc0 serial) | ✅ | PR #51 |
+| `pelagos vm ssh` (dropbear + ed25519 key) | ✅ | PR #52 |
 
 ---
 
-## Phase 3 — VM Access (Epic #41)
+## Phase 3 — VM Access (Epic #41) ✅ COMPLETE
 
-Three options for direct VM access beyond `pelagos vm shell` (vsock-based shell):
+All three options for direct VM access are done (closed in PR #51, PR #52):
 
 ### Option A — `pelagos vm shell` (vsock) ✅ DONE (PR #45)
 
 Interactive `/bin/sh` inside the VM over vsock. No container namespaces.
 TTY and non-TTY modes both work.
 
-### Option B — hvc0 serial console (issue #43) ← NEXT
+### Option B — `pelagos vm console` (hvc0) ✅ DONE (PR #51)
 
-Wire AVF's `VZVirtioConsoleDeviceSerialPortConfiguration` to the host terminal.
-Lets you watch raw boot output and drop into a login prompt.
-No guest changes needed — the kernel already writes to hvc0.
+Attaches to the VM's hvc0 serial console. Raw boot output visible; root shell
+auto-spawns on hvc0. Ctrl-] detaches. Non-TTY/pipe mode with 2s drain for scripting.
 
-### Option C — SSH (issue #44)
+### Option C — `pelagos vm ssh` (dropbear) ✅ DONE (PR #52)
 
-Run `dropbear` (small sshd) inside the VM. Requires socket_vmnet or port-forward
-to reach the VM from the host. Deferred until socket_vmnet is done.
+Runs `dropbear` sshd in the VM. Key pair generated at `~/.local/share/pelagos/vm_key`
+during `make image`; public key baked into initramfs as `root`'s `authorized_keys`.
+`pelagos vm ssh [-- cmd args]` connects to `root@192.168.105.2` using the stored key.
 
 ---
 
-## Phase 3 — NAT Reliability (issue #26)
+## Phase 3 — NAT Reliability (issue #26) ✅ COMPLETE
 
-`VZNATNetworkDeviceAttachment` (InternetSharing / bridge100) degrades after several
-VM lifecycles: ICMP survives but all TCP fails. Recovery: `sudo pfctl -f /etc/pf.conf`.
-
-**Root fix: migrate to socket_vmnet** (Apache 2.0, no restricted entitlement).
-- socket_vmnet runs as a privileged helper; guest uses `virtio-net` as normal
-- Eliminates the PF/InternetSharing dependency entirely
-- Also unblocks Option C (SSH) by giving the VM a stable reachable IP
-
-Stress test script: `scripts/test-nat-stress.sh 40`
+socket_vmnet migration done (merged, branch `feat/socket-vmnet`).
+VM gets a stable `192.168.105.2` IP via DHCP (socket_vmnet shared mode) or
+static fallback. `pelagos vm ssh` depends on this stable IP.
 
 ---
 
