@@ -24,13 +24,16 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: cargo fmt --check -p pelagos-mac -p pelagos-vz
+        run: cargo fmt --check -p pelagos-mac -p pelagos-vz -p pelagos-docker
 
       - name: Build pelagos-mac (release)
         run: cargo build --release -p pelagos-mac
 
+      - name: Build pelagos-docker (release)
+        run: cargo build --release -p pelagos-docker
+
       - name: Clippy
-        run: cargo clippy -p pelagos-mac -p pelagos-vz -- -D warnings
+        run: cargo clippy -p pelagos-mac -p pelagos-vz -p pelagos-docker -- -D warnings
 
       - name: Unit tests
-        run: cargo test -p pelagos-mac
+        run: cargo test -p pelagos-mac -p pelagos-docker

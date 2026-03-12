@@ -77,6 +77,9 @@ enum Commands {
         /// Run in background; print container name and exit
         #[arg(short = 'd', long)]
         detach: bool,
+        /// Set an environment variable KEY=VALUE inside the container (repeatable)
+        #[arg(short = 'e', long = "env")]
+        env: Vec<String>,
     },
     /// Run a command interactively in a container (stdin forwarded, optional TTY)
     Exec {
@@ -175,6 +178,8 @@ enum GuestCommand {
         name: Option<String>,
         #[serde(skip_serializing_if = "is_false")]
         detach: bool,
+        #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+        env: std::collections::HashMap<String, String>,
     },
     Exec {
         image: String,
@@ -365,10 +370,18 @@ fn main() {
             ref args,
             ref name,
             detach,
+            ref env,
         } => {
             let image = image.clone();
             let args = args.clone();
             let name = name.clone();
+            let env_map: std::collections::HashMap<String, String> = env
+                .iter()
+                .filter_map(|kv| {
+                    let (k, v) = kv.split_once('=')?;
+                    Some((k.to_string(), v.to_string()))
+                })
+                .collect();
             let daemon_args = daemon_args_from_cli(&cli);
             // Build the guest-side mount list from the parsed shares.
             let mounts: Vec<GuestMount> = daemon_args
@@ -392,6 +405,7 @@ fn main() {
                     mounts,
                     name,
                     detach,
+                    env: env_map,
                 },
             ));
         }
@@ -1104,6 +1118,7 @@ mod tests {
             mounts: vec![],
             name: None,
             detach: false,
+            env: std::collections::HashMap::new(),
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1123,6 +1138,7 @@ mod tests {
             mounts: vec![],
             name: Some("mybox".into()),
             detach: true,
+            env: std::collections::HashMap::new(),
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1142,6 +1158,7 @@ mod tests {
             }],
             name: None,
             detach: false,
+            env: std::collections::HashMap::new(),
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

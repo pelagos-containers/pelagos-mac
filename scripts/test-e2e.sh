@@ -32,6 +32,7 @@ KERNEL="$REPO_ROOT/out/vmlinuz"
 INITRD="$REPO_ROOT/out/initramfs-custom.gz"
 DISK="$REPO_ROOT/out/root.img"
 BINARY="$REPO_ROOT/target/aarch64-apple-darwin/release/pelagos"
+SHIM="$REPO_ROOT/target/aarch64-apple-darwin/release/pelagos-docker"
 CMDLINE="console=hvc0"
 
 # AWS ECR Public hosts Docker Official Images with no unauthenticated pull rate limits.
@@ -81,6 +82,7 @@ check_file "kernel"    "$KERNEL"
 check_file "initramfs" "$INITRD"
 check_file "disk"      "$DISK"
 check_file "binary"    "$BINARY"
+check_file "shim"      "$SHIM"
 
 if [ "$FAIL" -gt 0 ]; then
     echo ""
@@ -382,6 +384,155 @@ if echo "$OUT" | grep -q "apt-ok"; then
 else
     fail "ubuntu 24.04: apt-get update failed; output: $(echo "$OUT" | grep -v '^\[')"
 fi
+
+# ---------------------------------------------------------------------------
+# Tests 7g-7n: pelagos-docker shim
+#
+# The shim auto-detects the pelagos binary (sibling in the same release dir)
+# and VM artifacts (./out/).  No --kernel/--initrd/--disk flags needed.
+# A clean daemon is started on first shim invocation.
+# ---------------------------------------------------------------------------
+
+# shim() wraps the binary and merges stderr so output is fully captured.
+shim() { "$SHIM" "$@" 2>&1; }
+
+echo ""
+echo "=== test 7g: pelagos-docker pull ==="
+# Stop any running daemon so the pull test exercises a clean warm-start.
+pelagos vm stop > /dev/null 2>&1 || true
+sleep 1
+OUT=$(shim pull "$TEST_IMAGE")
+if [ $? -eq 0 ]; then
+    pass "docker pull: exited 0"
+else
+    fail "docker pull: non-zero exit; output: $OUT"
+fi
+
+echo ""
+echo "=== test 7h: pelagos-docker run --detach ==="
+SHIM_NAME="shim-test-$$"
+OUT=$(shim run --name "$SHIM_NAME" --detach \
+    --label "test.suite=e2e" --label "test.name=$SHIM_NAME" \
+    "$TEST_IMAGE" /bin/sh -c "echo shim-hello; sleep 30")
+if echo "$OUT" | grep -q "$SHIM_NAME"; then
+    pass "docker run --detach: container name '$SHIM_NAME' printed"
+else
+    fail "docker run --detach: expected '$SHIM_NAME', got: $OUT"
+fi
+sleep 1
+
+echo ""
+echo "=== test 7i: pelagos-docker ps (tabular + JSON + filter) ==="
+PS_TAB=$(shim ps --all)
+PS_JSON=$(shim ps --all --format json)
+PS_FILTER=$(shim ps --all --filter "name=$SHIM_NAME")
+PSOK=0
+if echo "$PS_TAB" | grep -q "$SHIM_NAME"; then
+    echo "  [OK]   tabular: '$SHIM_NAME' visible"
+else
+    echo "  [FAIL] tabular: '$SHIM_NAME' not found; output: $PS_TAB"
+    PSOK=1
+fi
+if echo "$PS_JSON" | python3 -c "import sys,json; rows=[json.loads(l) for l in sys.stdin if l.strip()]; assert any(r['Names']==\"$SHIM_NAME\" for r in rows)" 2>/dev/null; then
+    echo "  [OK]   JSON: '$SHIM_NAME' found in JSON output"
+else
+    echo "  [FAIL] JSON: '$SHIM_NAME' not found in JSON; output: $PS_JSON"
+    PSOK=1
+fi
+if echo "$PS_FILTER" | grep -q "$SHIM_NAME"; then
+    echo "  [OK]   filter: --filter name= works"
+else
+    echo "  [FAIL] filter: --filter name=$SHIM_NAME returned nothing; output: $PS_FILTER"
+    PSOK=1
+fi
+if [ "$PSOK" -eq 0 ]; then
+    pass "docker ps: tabular, JSON, and --filter all correct"
+else
+    fail "docker ps: one or more checks failed (see above)"
+fi
+
+echo ""
+echo "=== test 7j: pelagos-docker logs ==="
+OUT=$(shim logs "$SHIM_NAME")
+if echo "$OUT" | grep -q "shim-hello"; then
+    pass "docker logs: 'shim-hello' present"
+else
+    fail "docker logs: expected 'shim-hello', got: $OUT"
+fi
+
+echo ""
+echo "=== test 7k: pelagos-docker inspect (container) ==="
+INSPECT=$(shim inspect --type container "$SHIM_NAME")
+INS_OK=0
+if echo "$INSPECT" | python3 -c "
+import sys,json
+data=json.load(sys.stdin)
+c=data[0]
+assert c['Id']=='$SHIM_NAME'
+assert c['State']['Running']==True
+assert c['Config']['Labels'].get('test.suite')=='e2e'
+" 2>/dev/null; then
+    pass "docker inspect: Id, State.Running, and label all correct"
+else
+    fail "docker inspect: unexpected output: $INSPECT"
+fi
+
+echo ""
+echo "=== test 7l: pelagos-docker run -e (env var) ==="
+OUT=$(shim run -e "SHIM_VAR=shim-env-ok" \
+    "$TEST_IMAGE" /bin/sh -c 'echo "$SHIM_VAR"')
+if echo "$OUT" | grep -q "shim-env-ok"; then
+    pass "docker run -e: env var passed and echoed"
+else
+    fail "docker run -e: expected 'shim-env-ok', got: $OUT"
+fi
+
+echo ""
+echo "=== test 7n: pelagos-docker stop + rm ==="
+shim stop "$SHIM_NAME" > /dev/null 2>&1; STOP_EXIT=$?
+if [ "$STOP_EXIT" -eq 0 ]; then
+    echo "  [OK]   stop: exited 0"
+else
+    echo "  [FAIL] stop: exit $STOP_EXIT"
+    FAIL=$((FAIL + 1))
+fi
+shim rm "$SHIM_NAME" > /dev/null 2>&1
+OUT=$(shim ps --all)
+if echo "$OUT" | grep -q "$SHIM_NAME"; then
+    fail "docker rm: '$SHIM_NAME' still appears after rm"
+else
+    pass "docker rm: '$SHIM_NAME' gone from ps --all"
+fi
+
+echo ""
+echo "=== test 7m: pelagos-docker run -v (bind mount) ==="
+# Stop the daemon so this test gets a fresh one with the virtiofs mount configured.
+# Tests 7h–7l ran without any -v mounts; the existing daemon has no virtio device for /shimdata.
+"$BINARY" vm stop > /dev/null 2>&1 || true
+sleep 1
+TMPHOST=$(mktemp -d)
+echo "shim-mount-ok" > "$TMPHOST/shim.txt"
+OUT=$(shim run -v "$TMPHOST:/shimdata" \
+    "$TEST_IMAGE" cat /shimdata/shim.txt)
+rm -rf "$TMPHOST"
+if echo "$OUT" | grep -q "shim-mount-ok"; then
+    pass "docker run -v: bind mount visible inside container"
+else
+    fail "docker run -v: expected 'shim-mount-ok', got: $OUT"
+fi
+
+echo ""
+echo "=== test 7o: pelagos-docker exec stub ==="
+shim exec "$SHIM_NAME" /bin/sh > /dev/null 2>&1; EXEC_EXIT=$?
+if [ "$EXEC_EXIT" -ne 0 ]; then
+    pass "docker exec stub: exited non-zero (not yet supported)"
+else
+    fail "docker exec stub: expected non-zero exit, got 0"
+fi
+
+# Stop daemon before lifecycle tests.
+pelagos vm stop > /dev/null 2>&1 || true
+sleep 1
 
 # ---------------------------------------------------------------------------
 # Tests 8-13: container lifecycle (ps, logs, stop, rm, --name, --detach)
