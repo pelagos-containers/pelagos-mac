@@ -61,7 +61,28 @@ static fallback. `pelagos vm ssh` depends on this stable IP.
 
 ---
 
-## Phase 3 — Signed Installer (not yet tracked)
+## Phase 4 — VS Code Dev Container support (Epic #55)
+
+Goal: make pelagos-mac a backend for the [devcontainer CLI](https://github.com/devcontainers/cli).
+
+| Subtask | Issue | Status |
+|---|---|---|
+| Docker CLI shim (`pelagos-docker`) | #56 | Not started |
+| Native port forwarding (`-p host:container`) | #57 | Not started |
+| glibc/Ubuntu container image compatibility | #58 | Not started |
+
+**Recommended start: #57 (port forwarding).**
+It is self-contained Rust, has no external dependencies, and unblocks both the
+Docker CLI shim and SSH-based workflows. Once ports work, the shim (#56) can
+expose them correctly in `inspect` output, and glibc testing (#58) becomes more
+meaningful (containers can open network listeners that are actually reachable).
+
+See `docs/VM_LIFECYCLE.md` for the VM networking topology (socket_vmnet,
+192.168.105.x subnet) that port forwarding builds on.
+
+---
+
+## Phase 4 — Signed Installer (not yet tracked)
 
 `.pkg` installer for distribution. Requires:
 - Developer ID Application signature + notarization
