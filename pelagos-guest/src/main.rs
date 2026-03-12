@@ -26,6 +26,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::io::OwnedFd;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
@@ -92,6 +93,16 @@ pub enum GuestCommand {
     },
     Exec {
         image: String,
+        args: Vec<String>,
+        #[serde(default)]
+        env: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        tty: bool,
+    },
+    /// Exec a command inside an already-running container by name.
+    /// Enters the container's namespaces via setns(2) and execs the command.
+    ExecInto {
+        container: String,
         args: Vec<String>,
         #[serde(default)]
         env: std::collections::HashMap<String, String>,
@@ -235,6 +246,15 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 tty,
             } => {
                 handle_exec(fd, &image, &args, &env, tty)?;
+                return Ok(());
+            }
+            GuestCommand::ExecInto {
+                container,
+                args,
+                env,
+                tty,
+            } => {
+                handle_exec_into(fd, &container, &args, &env, tty)?;
                 return Ok(());
             }
             GuestCommand::Ps { all } => {
@@ -618,6 +638,155 @@ fn handle_exec(
     } else {
         handle_exec_piped(fd, cmd)
     }
+}
+
+/// Exec into an already-running container by entering its Linux namespaces.
+///
+/// Opens namespace fds in the parent, then uses `pre_exec` to call setns(2)
+/// in the forked child — after fork but before exec.  This is critical: calling
+/// setns in the parent thread would affect all other guest threads, corrupting
+/// the daemon for every concurrent connection.
+fn handle_exec_into(
+    fd: libc::c_int,
+    container: &str,
+    args: &[String],
+    env: &std::collections::HashMap<String, String>,
+    tty: bool,
+) -> std::io::Result<()> {
+    let pid = get_container_pid(container).map_err(|e| {
+        let mut w = FdWriter(fd);
+        let _ = send_response(
+            &mut w,
+            &GuestResponse::Error {
+                error: format!("exec-into: {}", e),
+            },
+        );
+        e
+    })?;
+
+    // Open namespace fds in the parent (allocations are safe here).
+    // Must NOT use O_CLOEXEC so that pre_exec can use them before exec.
+    let ns_fds = open_ns_fds(pid).map_err(|e| {
+        let mut w = FdWriter(fd);
+        let _ = send_response(
+            &mut w,
+            &GuestResponse::Error {
+                error: format!("exec-into: open ns fds: {}", e),
+            },
+        );
+        e
+    })?;
+
+    // Send ready — both sides switch to framed binary protocol.
+    {
+        let mut w = FdWriter(fd);
+        send_response(&mut w, &GuestResponse::Ready { ready: true })?;
+    }
+
+    let (prog, rest) = match args.split_first() {
+        Some(p) => p,
+        None => {
+            // Close ns fds before returning.
+            for fd in ns_fds {
+                unsafe { libc::close(fd) };
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "exec-into: no command",
+            ));
+        }
+    };
+
+    let mut cmd = Command::new(prog);
+    cmd.args(rest);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+
+    // Enter namespaces in the child after fork, before exec.
+    // Only async-signal-safe operations (setns, close) are used here.
+    // Order: net/uts/ipc first, pid before mnt (so /proc stays readable).
+    unsafe {
+        cmd.pre_exec(move || {
+            for &ns_fd in &ns_fds {
+                if call_setns(ns_fd) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::close(ns_fd);
+            }
+            Ok(())
+        });
+    }
+
+    // Spawn and run; parent closes its copies of ns_fds after spawn returns.
+    let result = if tty {
+        handle_exec_tty(fd, cmd)
+    } else {
+        handle_exec_piped(fd, cmd)
+    };
+
+    // Close parent copies of ns_fds (child already closed its copies in pre_exec,
+    // but the parent's copies are duplicates inherited at fork time).
+    for &ns_fd in &ns_fds {
+        unsafe { libc::close(ns_fd) };
+    }
+
+    result
+}
+
+/// Parse `pelagos ps --all` output and return the PID of the named container.
+fn get_container_pid(container: &str) -> std::io::Result<u32> {
+    let out = Command::new(pelagos_bin()).args(["ps", "--all"]).output()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Output format: NAME  STATUS  PID  ROOTFS  COMMAND  HEALTH  STARTED
+    for line in stdout.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 3 && cols[0] == container {
+            return cols[2]
+                .parse::<u32>()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("container '{}' not found or not running", container),
+    ))
+}
+
+/// Thin wrapper around setns(2) that compiles on all platforms.
+/// pelagos-guest only ever runs on Linux; the non-Linux branch is unreachable
+/// but must exist so `cargo check` / `cargo fmt` work on the macOS host.
+/// async-signal-safe: safe to call in pre_exec.
+#[cfg(target_os = "linux")]
+unsafe fn call_setns(fd: libc::c_int) -> libc::c_int {
+    libc::setns(fd, 0)
+}
+#[cfg(not(target_os = "linux"))]
+unsafe fn call_setns(_fd: libc::c_int) -> libc::c_int {
+    panic!("setns is Linux-only; pelagos-guest only runs inside the Linux VM")
+}
+
+/// Open namespace file descriptors for the given PID.
+/// Returns fds in order: [net, uts, ipc, pid, mnt].
+/// Caller must close all returned fds.
+fn open_ns_fds(pid: u32) -> std::io::Result<[libc::c_int; 5]> {
+    let ns_names = ["net", "uts", "ipc", "pid", "mnt"];
+    let mut fds = [-1i32; 5];
+    for (i, ns) in ns_names.iter().enumerate() {
+        let path = format!("/proc/{}/ns/{}", pid, ns);
+        let cpath = std::ffi::CString::new(path.as_str())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        // No O_CLOEXEC: fd must survive into pre_exec (before exec).
+        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
+        if fd < 0 {
+            for j in 0..i {
+                unsafe { libc::close(fds[j]) };
+            }
+            return Err(std::io::Error::last_os_error());
+        }
+        fds[i] = fd;
+    }
+    Ok(fds)
 }
 
 /// Non-TTY exec: spawn with piped stdin/stdout/stderr, forward via frames.

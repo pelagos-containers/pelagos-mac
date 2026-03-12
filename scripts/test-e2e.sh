@@ -522,12 +522,40 @@ else
 fi
 
 echo ""
-echo "=== test 7o: pelagos-docker exec stub ==="
-shim exec "$SHIM_NAME" /bin/sh > /dev/null 2>&1; EXEC_EXIT=$?
-if [ "$EXEC_EXIT" -ne 0 ]; then
-    pass "docker exec stub: exited non-zero (not yet supported)"
+echo "=== test 7o: pelagos-docker exec (non-tty) ==="
+# Stop daemon so this test gets a fresh one (test 7m left daemon with a -v mount).
+"$BINARY" vm stop > /dev/null 2>&1 || true
+sleep 1
+# Run a detached container, exec a command into it, then clean up.
+EXEC_CTR="shim-exec-$$"
+shim run --name "$EXEC_CTR" --detach "$TEST_IMAGE" \
+    /bin/sh -c "while true; do sleep 5; done" > /dev/null 2>&1
+sleep 1
+OUT=$(shim exec "$EXEC_CTR" /bin/sh -c "echo exec-ok" 2>&1)
+shim stop "$EXEC_CTR" > /dev/null 2>&1 || true
+shim rm   "$EXEC_CTR" > /dev/null 2>&1 || true
+if echo "$OUT" | grep -q "exec-ok"; then
+    pass "docker exec: command ran inside container"
 else
-    fail "docker exec stub: expected non-zero exit, got 0"
+    fail "docker exec: expected 'exec-ok', got: $OUT"
+fi
+
+echo ""
+echo "=== test 7p: pelagos-docker version ==="
+OUT=$(shim version 2>&1)
+if echo "$OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'Client' in d and 'Server' in d" 2>/dev/null; then
+    pass "docker version: valid JSON with Client and Server keys"
+else
+    fail "docker version: unexpected output: $OUT"
+fi
+
+echo ""
+echo "=== test 7q: pelagos-docker info ==="
+OUT=$(shim info 2>&1)
+if echo "$OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'ServerVersion' in d" 2>/dev/null; then
+    pass "docker info: valid JSON with ServerVersion key"
+else
+    fail "docker info: unexpected output: $OUT"
 fi
 
 # Stop daemon before lifecycle tests.
