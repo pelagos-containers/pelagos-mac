@@ -7,6 +7,8 @@ use std::path::PathBuf;
 pub struct StateDir {
     pub pid_file: PathBuf,
     pub sock_file: PathBuf,
+    /// Unix socket for the serial console relay (pelagos vm console).
+    pub console_sock_file: PathBuf,
     pub mounts_file: PathBuf,
 }
 
@@ -17,6 +19,7 @@ impl StateDir {
         Ok(Self {
             pid_file: base.join("vm.pid"),
             sock_file: base.join("vm.sock"),
+            console_sock_file: base.join("console.sock"),
             mounts_file: base.join("vm.mounts"),
         })
     }
@@ -67,10 +70,11 @@ impl StateDir {
         }
     }
 
-    /// Remove PID, socket, and mounts files. Best-effort; ignores errors.
+    /// Remove PID, socket, console socket, and mounts files. Best-effort; ignores errors.
     pub fn clear(&self) {
         let _ = std::fs::remove_file(&self.pid_file);
         let _ = std::fs::remove_file(&self.sock_file);
+        let _ = std::fs::remove_file(&self.console_sock_file);
         let _ = std::fs::remove_file(&self.mounts_file);
     }
 }
@@ -106,6 +110,7 @@ mod tests {
         StateDir {
             pid_file: base.join("vm.pid"),
             sock_file: base.join("vm.sock"),
+            console_sock_file: base.join("console.sock"),
             mounts_file: base.join("vm.mounts"),
         }
     }
@@ -183,10 +188,15 @@ mod tests {
         let s = StateDir {
             pid_file: base.join("vm.pid"),
             sock_file: base.join("vm.sock"),
+            console_sock_file: base.join("console.sock"),
             mounts_file: base.join("vm.mounts"),
         };
         assert_eq!(s.pid_file, PathBuf::from("/tmp/pelagos-path-test/vm.pid"));
         assert_eq!(s.sock_file, PathBuf::from("/tmp/pelagos-path-test/vm.sock"));
+        assert_eq!(
+            s.console_sock_file,
+            PathBuf::from("/tmp/pelagos-path-test/console.sock")
+        );
         assert_eq!(
             s.mounts_file,
             PathBuf::from("/tmp/pelagos-path-test/vm.mounts")

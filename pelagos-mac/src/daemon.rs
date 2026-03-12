@@ -12,7 +12,7 @@
 //!   4. On SIGTERM the daemon stops the VM, removes state files, and exits.
 
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -160,15 +160,26 @@ pub fn run(args: DaemonArgs) -> ! {
 
     let config = build_vm_config(&args);
     log::info!("booting VM...");
-    let vm = Arc::new(Vm::start(config).unwrap_or_else(|e| {
+    let (vm, console_fd) = Vm::start(config).unwrap_or_else(|e| {
         log::error!("VM start failed: {}", e);
         std::process::exit(1);
-    }));
+    });
+    let vm = Arc::new(vm);
     log::info!("VM running");
 
     let listener = UnixListener::bind(&state.sock_file).unwrap_or_else(|e| {
         log::error!("bind {}: {}", state.sock_file.display(), e);
         std::process::exit(1);
+    });
+
+    // Bind the console socket and start the relay thread.
+    // Stale socket from a previous daemon is cleaned up by state.clear() above.
+    let console_listener = UnixListener::bind(&state.console_sock_file).unwrap_or_else(|e| {
+        log::error!("bind {}: {}", state.console_sock_file.display(), e);
+        std::process::exit(1);
+    });
+    std::thread::spawn(move || {
+        console_relay_loop(console_listener, console_fd);
     });
 
     state.write_pid(std::process::id()).unwrap_or_else(|e| {
@@ -348,6 +359,108 @@ pub(crate) fn build_cmdline_from_parts(base: &str, shares: &[VirtiofsShare]) -> 
 #[cfg(test)]
 pub(crate) fn mounts_match(a: &[VirtiofsShare], b: &[VirtiofsShare]) -> bool {
     a == b
+}
+
+// ---------------------------------------------------------------------------
+// Serial console relay
+// ---------------------------------------------------------------------------
+
+/// Accept console clients forever.  Each client gets the serial port for its
+/// session; when it disconnects we wait for the next one.  The serial port
+/// socketpair end (`relay_fd`) is kept alive for the process lifetime.
+fn console_relay_loop(listener: UnixListener, relay_fd: OwnedFd) {
+    let raw = relay_fd.into_raw_fd();
+    loop {
+        let client = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                log::warn!("console accept: {}", e);
+                continue;
+            }
+        };
+        log::info!("console client connected");
+        proxy_console(client, raw);
+        log::info!("console client disconnected");
+        // Loop back to accept the next client; raw stays open.
+    }
+}
+
+/// Bidirectionally proxy between a Unix socket client and the serial console
+/// fd.  Uses a single-threaded poll(2) loop so that a client disconnect
+/// closes both directions cleanly without leaking the relay fd.
+fn proxy_console(client: UnixStream, relay_fd: RawFd) {
+    let client_fd = client.as_raw_fd();
+    // dup the relay fd so we can close the dups independently when done
+    // without closing the original (which must stay open for the next client).
+    let r_read = unsafe { libc::dup(relay_fd) };
+    let r_write = unsafe { libc::dup(relay_fd) };
+    if r_read < 0 || r_write < 0 {
+        log::error!("dup relay_fd failed");
+        unsafe {
+            if r_read >= 0 {
+                libc::close(r_read);
+            }
+            if r_write >= 0 {
+                libc::close(r_write);
+            }
+        }
+        return;
+    }
+
+    let mut buf = vec![0u8; 4096];
+    loop {
+        let mut pfds = [
+            libc::pollfd {
+                fd: client_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: r_read,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let n = unsafe { libc::poll(pfds.as_mut_ptr(), 2, 1000) };
+        if n < 0 {
+            break;
+        }
+
+        // Client → relay
+        if pfds[0].revents & libc::POLLIN != 0 {
+            let n =
+                unsafe { libc::read(client_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            unsafe { libc::write(r_write, buf.as_ptr() as *const libc::c_void, n as usize) };
+        }
+        if pfds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            break;
+        }
+
+        // Relay → client
+        if pfds[1].revents & libc::POLLIN != 0 {
+            let n = unsafe { libc::read(r_read, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            let w =
+                unsafe { libc::write(client_fd, buf.as_ptr() as *const libc::c_void, n as usize) };
+            if w < 0 {
+                break;
+            }
+        }
+        if pfds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            break;
+        }
+    }
+
+    unsafe {
+        libc::close(r_read);
+        libc::close(r_write);
+    }
+    // `client` is dropped here, closing client_fd.
 }
 
 // ---------------------------------------------------------------------------

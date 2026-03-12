@@ -6,6 +6,7 @@
 //! that owns the VZVirtualMachine and proxies vsock connections over a Unix socket.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process;
@@ -130,6 +131,8 @@ enum VmCommands {
     Status,
     /// Open an interactive shell directly in the VM (not in a container)
     Shell,
+    /// Attach to the VM's hvc0 serial console (Ctrl-] to detach)
+    Console,
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +266,37 @@ fn main() {
             }
             let stream = connect_or_exit();
             process::exit(exec_command(stream, GuestCommand::Shell { tty }, tty));
+        }
+
+        Commands::Vm {
+            sub: VmCommands::Console,
+        } => {
+            let state = match state::StateDir::open() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    process::exit(1);
+                }
+            };
+            if !state.console_sock_file.exists() {
+                eprintln!("error: no VM running. Start one with 'pelagos ping'");
+                process::exit(1);
+            }
+            let stream = match UnixStream::connect(&state.console_sock_file) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("console connect: {}", e);
+                    process::exit(1);
+                }
+            };
+            eprintln!("[pelagos] connected to VM console (hvc0). Press Ctrl-] to detach.");
+            let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } != 0;
+            let saved = if is_tty { Some(enter_raw_mode()) } else { None };
+            let exit_code = console_proxy(stream);
+            if let Some(t) = saved {
+                restore_terminal(t);
+            }
+            process::exit(exit_code);
         }
 
         Commands::Run {
@@ -768,6 +802,115 @@ fn read_guest_frames(reader: &mut impl Read, _tty: bool) -> i32 {
             }
         }
     }
+}
+
+/// Proxy stdin/stdout ↔ a Unix socket connected to the VM serial console.
+///
+/// - In TTY mode: Ctrl-] (0x1D) detaches cleanly; stdin EOF also exits.
+/// - In piped mode: after stdin EOF, continues draining console output for up
+///   to 2 seconds so that command output arrives before the process exits.
+///   This makes `printf 'cmd\n' | pelagos vm console` work correctly.
+///
+/// Returns exit code (always 0).
+fn console_proxy(stream: UnixStream) -> i32 {
+    let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } != 0;
+    let stream_fd = stream.as_raw_fd();
+    let mut buf = vec![0u8; 4096];
+    let mut stdin_done = false;
+    let mut drain_until: Option<std::time::Instant> = None;
+
+    loop {
+        // In piped mode, after stdin is exhausted, drain console output for
+        // up to 2 seconds, then exit.  In TTY mode, exit immediately on EOF.
+        let timeout_ms: i32 = if stdin_done {
+            if is_tty {
+                break;
+            }
+            let deadline = drain_until.get_or_insert_with(|| {
+                std::time::Instant::now() + std::time::Duration::from_secs(2)
+            });
+            let rem = deadline.saturating_duration_since(std::time::Instant::now());
+            if rem.is_zero() {
+                break;
+            }
+            rem.as_millis() as i32
+        } else {
+            -1
+        };
+
+        let mut pfds = [
+            libc::pollfd {
+                fd: libc::STDIN_FILENO,
+                events: if stdin_done { 0 } else { libc::POLLIN },
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stream_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let n = unsafe { libc::poll(pfds.as_mut_ptr(), 2, timeout_ms) };
+        if n < 0 {
+            break;
+        }
+        if n == 0 {
+            break; // drain timeout expired
+        }
+
+        // stdin → console
+        if !stdin_done && pfds[0].revents & libc::POLLIN != 0 {
+            let n = unsafe {
+                libc::read(
+                    libc::STDIN_FILENO,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+            if n <= 0 {
+                stdin_done = true;
+                continue; // enter drain mode; don't break yet
+            }
+            let chunk = &buf[..n as usize];
+            // Ctrl-] (ASCII 0x1D) detaches.
+            if chunk.contains(&0x1D) {
+                break;
+            }
+            unsafe {
+                libc::write(
+                    stream_fd,
+                    chunk.as_ptr() as *const libc::c_void,
+                    chunk.len(),
+                )
+            };
+        }
+        if pfds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            stdin_done = true;
+        }
+
+        // console → stdout
+        if pfds[1].revents & libc::POLLIN != 0 {
+            let n =
+                unsafe { libc::read(stream_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            let w = unsafe {
+                libc::write(
+                    libc::STDOUT_FILENO,
+                    buf.as_ptr() as *const libc::c_void,
+                    n as usize,
+                )
+            };
+            if w < 0 {
+                break; // stdout closed (e.g. head -c N reached limit)
+            }
+        }
+        if pfds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            break;
+        }
+    }
+    0
 }
 
 /// Put stdin into raw mode. Returns the saved termios to restore later.

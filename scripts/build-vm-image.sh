@@ -376,6 +376,11 @@ fi
 
 export PELAGOS_IMAGE_STORE=/var/lib/pelagos
 
+# Start a root shell on hvc0 for 'pelagos vm console' access.
+# Opens /dev/hvc0 as a bidirectional fd and execs /bin/sh with all I/O wired
+# to it.  Loops so that reconnecting after 'Ctrl-]' detach spawns a fresh shell.
+(while true; do /bin/sh </dev/hvc0 >/dev/hvc0 2>/dev/hvc0; sleep 1; done) &
+
 exec /usr/local/bin/pelagos-guest
 INIT_EOF
     chmod 755 "$INITRD_TMP/init"

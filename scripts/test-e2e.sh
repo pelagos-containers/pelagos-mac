@@ -272,7 +272,24 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 7b: exec with explicit -t (TTY / PTY mode)
+# Test 7b: vm console (non-TTY smoke test)
+#
+# Sends a command to the VM serial console via a pipe and checks the output.
+# The getty runs /bin/sh on hvc0; we send 'uname -s\nexit\n' and expect "Linux".
+# Uses printf to send input so the shell exits cleanly (no interactive mode).
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== test 7b: vm console (non-tty) ==="
+OUT=$(printf 'uname -s\nexit\n' | pelagos vm console 2>/dev/null | tr -d '\r' | grep -v '^\[')
+if echo "$OUT" | grep -q "Linux"; then
+    pass "vm console: 'uname -s' returned 'Linux'"
+else
+    fail "vm console: expected 'Linux', got: $OUT"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 7c: exec with explicit -t (TTY / PTY mode)
 #
 # PTY output uses \r\n line endings; strip \r before comparing.
 # This test catches two failure modes that are invisible in non-TTY context:
@@ -281,7 +298,7 @@ fi
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== test 7b: exec -t (tty mode) ==="
+echo "=== test 7c: exec -t (tty mode) ==="
 OUT=$(pelagos exec -t "$TEST_IMAGE" /bin/echo hello-tty 2>&1 | tr -d '\r')
 echo "$OUT" | grep -v "^\["
 if echo "$OUT" | grep -q "hello-tty"; then

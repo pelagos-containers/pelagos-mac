@@ -181,7 +181,11 @@ pub enum VmExitReason {
 
 impl Vm {
     /// Boot a VM from the given config. Blocks until the VM reports running state.
-    pub fn start(config: VmConfig) -> Result<Self, crate::Error> {
+    ///
+    /// Returns `(Vm, console_fd)` where `console_fd` is the host end of the
+    /// serial console socketpair.  Bytes written to `console_fd` reach hvc0
+    /// inside the guest; bytes the guest writes to hvc0 are readable from it.
+    pub fn start(config: VmConfig) -> Result<(Self, std::os::unix::io::OwnedFd), crate::Error> {
         unsafe { start_vm(config) }
     }
 
@@ -352,7 +356,7 @@ impl Vm {
 // start_vm — the full AVF initialization sequence
 // ---------------------------------------------------------------------------
 
-unsafe fn start_vm(config: VmConfig) -> Result<Vm, crate::Error> {
+unsafe fn start_vm(config: VmConfig) -> Result<(Vm, std::os::unix::io::OwnedFd), crate::Error> {
     // 1. Serial dispatch queue — all AVF method calls go through this queue.
     let queue = DispatchQueue::new("com.pelagos.vm", DispatchQueueAttr::SERIAL);
 
@@ -383,7 +387,7 @@ unsafe fn start_vm(config: VmConfig) -> Result<Vm, crate::Error> {
     let disk_attach = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
         VZDiskImageStorageDeviceAttachment::alloc(),
         &disk_url,
-        true,
+        false, // read-write so the guest can format and persist the OCI image cache
     )
     .map_err(|e| crate::Error::Config(e.localizedDescription().to_string()))?;
     let block_dev = VZVirtioBlockDeviceConfiguration::initWithAttachment(
@@ -446,14 +450,34 @@ unsafe fn start_vm(config: VmConfig) -> Result<Vm, crate::Error> {
         vm_config.setDirectorySharingDevices(&NSArray::from_slice(&refs));
     }
 
-    // 9. Virtio serial console → guest's hvc0 → host stderr.
-    //    This lets us see kernel boot messages and init script output for debugging.
-    let stderr_fh = NSFileHandle::fileHandleWithStandardError();
+    // 9. Virtio serial console → guest hvc0, wired to a socketpair.
+    //    sp[0] (vm_fd)    → given to VZFileHandleSerialPortAttachment (bidirectional)
+    //    sp[1] (relay_fd) → returned to the caller for pelagos vm console relay
+    //
+    //    We dup vm_fd twice (one for the read handle, one for the write handle)
+    //    with closeOnDealloc:true so AVF owns both fds and cleans them up with
+    //    the VM.  The original vm_fd is closed after the dups are taken.
+    let mut sp = [0i32; 2];
+    if libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sp.as_mut_ptr()) != 0 {
+        return Err(crate::Error::Runtime(format!(
+            "socketpair for console: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let vm_fd = sp[0];
+    let relay_console_fd = std::os::unix::io::OwnedFd::from_raw_fd(sp[1]);
+    let read_dup = libc::dup(vm_fd);
+    let write_dup = libc::dup(vm_fd);
+    libc::close(vm_fd);
+    let vm_fh_read =
+        NSFileHandle::initWithFileDescriptor_closeOnDealloc(NSFileHandle::alloc(), read_dup, true);
+    let vm_fh_write =
+        NSFileHandle::initWithFileDescriptor_closeOnDealloc(NSFileHandle::alloc(), write_dup, true);
     let serial_attach =
         VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
             VZFileHandleSerialPortAttachment::alloc(),
-            None, // no host→guest input
-            Some(&stderr_fh),
+            Some(&*vm_fh_read),
+            Some(&*vm_fh_write),
         );
     let serial_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
     serial_port.setAttachment(Some(&*serial_attach));
@@ -544,13 +568,16 @@ unsafe fn start_vm(config: VmConfig) -> Result<Vm, crate::Error> {
 
     let queue_arc = Arc::new(SendQueue(queue));
 
-    Ok(Vm {
-        vm: vm_arc,
-        sock_dev: Arc::new(SendSockDev(sock_dev)),
-        queue: queue_arc,
-        config,
-        _relay: relay,
-    })
+    Ok((
+        Vm {
+            vm: vm_arc,
+            sock_dev: Arc::new(SendSockDev(sock_dev)),
+            queue: queue_arc,
+            config,
+            _relay: relay,
+        },
+        relay_console_fd,
+    ))
 }
 
 // ---------------------------------------------------------------------------
