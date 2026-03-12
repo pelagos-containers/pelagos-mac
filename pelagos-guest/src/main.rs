@@ -523,9 +523,6 @@ fn run_container(
     if detach {
         cmd.arg("--detach");
     }
-    // Bind-mount the VM's /etc/resolv.conf so containers get working DNS.
-    // Workaround until the pelagos runtime handles this automatically (issue #60).
-    cmd.arg("-v").arg("/etc/resolv.conf:/etc/resolv.conf");
     // Pass each virtiofs guest-side path as a -v bind mount to pelagos run.
     for mount in mounts {
         let guest_mnt = format!("/mnt/{}", mount.tag);
