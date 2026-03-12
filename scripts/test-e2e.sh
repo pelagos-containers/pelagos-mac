@@ -613,6 +613,50 @@ else
     fail "docker network: create=$CREATE_EXIT rm=$RM_EXIT ls_output=$LS_OUT"
 fi
 
+# ---------------------------------------------------------------------------
+# Test 7u: docker cp — container→host
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== test 7u: docker cp (container to host) ==="
+CP_NAME="cpe2eu$$"
+CP_OUT_DIR=$(mktemp -d)
+shim run --detach --name "$CP_NAME" alpine sleep 30 > /dev/null 2>&1
+sleep 2  # give container time to start
+shim cp "${CP_NAME}:/etc/passwd" "$CP_OUT_DIR/" > /dev/null 2>&1; CP_FROM_EXIT=$?
+shim stop "$CP_NAME" > /dev/null 2>&1
+shim rm "$CP_NAME" > /dev/null 2>&1
+if [ "$CP_FROM_EXIT" -eq 0 ] && [ -f "$CP_OUT_DIR/passwd" ]; then
+    pass "docker cp container→host: exit=$CP_FROM_EXIT file exists"
+else
+    fail "docker cp container→host: exit=$CP_FROM_EXIT files=$(ls "$CP_OUT_DIR" 2>/dev/null)"
+fi
+rm -rf "$CP_OUT_DIR"
+
+# ---------------------------------------------------------------------------
+# Test 7v: docker cp — host→container
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== test 7v: docker cp (host to container) ==="
+CP_NAME2="cpe2ev$$"
+CP_SRC=$(mktemp)
+CP_TOKEN="pelagos-cp-test-$$"
+echo "$CP_TOKEN" > "$CP_SRC"
+CP_FNAME=$(basename "$CP_SRC")
+shim run --detach --name "$CP_NAME2" alpine sleep 30 > /dev/null 2>&1
+sleep 2  # give container time to start
+shim cp "$CP_SRC" "${CP_NAME2}:/tmp/" > /dev/null 2>&1; CP_TO_EXIT=$?
+CP_INNER=$(shim exec "$CP_NAME2" cat "/tmp/$CP_FNAME" 2>&1)
+shim stop "$CP_NAME2" > /dev/null 2>&1
+shim rm "$CP_NAME2" > /dev/null 2>&1
+rm -f "$CP_SRC"
+if [ "$CP_TO_EXIT" -eq 0 ] && [ "$CP_INNER" = "$CP_TOKEN" ]; then
+    pass "docker cp host→container: exit=$CP_TO_EXIT content matched"
+else
+    fail "docker cp host→container: exit=$CP_TO_EXIT inner='$CP_INNER' expected='$CP_TOKEN'"
+fi
+
 # Stop daemon before lifecycle tests.
 pelagos vm stop > /dev/null 2>&1 || true
 sleep 1

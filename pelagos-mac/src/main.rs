@@ -168,6 +168,17 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Copy files between the host and a running container.
+    /// Use `container:path` syntax to denote a path inside a container.
+    /// Examples:
+    ///   pelagos cp mycontainer:/etc/os-release /tmp/os-release
+    ///   pelagos cp /tmp/myfile mycontainer:/tmp/
+    Cp {
+        /// Source: either `container:path` or a local path
+        src: String,
+        /// Destination: either `container:path` or a local path
+        dst: String,
+    },
     /// Persistent VM management
     Vm {
         #[command(subcommand)]
@@ -285,16 +296,43 @@ enum GuestCommand {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         args: Vec<String>,
     },
+    /// Copy a path out of a running container.
+    CpFrom {
+        container: String,
+        src: String,
+    },
+    /// Copy a tar payload into a running container.
+    /// `data_size` raw tar bytes follow immediately after the JSON command line.
+    CpTo {
+        container: String,
+        dst: String,
+        data_size: u64,
+    },
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "snake_case")]
 enum GuestResponse {
-    Stream { stream: String, data: String },
-    Exit { exit: i32 },
-    Pong { pong: bool },
-    Error { error: String },
-    Ready { ready: bool },
+    Stream {
+        stream: String,
+        data: String,
+    },
+    Exit {
+        exit: i32,
+    },
+    Pong {
+        pong: bool,
+    },
+    Error {
+        error: String,
+    },
+    Ready {
+        ready: bool,
+    },
+    /// Precedes `size` raw bytes written directly to the socket.
+    RawBytes {
+        size: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -675,6 +713,26 @@ fn main() {
                 GuestCommand::Network { sub, args },
             ));
         }
+
+        Commands::Cp { ref src, ref dst } => {
+            let daemon_args = daemon_args_from_cli(&cli);
+            if let Err(e) = daemon::ensure_running(&daemon_args) {
+                log::error!("failed to start VM daemon: {}", e);
+                process::exit(1);
+            }
+            let stream = connect_or_exit();
+            // One of src/dst must be `container:path`; the other is a local path.
+            if let Some((container, src_path)) = parse_container_path(src) {
+                let local_dst = dst.as_str();
+                process::exit(cp_from_command(stream, &container, src_path, local_dst));
+            } else if let Some((container, dst_path)) = parse_container_path(dst) {
+                let local_src = src.as_str();
+                process::exit(cp_to_command(stream, local_src, &container, dst_path));
+            } else {
+                log::error!("cp: one of src or dst must be container:path");
+                process::exit(1);
+            }
+        }
     }
 }
 
@@ -965,6 +1023,241 @@ fn build_command(
             }
             Err(e) => {
                 log::error!("parse error: {} (line: {:?})", e, trimmed);
+                break;
+            }
+        }
+    }
+    exit_code
+}
+
+// ---------------------------------------------------------------------------
+// docker cp helpers
+// ---------------------------------------------------------------------------
+
+/// Parse `container:path` notation. Returns `(container, path)` if the input
+/// matches, otherwise `None`.
+fn parse_container_path(s: &str) -> Option<(String, &str)> {
+    // A bare path starts with `/`, `.`, or is just `-` (stdin/stdout).
+    // Anything with a `:` that doesn't start with those is container:path.
+    if s.starts_with('/') || s.starts_with('.') || s == "-" {
+        return None;
+    }
+    let colon = s.find(':')?;
+    let container = s[..colon].to_string();
+    let path = &s[colon + 1..];
+    if container.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some((container, path))
+}
+
+/// Copy a path out of a container to a local destination.
+/// Receives `GuestResponse::RawBytes { size }` then raw tar bytes from the guest.
+fn cp_from_command(stream: UnixStream, container: &str, src: &str, local_dst: &str) -> i32 {
+    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+    let mut writer = stream;
+
+    let mut msg = serde_json::to_string(&GuestCommand::CpFrom {
+        container: container.to_string(),
+        src: src.to_string(),
+    })
+    .unwrap();
+    msg.push('\n');
+    if let Err(e) = writer.write_all(msg.as_bytes()) {
+        log::error!("cp: write error: {}", e);
+        return 1;
+    }
+
+    // First response must be RawBytes with the tar size.
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => {
+                log::error!("cp: connection closed before response");
+                return 1;
+            }
+            Ok(_) => {}
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<GuestResponse>(trimmed) {
+            Ok(GuestResponse::RawBytes { size }) => {
+                // Read exactly `size` raw bytes and pipe through `tar xf -`.
+                let dst_path = std::path::Path::new(local_dst);
+                let dst_dir = if dst_path.is_dir() {
+                    local_dst.to_string()
+                } else {
+                    dst_path
+                        .parent()
+                        .map(|p| p.to_str().unwrap_or("."))
+                        .unwrap_or(".")
+                        .to_string()
+                };
+
+                let mut tar_proc = match std::process::Command::new("tar")
+                    .arg("xf")
+                    .arg("-")
+                    .arg("-C")
+                    .arg(&dst_dir)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log::error!("cp: tar spawn: {}", e);
+                        return 1;
+                    }
+                };
+
+                let copy_result = {
+                    let mut sink = tar_proc.stdin.take().unwrap();
+                    let mut limited = (&mut reader).take(size);
+                    std::io::copy(&mut limited, &mut sink)
+                };
+                let tar_status = tar_proc.wait();
+                if copy_result.is_err() || tar_status.map(|s| !s.success()).unwrap_or(true) {
+                    log::error!("cp: tar extract failed");
+                    return 1;
+                }
+            }
+            Ok(GuestResponse::Error { error }) => {
+                log::error!("cp: {}", error);
+                return 1;
+            }
+            Ok(GuestResponse::Exit { exit }) => return exit,
+            Ok(_) => continue,
+            Err(e) => {
+                log::error!("cp: parse error: {}", e);
+                return 1;
+            }
+        }
+    }
+}
+
+/// Copy a local path into a container at `dst`.
+/// Tars the local source and streams it via `GuestCommand::CpTo`.
+fn cp_to_command(stream: UnixStream, local_src: &str, container: &str, dst: &str) -> i32 {
+    // Tar the local source into a temp file.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    let tar_path = std::env::temp_dir().join(format!("pelagos-cp-{}.tar", ts));
+
+    let src_path = std::path::Path::new(local_src);
+    let (tar_dir, tar_name) = if src_path.is_dir() {
+        (local_src, ".".to_string())
+    } else {
+        let parent = src_path
+            .parent()
+            .and_then(|p| p.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(".");
+        let name = src_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(local_src);
+        (parent, name.to_string())
+    };
+
+    let tar_status = std::process::Command::new("tar")
+        .arg("cf")
+        .arg(&tar_path)
+        .arg("-C")
+        .arg(tar_dir)
+        .arg(&tar_name)
+        .status();
+    match tar_status {
+        Err(e) => {
+            log::error!("cp: tar: {}", e);
+            return 1;
+        }
+        Ok(s) if !s.success() => {
+            log::error!("cp: tar failed (exit {})", s.code().unwrap_or(-1));
+            return 1;
+        }
+        Ok(_) => {}
+    }
+
+    let data_size = match std::fs::metadata(&tar_path) {
+        Ok(m) => m.len(),
+        Err(e) => {
+            log::error!("cp: tar metadata: {}", e);
+            let _ = std::fs::remove_file(&tar_path);
+            return 1;
+        }
+    };
+
+    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+    let mut writer = stream;
+
+    // Send JSON header.
+    let mut msg = serde_json::to_string(&GuestCommand::CpTo {
+        container: container.to_string(),
+        dst: dst.to_string(),
+        data_size,
+    })
+    .unwrap();
+    msg.push('\n');
+    if let Err(e) = writer.write_all(msg.as_bytes()) {
+        log::error!("cp: write error: {}", e);
+        let _ = std::fs::remove_file(&tar_path);
+        return 1;
+    }
+
+    // Stream raw tar bytes.
+    let mut tar_file = match std::fs::File::open(&tar_path) {
+        Ok(f) => f,
+        Err(e) => {
+            log::error!("cp: open tar: {}", e);
+            let _ = std::fs::remove_file(&tar_path);
+            return 1;
+        }
+    };
+    if let Err(e) = std::io::copy(&mut tar_file, &mut writer) {
+        log::error!("cp: stream tar: {}", e);
+        let _ = std::fs::remove_file(&tar_path);
+        return 1;
+    }
+    let _ = std::fs::remove_file(&tar_path);
+
+    // Read streaming response from guest.
+    let mut exit_code = 1;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<GuestResponse>(trimmed) {
+            Ok(GuestResponse::Stream { stream, data }) => {
+                if stream == "stderr" {
+                    eprint!("{}", data);
+                } else {
+                    print!("{}", data);
+                }
+            }
+            Ok(GuestResponse::Exit { exit }) => {
+                exit_code = exit;
+                break;
+            }
+            Ok(GuestResponse::Error { error }) => {
+                log::error!("cp: {}", error);
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                log::error!("cp: parse: {}", e);
                 break;
             }
         }
@@ -1758,5 +2051,55 @@ mod tests {
         assert_eq!(v["sub"], "create");
         assert_eq!(v["args"][0], "--subnet");
         assert_eq!(v["args"][2], "mynet");
+    }
+
+    #[test]
+    fn cp_from_serializes() {
+        let cmd = GuestCommand::CpFrom {
+            container: "mybox".into(),
+            src: "/etc/os-release".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "cp_from");
+        assert_eq!(v["container"], "mybox");
+        assert_eq!(v["src"], "/etc/os-release");
+    }
+
+    #[test]
+    fn cp_to_serializes() {
+        let cmd = GuestCommand::CpTo {
+            container: "mybox".into(),
+            dst: "/tmp/".into(),
+            data_size: 4096,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "cp_to");
+        assert_eq!(v["container"], "mybox");
+        assert_eq!(v["dst"], "/tmp/");
+        assert_eq!(v["data_size"], 4096);
+    }
+
+    #[test]
+    fn parse_container_path_detects_container() {
+        let (c, p) = super::parse_container_path("mybox:/etc/os-release").unwrap();
+        assert_eq!(c, "mybox");
+        assert_eq!(p, "/etc/os-release");
+    }
+
+    #[test]
+    fn parse_container_path_rejects_absolute() {
+        assert!(super::parse_container_path("/tmp/foo").is_none());
+    }
+
+    #[test]
+    fn parse_container_path_rejects_relative() {
+        assert!(super::parse_container_path("./foo/bar").is_none());
+    }
+
+    #[test]
+    fn parse_container_path_rejects_dash() {
+        assert!(super::parse_container_path("-").is_none());
     }
 }

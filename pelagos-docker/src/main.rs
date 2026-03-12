@@ -192,6 +192,15 @@ enum DockerCmd {
         /// Network name.
         name: Option<String>,
     },
+
+    /// Copy files between the host and a running container.
+    /// Use `container:path` syntax for the container side.
+    Cp {
+        /// Source: `container:path` or local path.
+        src: String,
+        /// Destination: `container:path` or local path.
+        dst: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +286,7 @@ fn main() {
         } => cmd_build(&cfg, &tag, &file, &build_args, no_cache, &context),
         DockerCmd::Volume { sub, name } => cmd_volume(&cfg, &sub, name.as_deref()),
         DockerCmd::Network { sub, name } => cmd_network(&cfg, &sub, name.as_deref()),
+        DockerCmd::Cp { src, dst } => cmd_cp(&cfg, &src, &dst),
     };
 
     process::exit(exit_code);
@@ -948,6 +958,19 @@ fn cmd_volume(cfg: &Config, sub: &str, name: Option<&str>) -> i32 {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => {
             eprintln!("pelagos-docker volume: {}", e);
+            1
+        }
+    }
+}
+
+fn cmd_cp(cfg: &Config, src: &str, dst: &str) -> i32 {
+    // Pass src and dst verbatim; the host `pelagos cp` command handles
+    // the `container:path` parsing.
+    let a: Vec<OsString> = args(&["cp", src, dst]);
+    match run_pelagos_inherited(cfg, &a) {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("pelagos-docker cp: {}", e);
             1
         }
     }

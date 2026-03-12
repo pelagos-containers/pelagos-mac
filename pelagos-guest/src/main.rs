@@ -162,6 +162,21 @@ pub enum GuestCommand {
         #[serde(default)]
         args: Vec<String>,
     },
+    /// Copy a path out of a running container.
+    /// Response: GuestResponse::RawBytes { size } line, then `size` raw tar bytes, then Exit.
+    CpFrom {
+        container: String,
+        /// Absolute path inside the container (file or directory).
+        src: String,
+    },
+    /// Copy a tar payload into a running container.
+    /// `data_size` raw tar bytes follow immediately after the JSON command line.
+    CpTo {
+        container: String,
+        /// Destination directory inside the container.
+        dst: String,
+        data_size: u64,
+    },
 }
 
 fn default_dockerfile() -> String {
@@ -171,11 +186,26 @@ fn default_dockerfile() -> String {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GuestResponse {
-    Stream { stream: StreamKind, data: String },
-    Exit { exit: i32 },
-    Pong { pong: bool },
-    Error { error: String },
-    Ready { ready: bool },
+    Stream {
+        stream: StreamKind,
+        data: String,
+    },
+    Exit {
+        exit: i32,
+    },
+    Pong {
+        pong: bool,
+    },
+    Error {
+        error: String,
+    },
+    Ready {
+        ready: bool,
+    },
+    /// Precedes a raw binary payload of `size` bytes written directly to the socket (no JSON framing).
+    RawBytes {
+        size: u64,
+    },
 }
 
 #[derive(Debug, Serialize, Clone, Copy)]
@@ -364,6 +394,18 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
             }
             GuestCommand::Network { sub, args } => {
                 handle_network(&mut writer, &sub, &args)?;
+            }
+            GuestCommand::CpFrom { container, src } => {
+                handle_cp_from(&mut writer, &container, &src)?;
+                return Ok(());
+            }
+            GuestCommand::CpTo {
+                container,
+                dst,
+                data_size,
+            } => {
+                handle_cp_to(&mut writer, reader, &container, &dst, data_size)?;
+                return Ok(());
             }
         }
     }
@@ -800,6 +842,217 @@ fn handle_network(writer: &mut impl Write, sub: &str, args: &[String]) -> std::i
     let mut cmd = Command::new(pelagos_bin());
     cmd.arg("network").arg(sub).args(args);
     spawn_and_stream(writer, cmd)
+}
+
+// ---------------------------------------------------------------------------
+// docker cp handlers
+// ---------------------------------------------------------------------------
+
+/// Copy a path out of a running container by entering its namespaces directly.
+/// Runs `tar -cC <parent> <name>` inside the container namespace, captures raw
+/// tar bytes, sends a RawBytes header, writes the bytes, then sends Exit.
+fn handle_cp_from(writer: &mut impl Write, container: &str, src: &str) -> std::io::Result<()> {
+    use std::path::Path;
+
+    let pid = match get_container_pid(container) {
+        Ok(p) => p,
+        Err(e) => {
+            send_response(
+                writer,
+                &GuestResponse::Error {
+                    error: format!("cp: {}", e),
+                },
+            )?;
+            return Ok(());
+        }
+    };
+    let ns_fds = match open_ns_fds(pid) {
+        Ok(f) => f,
+        Err(e) => {
+            send_response(
+                writer,
+                &GuestResponse::Error {
+                    error: format!("cp: open ns fds: {}", e),
+                },
+            )?;
+            return Ok(());
+        }
+    };
+
+    let src_path = Path::new(src);
+    let parent = src_path
+        .parent()
+        .and_then(|p| p.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("/");
+    let name = src_path.file_name().and_then(|n| n.to_str()).unwrap_or(".");
+
+    let mut cmd = Command::new("tar");
+    cmd.arg("-cC").arg(parent).arg(name);
+    // Enter container namespaces in the child after fork, before exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            for &ns_fd in &ns_fds {
+                if call_setns(ns_fd) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::close(ns_fd);
+            }
+            Ok(())
+        });
+    }
+
+    let output = cmd.output();
+    // Close parent's copies of ns_fds.
+    for &ns_fd in &ns_fds {
+        unsafe { libc::close(ns_fd) };
+    }
+
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => {
+            send_response(
+                writer,
+                &GuestResponse::Error {
+                    error: e.to_string(),
+                },
+            )?;
+            return Ok(());
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        send_response(
+            writer,
+            &GuestResponse::Error {
+                error: format!(
+                    "cp: tar failed (exit {}): {}",
+                    output.status.code().unwrap_or(-1),
+                    stderr.trim()
+                ),
+            },
+        )?;
+        return Ok(());
+    }
+
+    let size = output.stdout.len() as u64;
+    send_response(writer, &GuestResponse::RawBytes { size })?;
+    writer.write_all(&output.stdout)?;
+    send_response(writer, &GuestResponse::Exit { exit: 0 })?;
+    Ok(())
+}
+
+/// Copy a tar payload into a running container by entering its namespaces directly.
+/// Reads `data_size` raw bytes from `reader`, pipes them to `tar -xC <dst>`
+/// running inside the container namespace.
+fn handle_cp_to(
+    writer: &mut impl Write,
+    mut reader: BufReader<FdReader>,
+    container: &str,
+    dst: &str,
+    data_size: u64,
+) -> std::io::Result<()> {
+    let pid = match get_container_pid(container) {
+        Ok(p) => p,
+        Err(e) => {
+            send_response(
+                writer,
+                &GuestResponse::Error {
+                    error: format!("cp: {}", e),
+                },
+            )?;
+            return Ok(());
+        }
+    };
+    let ns_fds = match open_ns_fds(pid) {
+        Ok(f) => f,
+        Err(e) => {
+            send_response(
+                writer,
+                &GuestResponse::Error {
+                    error: format!("cp: open ns fds: {}", e),
+                },
+            )?;
+            return Ok(());
+        }
+    };
+
+    let mut cmd = Command::new("tar");
+    cmd.arg("-xC")
+        .arg(dst)
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Enter container namespaces in the child after fork, before exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            for &ns_fd in &ns_fds {
+                if call_setns(ns_fd) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::close(ns_fd);
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            for &ns_fd in &ns_fds {
+                unsafe { libc::close(ns_fd) };
+            }
+            send_response(
+                writer,
+                &GuestResponse::Error {
+                    error: e.to_string(),
+                },
+            )?;
+            return Ok(());
+        }
+    };
+    // Close parent's copies of ns_fds.
+    for &ns_fd in &ns_fds {
+        unsafe { libc::close(ns_fd) };
+    }
+
+    let mut tar_stdin = child.stdin.take().unwrap();
+    let copy_result = {
+        let mut limited = (&mut reader).take(data_size);
+        std::io::copy(&mut limited, &mut tar_stdin)
+    };
+    drop(tar_stdin); // EOF to tar
+
+    if let Err(e) = copy_result {
+        let _ = child.wait();
+        send_response(
+            writer,
+            &GuestResponse::Error {
+                error: e.to_string(),
+            },
+        )?;
+        return Ok(());
+    }
+
+    let stderr_pipe = child.stderr.take().unwrap();
+    let stderr_str = {
+        let mut s = String::new();
+        let _ = BufReader::new(stderr_pipe).read_to_string(&mut s);
+        s
+    };
+    let status = child.wait()?;
+    let code = status.code().unwrap_or(-1);
+    if !stderr_str.is_empty() {
+        send_response(
+            writer,
+            &GuestResponse::Stream {
+                stream: StreamKind::Stderr,
+                data: stderr_str,
+            },
+        )?;
+    }
+    send_response(writer, &GuestResponse::Exit { exit: code })?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1619,6 +1872,37 @@ mod tests {
                 assert_eq!(sub, "create");
                 assert_eq!(args[2], "mynet");
                 assert_eq!(args[0], "--subnet");
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cp_from_deserializes() {
+        let json = r#"{"cmd":"cp_from","container":"mybox","src":"/etc/os-release"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        match cmd {
+            GuestCommand::CpFrom { container, src } => {
+                assert_eq!(container, "mybox");
+                assert_eq!(src, "/etc/os-release");
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cp_to_deserializes() {
+        let json = r#"{"cmd":"cp_to","container":"mybox","dst":"/tmp/","data_size":4096}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        match cmd {
+            GuestCommand::CpTo {
+                container,
+                dst,
+                data_size,
+            } => {
+                assert_eq!(container, "mybox");
+                assert_eq!(dst, "/tmp/");
+                assert_eq!(data_size, 4096);
             }
             other => panic!("unexpected: {:?}", other),
         }
