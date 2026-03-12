@@ -958,7 +958,63 @@ fn build_command(
     no_cache: bool,
     context: &std::path::Path,
 ) -> i32 {
-    // Write a gzipped tar of the context to a temp file so we know its size.
+    // Determine the Dockerfile path relative to the context.
+    // If -f is an absolute path outside the context dir (e.g. a temp file generated
+    // by the devcontainer CLI), copy it into a scratch directory alongside the context
+    // contents so the guest can find it by name.
+    let dockerfile_path = std::path::Path::new(dockerfile);
+    let (effective_context, dockerfile_name) =
+        if dockerfile_path.is_absolute() && !dockerfile_path.starts_with(context) {
+            // Build a temp dir with the context contents + the external Dockerfile.
+            let ts_prep = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros();
+            let scratch = std::env::temp_dir().join(format!("pelagos-ctx-prep-{}", ts_prep));
+            if let Err(e) = std::fs::create_dir_all(&scratch) {
+                log::error!("build: create scratch dir: {}", e);
+                return 1;
+            }
+            // Copy context into scratch.
+            let cp_status = std::process::Command::new("cp")
+                .arg("-a")
+                .arg(format!("{}/.", context.display()))
+                .arg(&scratch)
+                .status();
+            match cp_status {
+                Err(e) => {
+                    log::error!("build: cp context: {}", e);
+                    let _ = std::fs::remove_dir_all(&scratch);
+                    return 1;
+                }
+                Ok(s) if !s.success() => {
+                    log::error!("build: cp context failed");
+                    let _ = std::fs::remove_dir_all(&scratch);
+                    return 1;
+                }
+                Ok(_) => {}
+            }
+            // Copy the external Dockerfile into scratch using its basename.
+            let name = dockerfile_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Dockerfile");
+            if let Err(e) = std::fs::copy(dockerfile_path, scratch.join(name)) {
+                log::error!("build: copy external Dockerfile: {}", e);
+                let _ = std::fs::remove_dir_all(&scratch);
+                return 1;
+            }
+            (scratch, name.to_string())
+        } else {
+            // Dockerfile is inside (or relative to) the context; just use its name/rel path.
+            let name = dockerfile_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(dockerfile);
+            (context.to_path_buf(), name.to_string())
+        };
+
+    // Write a gzipped tar of the (effective) context to a temp file so we know its size.
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -969,9 +1025,13 @@ fn build_command(
         .arg("czf")
         .arg(&tar_path)
         .arg("-C")
-        .arg(context)
+        .arg(&effective_context)
         .arg(".")
         .status();
+    // Clean up scratch dir if we created one.
+    if effective_context != context {
+        let _ = std::fs::remove_dir_all(&effective_context);
+    }
     match tar_status {
         Err(e) => {
             log::error!("tar: {}", e);
@@ -999,7 +1059,7 @@ fn build_command(
     // Send JSON header with context_size.
     let cmd = GuestCommand::Build {
         tag: tag.to_string(),
-        dockerfile: dockerfile.to_string(),
+        dockerfile: dockerfile_name,
         build_args: build_args.to_vec(),
         no_cache,
         context_size,
