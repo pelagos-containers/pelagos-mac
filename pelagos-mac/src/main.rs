@@ -149,6 +149,9 @@ enum Commands {
         /// Do not use the cache
         #[arg(long)]
         no_cache: bool,
+        /// Target build stage (accepted for compatibility; pelagos builds the final stage)
+        #[arg(long)]
+        target: Option<String>,
         /// Build context path (default: .)
         #[arg(default_value = ".")]
         context: String,
@@ -662,6 +665,7 @@ fn main() {
             ref file,
             ref build_args,
             no_cache,
+            target: _,
             ref context,
         } => {
             let tag = tag.clone();

@@ -967,10 +967,11 @@ fn cmd_build(
     if no_cache {
         sub.push("--no-cache".into());
     }
-    if let Some(t) = target {
-        sub.push("--target".into());
-        sub.push(t.into());
-    }
+    // --target is accepted but not forwarded: pelagos build does not yet support
+    // multi-stage target selection. The devcontainer CLI always makes
+    // dev_containers_target_stage the final stage, so omitting --target produces
+    // the same image. Re-wire once pelagos build gains --target support.
+    let _ = target;
     sub.push(context.into());
     match run_pelagos_inherited(cfg, &sub) {
         Ok(s) => s.code().unwrap_or(1),
