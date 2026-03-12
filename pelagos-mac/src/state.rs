@@ -90,8 +90,9 @@ impl StateDir {
     /// Vec if the file does not exist.
     pub fn read_ports(&self) -> io::Result<Vec<crate::daemon::PortForward>> {
         match std::fs::read_to_string(&self.ports_file) {
-            Ok(s) => serde_json::from_str(&s)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+            Ok(s) => {
+                serde_json::from_str(&s).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e),
         }
@@ -215,8 +216,14 @@ mod tests {
     fn write_and_read_ports() {
         let s = temp_state();
         let ports = vec![
-            crate::daemon::PortForward { host_port: 8080, container_port: 80 },
-            crate::daemon::PortForward { host_port: 3000, container_port: 3000 },
+            crate::daemon::PortForward {
+                host_port: 8080,
+                container_port: 80,
+            },
+            crate::daemon::PortForward {
+                host_port: 3000,
+                container_port: 3000,
+            },
         ];
         s.write_ports(&ports).expect("write_ports");
         let read_back = s.read_ports().expect("read_ports");

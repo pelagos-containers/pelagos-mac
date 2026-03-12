@@ -246,11 +246,9 @@ pub fn run(args: DaemonArgs) -> ! {
         .unwrap_or_else(|e| {
             log::error!("write mounts: {}", e);
         });
-    state
-        .write_ports(&args.port_forwards)
-        .unwrap_or_else(|e| {
-            log::error!("write ports: {}", e);
-        });
+    state.write_ports(&args.port_forwards).unwrap_or_else(|e| {
+        log::error!("write ports: {}", e);
+    });
 
     // Start a TCP proxy thread for each requested port forward.
     for pf in &args.port_forwards {
@@ -607,7 +605,9 @@ fn proxy_console(client: UnixStream, relay_fd: RawFd) {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_cmdline_from_parts, mounts_match, parse_port_spec, PortForward, VirtiofsShare};
+    use super::{
+        build_cmdline_from_parts, mounts_match, parse_port_spec, PortForward, VirtiofsShare,
+    };
     use std::path::PathBuf;
 
     fn share(tag: &str, host: &str, container: &str, ro: bool) -> VirtiofsShare {
@@ -691,13 +691,25 @@ mod tests {
     #[test]
     fn parse_port_colon_form() {
         let pf = parse_port_spec("8080:80").unwrap();
-        assert_eq!(pf, PortForward { host_port: 8080, container_port: 80 });
+        assert_eq!(
+            pf,
+            PortForward {
+                host_port: 8080,
+                container_port: 80
+            }
+        );
     }
 
     #[test]
     fn parse_port_bare_form() {
         let pf = parse_port_spec("3000").unwrap();
-        assert_eq!(pf, PortForward { host_port: 3000, container_port: 3000 });
+        assert_eq!(
+            pf,
+            PortForward {
+                host_port: 3000,
+                container_port: 3000
+            }
+        );
     }
 
     #[test]
