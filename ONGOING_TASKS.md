@@ -1,6 +1,6 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-03-12, SHA 6e4f0a0 (post-PR #52)*
+*Last updated: 2026-03-12, SHA 45206c7 (post-PR #59)*
 
 ---
 
@@ -68,17 +68,18 @@ Goal: make pelagos-mac a backend for the [devcontainer CLI](https://github.com/d
 | Subtask | Issue | Status |
 |---|---|---|
 | Docker CLI shim (`pelagos-docker`) | #56 | Not started |
-| Native port forwarding (`-p host:container`) | #57 | Not started |
+| Native port forwarding (`-p host:container`) | #57 | ✅ Done (PR #59) |
 | glibc/Ubuntu container image compatibility | #58 | Not started |
 
-**Recommended start: #57 (port forwarding).**
-It is self-contained Rust, has no external dependencies, and unblocks both the
-Docker CLI shim and SSH-based workflows. Once ports work, the shim (#56) can
-expose them correctly in `inspect` output, and glibc testing (#58) becomes more
-meaningful (containers can open network listeners that are actually reachable).
+Port forwarding merged in PR #59. Daemon binds `TcpListener` on the host and
+proxies to `192.168.105.2:container_port` in the VM. Verified via e2e test 7e.
+
+**Recommended next: #56 (Docker CLI shim) or #58 (glibc/Ubuntu compat).**
+Both are now unblocked. The shim (#56) lets `docker run` delegate to pelagos;
+#58 opens Ubuntu/glibc containers which are required for most devcontainer templates.
 
 See `docs/VM_LIFECYCLE.md` for the VM networking topology (socket_vmnet,
-192.168.105.x subnet) that port forwarding builds on.
+192.168.105.x subnet).
 
 ---
 
