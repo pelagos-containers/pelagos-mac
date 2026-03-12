@@ -329,7 +329,35 @@ else
     fail "exec -t: expected 'hello-tty', got: $(echo "$OUT" | grep -v '^\[')"
 fi
 
-# Stop daemon so lifecycle tests get a clean slate.
+# Stop daemon so port-forward and lifecycle tests get a clean slate.
+pelagos vm stop > /dev/null 2>&1 || true
+sleep 1
+
+# ---------------------------------------------------------------------------
+# Test 7e: port forwarding (-p host_port:container_port)
+#
+# Starts the daemon with --port 18765:8765, runs a detached container that
+# listens on container port 8765 with nc, then connects from the host via
+# the forwarded port 18765 and checks the relayed output.
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== test 7e: port forwarding ==="
+"$BINARY" \
+    --kernel  "$KERNEL" \
+    --initrd  "$INITRD" \
+    --disk    "$DISK" \
+    --cmdline "$CMDLINE" \
+    --port    18765:8765 \
+    run --detach --name pf-test "$TEST_IMAGE" \
+    /bin/sh -c 'echo pf-ok | nc -l -p 8765' > /dev/null 2>&1 || true
+sleep 2
+PF_OUT=$(nc -w 3 127.0.0.1 18765 2>/dev/null || echo "")
+if echo "$PF_OUT" | grep -q "pf-ok"; then
+    pass "port forward: host:18765 → container:8765 relayed 'pf-ok'"
+else
+    fail "port forward: expected 'pf-ok' via host:18765, got: $PF_OUT"
+fi
 pelagos vm stop > /dev/null 2>&1 || true
 sleep 1
 

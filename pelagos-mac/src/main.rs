@@ -53,6 +53,11 @@ struct Cli {
     #[arg(short = 'v', long = "volume", global = true)]
     volumes: Vec<String>,
 
+    /// Forward a host port to a container port: host_port:container_port
+    /// May be specified multiple times.
+    #[arg(short = 'p', long = "port", global = true)]
+    ports: Vec<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -492,6 +497,7 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
     });
 
     let virtiofs_shares = parse_volumes(&cli.volumes);
+    let port_forwards = parse_ports(&cli.ports);
 
     daemon::DaemonArgs {
         kernel,
@@ -501,7 +507,24 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
         memory_mib: cli.memory,
         cpus: cli.cpus,
         virtiofs_shares,
+        port_forwards,
     }
+}
+
+/// Parse `-p host_port:container_port` strings into `PortForward`s.
+fn parse_ports(ports: &[String]) -> Vec<daemon::PortForward> {
+    ports
+        .iter()
+        .map(|spec| {
+            daemon::parse_port_spec(spec).unwrap_or_else(|| {
+                log::error!(
+                    "invalid port spec {:?}: expected host_port:container_port",
+                    spec
+                );
+                process::exit(1);
+            })
+        })
+        .collect()
 }
 
 /// Parse `-v /host/path:/container/path[:ro]` strings into `VirtiofsShare`s.

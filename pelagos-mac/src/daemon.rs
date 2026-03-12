@@ -12,6 +12,7 @@
 //!   4. On SIGTERM the daemon stops the VM, removes state files, and exits.
 
 use std::io;
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -29,6 +30,34 @@ use crate::state::StateDir;
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
+
+/// A host→container port forward: host TCP listener relays to a port inside the VM.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortForward {
+    /// Port to listen on on the host (0.0.0.0).
+    pub host_port: u16,
+    /// Port to connect to inside the VM (192.168.105.2).
+    pub container_port: u16,
+}
+
+/// Parse a `"host_port:container_port"` or bare `"port"` spec.
+pub fn parse_port_spec(spec: &str) -> Option<PortForward> {
+    let parts: Vec<&str> = spec.splitn(2, ':').collect();
+    if parts.len() == 2 {
+        let host_port = parts[0].parse().ok()?;
+        let container_port = parts[1].parse().ok()?;
+        Some(PortForward {
+            host_port,
+            container_port,
+        })
+    } else {
+        let port = spec.parse().ok()?;
+        Some(PortForward {
+            host_port: port,
+            container_port: port,
+        })
+    }
+}
 
 /// A single virtiofs host→guest mount.
 ///
@@ -60,6 +89,8 @@ pub struct DaemonArgs {
     pub cpus: usize,
     /// virtiofs shares requested for this invocation (may be empty).
     pub virtiofs_shares: Vec<VirtiofsShare>,
+    /// Host→container port forwards (may be empty).
+    pub port_forwards: Vec<PortForward>,
 }
 
 /// Ensure the daemon is running, starting it if necessary.
@@ -72,6 +103,7 @@ pub fn ensure_running(args: &DaemonArgs) -> io::Result<()> {
 
     if state.is_daemon_alive() {
         // Verify that the running daemon was started with the same mounts.
+        // (virtiofs shares are part of the VM config and cannot change at runtime.)
         let running_mounts = state.read_mounts()?;
         if running_mounts != args.virtiofs_shares {
             return Err(io::Error::new(
@@ -79,6 +111,24 @@ pub fn ensure_running(args: &DaemonArgs) -> io::Result<()> {
                 "daemon is running with different mount configuration; \
                  run 'pelagos vm stop' first, then retry",
             ));
+        }
+        // Verify that any explicitly requested port forwards are active.
+        // Requesting no ports (-p not given) always succeeds even if the daemon
+        // has active forwards (the proxies are already running).
+        if !args.port_forwards.is_empty() {
+            let running_ports = state.read_ports()?;
+            for pf in &args.port_forwards {
+                if !running_ports.contains(pf) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "port {}:{} is not forwarded by the running daemon; \
+                             run 'pelagos vm stop' first, then retry",
+                            pf.host_port, pf.container_port
+                        ),
+                    ));
+                }
+            }
         }
         return Ok(());
     }
@@ -103,6 +153,10 @@ pub fn ensure_running(args: &DaemonArgs) -> io::Result<()> {
             spec.push_str(":ro");
         }
         cmd.arg("--volume").arg(&spec);
+    }
+    for pf in &args.port_forwards {
+        cmd.arg("--port")
+            .arg(format!("{}:{}", pf.host_port, pf.container_port));
     }
     cmd.arg("vm-daemon-internal");
     cmd.stdin(std::process::Stdio::null());
@@ -186,12 +240,26 @@ pub fn run(args: DaemonArgs) -> ! {
         log::error!("write pid: {}", e);
     });
 
-    // Persist mount configuration so subsequent invocations can verify compatibility.
+    // Persist mount and port configuration.
     state
         .write_mounts(&args.virtiofs_shares)
         .unwrap_or_else(|e| {
             log::error!("write mounts: {}", e);
         });
+    state
+        .write_ports(&args.port_forwards)
+        .unwrap_or_else(|e| {
+            log::error!("write ports: {}", e);
+        });
+
+    // Start a TCP proxy thread for each requested port forward.
+    for pf in &args.port_forwards {
+        let host_port = pf.host_port;
+        let container_port = pf.container_port;
+        std::thread::spawn(move || {
+            port_forward_loop(host_port, container_port);
+        });
+    }
 
     log::info!("daemon listening on {}", state.sock_file.display());
 
@@ -311,6 +379,76 @@ fn proxy(unix: UnixStream, vsock: OwnedFd) {
 
     let _ = t_a.join();
     let _ = t_b.join();
+}
+
+// ---------------------------------------------------------------------------
+// Port forwarding
+// ---------------------------------------------------------------------------
+
+/// Accept TCP connections on `host_port` and proxy each one to
+/// `192.168.105.2:container_port` inside the VM.  Runs for the lifetime of
+/// the daemon process.
+fn port_forward_loop(host_port: u16, container_port: u16) {
+    let listener = match TcpListener::bind(("0.0.0.0", host_port)) {
+        Ok(l) => l,
+        Err(e) => {
+            log::error!("port forward bind 0.0.0.0:{}: {}", host_port, e);
+            return;
+        }
+    };
+    log::info!(
+        "port forward active: 0.0.0.0:{} → 192.168.105.2:{}",
+        host_port,
+        container_port
+    );
+    for incoming in listener.incoming() {
+        let client = match incoming {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("port forward accept: {}", e);
+                continue;
+            }
+        };
+        std::thread::spawn(move || {
+            let target = std::net::SocketAddr::from(([192, 168, 105, 2], container_port));
+            let server = match TcpStream::connect(target) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!(
+                        "port forward connect 192.168.105.2:{}: {}",
+                        container_port,
+                        e
+                    );
+                    return;
+                }
+            };
+            tcp_proxy(client, server);
+        });
+    }
+}
+
+/// Bidirectionally proxy two TCP streams.  Returns when either side closes.
+fn tcp_proxy(client: TcpStream, server: TcpStream) {
+    let mut client_read = client;
+    let mut server_read = server;
+    let mut client_write = client_read.try_clone().expect("tcp clone");
+    let mut server_write = server_read.try_clone().expect("tcp clone");
+
+    // client → server
+    let t1 = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut client_read, &mut server_write);
+        // Signal server that client is done sending.
+        let _ = server_write.shutdown(std::net::Shutdown::Write);
+    });
+
+    // server → client
+    let t2 = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut server_read, &mut client_write);
+        let _ = client_write.shutdown(std::net::Shutdown::Write);
+    });
+
+    let _ = t1.join();
+    let _ = t2.join();
 }
 
 // ---------------------------------------------------------------------------
@@ -469,7 +607,7 @@ fn proxy_console(client: UnixStream, relay_fd: RawFd) {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_cmdline_from_parts, mounts_match, VirtiofsShare};
+    use super::{build_cmdline_from_parts, mounts_match, parse_port_spec, PortForward, VirtiofsShare};
     use std::path::PathBuf;
 
     fn share(tag: &str, host: &str, container: &str, ro: bool) -> VirtiofsShare {
@@ -548,5 +686,24 @@ mod tests {
         let a = vec![share("share0", "/host/a", "/a", false)];
         let b = vec![share("share0", "/host/a", "/a", true)];
         assert!(!mounts_match(&a, &b));
+    }
+
+    #[test]
+    fn parse_port_colon_form() {
+        let pf = parse_port_spec("8080:80").unwrap();
+        assert_eq!(pf, PortForward { host_port: 8080, container_port: 80 });
+    }
+
+    #[test]
+    fn parse_port_bare_form() {
+        let pf = parse_port_spec("3000").unwrap();
+        assert_eq!(pf, PortForward { host_port: 3000, container_port: 3000 });
+    }
+
+    #[test]
+    fn parse_port_invalid_returns_none() {
+        assert!(parse_port_spec("notaport").is_none());
+        assert!(parse_port_spec("abc:def").is_none());
+        assert!(parse_port_spec("99999:80").is_none()); // u16 overflow
     }
 }
