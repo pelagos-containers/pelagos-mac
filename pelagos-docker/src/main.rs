@@ -157,6 +157,41 @@ enum DockerCmd {
         #[arg(short = 'f', long)]
         format: Option<String>,
     },
+
+    /// Build an OCI image from a Dockerfile.
+    Build {
+        /// Image tag.
+        #[arg(short = 't', long)]
+        tag: String,
+        /// Dockerfile path inside the build context.
+        #[arg(short = 'f', long, default_value = "Dockerfile")]
+        file: String,
+        /// Build argument KEY=VALUE (repeatable).
+        #[arg(long = "build-arg")]
+        build_args: Vec<String>,
+        /// Do not use the cache.
+        #[arg(long)]
+        no_cache: bool,
+        /// Build context path (default: .).
+        #[arg(default_value = ".")]
+        context: String,
+    },
+
+    /// Manage named volumes.
+    Volume {
+        /// Subcommand: create, ls, rm.
+        sub: String,
+        /// Volume name.
+        name: Option<String>,
+    },
+
+    /// Manage named networks.
+    Network {
+        /// Subcommand: create, ls, rm, inspect.
+        sub: String,
+        /// Network name.
+        name: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +268,15 @@ fn main() {
         DockerCmd::Version { format } => cmd_version_with_format(format.as_deref()),
         DockerCmd::Info { format: _ } => cmd_info(),
         DockerCmd::Events { .. } => cmd_events(),
+        DockerCmd::Build {
+            tag,
+            file,
+            build_args,
+            no_cache,
+            context,
+        } => cmd_build(&cfg, &tag, &file, &build_args, no_cache, &context),
+        DockerCmd::Volume { sub, name } => cmd_volume(&cfg, &sub, name.as_deref()),
+        DockerCmd::Network { sub, name } => cmd_network(&cfg, &sub, name.as_deref()),
     };
 
     process::exit(exit_code);
@@ -863,4 +907,72 @@ fn build_ports_map(_container: &str, port_map: &[(u16, u16)]) -> HashMap<String,
         });
     }
     map
+}
+
+// ---------------------------------------------------------------------------
+// Build / Volume / Network
+// ---------------------------------------------------------------------------
+
+fn cmd_build(
+    cfg: &Config,
+    tag: &str,
+    file: &str,
+    build_args: &[String],
+    no_cache: bool,
+    context: &str,
+) -> i32 {
+    let mut sub: Vec<OsString> = args(&["build", "-t", tag, "-f", file]);
+    for arg in build_args {
+        sub.push("--build-arg".into());
+        sub.push(arg.into());
+    }
+    if no_cache {
+        sub.push("--no-cache".into());
+    }
+    sub.push(context.into());
+    match run_pelagos_inherited(cfg, &sub) {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("pelagos-docker build: {}", e);
+            1
+        }
+    }
+}
+
+fn cmd_volume(cfg: &Config, sub: &str, name: Option<&str>) -> i32 {
+    let mut a: Vec<OsString> = args(&["volume", sub]);
+    if let Some(n) = name {
+        a.push(n.into());
+    }
+    match run_pelagos_inherited(cfg, &a) {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("pelagos-docker volume: {}", e);
+            1
+        }
+    }
+}
+
+fn cmd_network(cfg: &Config, sub: &str, name: Option<&str>) -> i32 {
+    let mut a: Vec<OsString> = args(&["network", sub]);
+    // `docker network create <name>` auto-assigns a subnet; pelagos requires one explicitly.
+    // Pick 10.88.<hash>.0/24 derived from the name so repeated calls are idempotent.
+    if sub == "create" {
+        if let Some(n) = name {
+            let hash: u8 = n.bytes().fold(0u8, |acc, b| acc.wrapping_add(b));
+            let subnet = format!("10.88.{}.0/24", hash);
+            a.push("--subnet".into());
+            a.push(subnet.into());
+            a.push(n.into());
+        }
+    } else if let Some(n) = name {
+        a.push(n.into());
+    }
+    match run_pelagos_inherited(cfg, &a) {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("pelagos-docker network: {}", e);
+            1
+        }
+    }
 }

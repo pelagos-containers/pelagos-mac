@@ -553,6 +553,66 @@ else
     fail "docker info: unexpected output: $OUT"
 fi
 
+# ---------------------------------------------------------------------------
+# Test 7r: docker build (Dockerfile → OCI image via pelagos build)
+#
+# Creates a minimal Dockerfile (FROM alpine + RUN echo), tars the context,
+# sends it to the guest, and verifies the build succeeds.
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== test 7r: docker build ==="
+# Stop daemon so build test gets a fresh one (no conflicting mounts).
+"$BINARY" vm stop > /dev/null 2>&1 || true
+sleep 1
+BUILD_CTX=$(mktemp -d)
+cat > "$BUILD_CTX/Dockerfile" <<'DOCKERFILE'
+FROM public.ecr.aws/docker/library/alpine:latest
+RUN echo build-ok
+CMD ["/bin/sh"]
+DOCKERFILE
+BUILD_TAG="pelagos-e2e-build-$$:latest"
+OUT=$(shim build -t "$BUILD_TAG" "$BUILD_CTX" 2>&1)
+BUILD_EXIT=$?
+rm -rf "$BUILD_CTX"
+if [ "$BUILD_EXIT" -eq 0 ]; then
+    pass "docker build: exited 0"
+else
+    fail "docker build: exit $BUILD_EXIT; output: $OUT"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 7s: docker volume create / ls / rm round-trip
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== test 7s: docker volume create/ls/rm ==="
+VOL_NAME="pelagos-e2e-vol-$$"
+shim volume create "$VOL_NAME" > /dev/null 2>&1; CREATE_EXIT=$?
+LS_OUT=$(shim volume ls 2>&1)
+shim volume rm "$VOL_NAME" > /dev/null 2>&1; RM_EXIT=$?
+if [ "$CREATE_EXIT" -eq 0 ] && echo "$LS_OUT" | grep -q "$VOL_NAME" && [ "$RM_EXIT" -eq 0 ]; then
+    pass "docker volume: create/ls/rm round-trip succeeded"
+else
+    fail "docker volume: create=$CREATE_EXIT rm=$RM_EXIT ls_output=$LS_OUT"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 7t: docker network create / ls / rm round-trip
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== test 7t: docker network create/ls/rm ==="
+NET_NAME="e2enet$$"
+shim network create "$NET_NAME" > /dev/null 2>&1; CREATE_EXIT=$?
+LS_OUT=$(shim network ls 2>&1)
+shim network rm "$NET_NAME" > /dev/null 2>&1; RM_EXIT=$?
+if [ "$CREATE_EXIT" -eq 0 ] && echo "$LS_OUT" | grep -q "$NET_NAME" && [ "$RM_EXIT" -eq 0 ]; then
+    pass "docker network: create/ls/rm round-trip succeeded"
+else
+    fail "docker network: create=$CREATE_EXIT rm=$RM_EXIT ls_output=$LS_OUT"
+fi
+
 # Stop daemon before lifecycle tests.
 pelagos vm stop > /dev/null 2>&1 || true
 sleep 1

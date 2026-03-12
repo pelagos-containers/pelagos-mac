@@ -135,6 +135,39 @@ enum Commands {
     },
     /// Ping the guest daemon (readiness check)
     Ping,
+    /// Build an OCI image from a Dockerfile (Remfile) inside the VM
+    Build {
+        /// Image tag (e.g. myapp:latest)
+        #[arg(short = 't', long)]
+        tag: String,
+        /// Path to the Dockerfile/Remfile inside the build context (default: Dockerfile)
+        #[arg(short = 'f', long, default_value = "Dockerfile")]
+        file: String,
+        /// Build argument (KEY=VALUE); may be repeated
+        #[arg(long = "build-arg")]
+        build_args: Vec<String>,
+        /// Do not use the cache
+        #[arg(long)]
+        no_cache: bool,
+        /// Build context path (default: .)
+        #[arg(default_value = ".")]
+        context: String,
+    },
+    /// Manage named volumes inside the VM
+    Volume {
+        /// Subcommand: create, ls, rm
+        sub: String,
+        /// Volume name (for create/rm)
+        name: Option<String>,
+    },
+    /// Manage named networks inside the VM
+    Network {
+        /// Subcommand: create, ls, rm, inspect
+        sub: String,
+        /// Remaining args forwarded verbatim (name, flags like --subnet, etc.)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Persistent VM management
     Vm {
         #[command(subcommand)]
@@ -232,6 +265,26 @@ enum GuestCommand {
         force: bool,
     },
     Ping,
+    Build {
+        tag: String,
+        dockerfile: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        build_args: Vec<String>,
+        #[serde(skip_serializing_if = "is_false")]
+        no_cache: bool,
+        context_size: u64,
+    },
+    Volume {
+        sub: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    Network {
+        sub: String,
+        /// All remaining args forwarded verbatim (name, --subnet, etc.).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Deserialize, Debug)]
@@ -565,6 +618,63 @@ fn main() {
                 GuestCommand::Rm { name, force },
             ));
         }
+
+        Commands::Build {
+            ref tag,
+            ref file,
+            ref build_args,
+            no_cache,
+            ref context,
+        } => {
+            let tag = tag.clone();
+            let file = file.clone();
+            let build_args = build_args.clone();
+            let context = std::path::PathBuf::from(context);
+            let daemon_args = daemon_args_from_cli(&cli);
+            if let Err(e) = daemon::ensure_running(&daemon_args) {
+                log::error!("failed to start VM daemon: {}", e);
+                process::exit(1);
+            }
+            let stream = connect_or_exit();
+            process::exit(build_command(
+                stream,
+                &tag,
+                &file,
+                &build_args,
+                no_cache,
+                &context,
+            ));
+        }
+
+        Commands::Volume { ref sub, ref name } => {
+            let sub = sub.clone();
+            let name = name.clone();
+            let daemon_args = daemon_args_from_cli(&cli);
+            if let Err(e) = daemon::ensure_running(&daemon_args) {
+                log::error!("failed to start VM daemon: {}", e);
+                process::exit(1);
+            }
+            let stream = connect_or_exit();
+            process::exit(passthrough_command(
+                stream,
+                GuestCommand::Volume { sub, name },
+            ));
+        }
+
+        Commands::Network { ref sub, ref args } => {
+            let sub = sub.clone();
+            let args = args.clone();
+            let daemon_args = daemon_args_from_cli(&cli);
+            if let Err(e) = daemon::ensure_running(&daemon_args) {
+                log::error!("failed to start VM daemon: {}", e);
+                process::exit(1);
+            }
+            let stream = connect_or_exit();
+            process::exit(passthrough_command(
+                stream,
+                GuestCommand::Network { sub, args },
+            ));
+        }
     }
 }
 
@@ -709,6 +819,119 @@ fn passthrough_command(stream: UnixStream, cmd: GuestCommand) -> i32 {
         return 1;
     }
 
+    let mut exit_code = 1;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<GuestResponse>(trimmed) {
+            Ok(GuestResponse::Stream { stream, data }) => {
+                if stream == "stderr" {
+                    eprint!("{}", data);
+                } else {
+                    print!("{}", data);
+                }
+            }
+            Ok(GuestResponse::Exit { exit }) => {
+                exit_code = exit;
+                break;
+            }
+            Ok(GuestResponse::Error { error }) => {
+                log::error!("guest error: {}", error);
+                break;
+            }
+            Ok(resp) => {
+                log::warn!("unexpected response: {:?}", resp);
+            }
+            Err(e) => {
+                log::error!("parse error: {} (line: {:?})", e, trimmed);
+                break;
+            }
+        }
+    }
+    exit_code
+}
+
+/// Tar up the build context, send it to the guest, and relay build output.
+fn build_command(
+    stream: UnixStream,
+    tag: &str,
+    dockerfile: &str,
+    build_args: &[String],
+    no_cache: bool,
+    context: &std::path::Path,
+) -> i32 {
+    // Write a gzipped tar of the context to a temp file so we know its size.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    let tar_path = std::env::temp_dir().join(format!("pelagos-ctx-{}.tar.gz", ts));
+
+    let tar_status = std::process::Command::new("tar")
+        .arg("czf")
+        .arg(&tar_path)
+        .arg("-C")
+        .arg(context)
+        .arg(".")
+        .status();
+    match tar_status {
+        Err(e) => {
+            log::error!("tar: {}", e);
+            return 1;
+        }
+        Ok(s) if !s.success() => {
+            log::error!("tar failed (exit {})", s.code().unwrap_or(-1));
+            return 1;
+        }
+        Ok(_) => {}
+    }
+
+    let context_size = match std::fs::metadata(&tar_path) {
+        Ok(m) => m.len(),
+        Err(e) => {
+            log::error!("tar metadata: {}", e);
+            let _ = std::fs::remove_file(&tar_path);
+            return 1;
+        }
+    };
+
+    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+    let mut writer = stream;
+
+    // Send JSON header with context_size.
+    let cmd = GuestCommand::Build {
+        tag: tag.to_string(),
+        dockerfile: dockerfile.to_string(),
+        build_args: build_args.to_vec(),
+        no_cache,
+        context_size,
+    };
+    let mut msg = serde_json::to_string(&cmd).unwrap();
+    msg.push('\n');
+    if let Err(e) = writer.write_all(msg.as_bytes()) {
+        log::error!("build: write header: {}", e);
+        let _ = std::fs::remove_file(&tar_path);
+        return 1;
+    }
+
+    // Stream the tar bytes immediately after the header.
+    let result =
+        std::fs::File::open(&tar_path).and_then(|mut f| std::io::copy(&mut f, &mut writer));
+    let _ = std::fs::remove_file(&tar_path);
+    if let Err(e) = result {
+        log::error!("build: send context: {}", e);
+        return 1;
+    }
+
+    // Read streaming build output.
     let mut exit_code = 1;
     let mut line = String::new();
     loop {
@@ -1146,9 +1369,10 @@ fn read_winsize() -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        recv_frame, send_frame, GuestCommand, GuestMount, GuestResponse, FRAME_EXIT, FRAME_RESIZE,
-        FRAME_STDIN, FRAME_STDOUT,
+        recv_frame, send_frame, Cli, Commands, GuestCommand, GuestMount, GuestResponse, FRAME_EXIT,
+        FRAME_RESIZE, FRAME_STDIN, FRAME_STDOUT,
     };
+    use clap::Parser as _;
     use std::io::Cursor;
 
     #[test]
@@ -1429,5 +1653,110 @@ mod tests {
         let (frame_type, data) = recv_frame(&mut cursor).unwrap();
         assert_eq!(frame_type, FRAME_STDOUT);
         assert!(data.is_empty());
+    }
+
+    #[test]
+    fn build_command_serializes() {
+        let cmd = GuestCommand::Build {
+            tag: "myapp:latest".into(),
+            dockerfile: "Dockerfile".into(),
+            build_args: vec!["KEY=VAL".into()],
+            no_cache: true,
+            context_size: 4096,
+        };
+        let json = serde_json::to_string(&cmd).expect("serialize failed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "build");
+        assert_eq!(v["tag"], "myapp:latest");
+        assert_eq!(v["dockerfile"], "Dockerfile");
+        assert_eq!(v["build_args"][0], "KEY=VAL");
+        assert_eq!(v["no_cache"], true);
+        assert_eq!(v["context_size"], 4096);
+    }
+
+    #[test]
+    fn build_command_omits_defaults() {
+        let cmd = GuestCommand::Build {
+            tag: "x".into(),
+            dockerfile: "Dockerfile".into(),
+            build_args: vec![],
+            no_cache: false,
+            context_size: 0,
+        };
+        let json = serde_json::to_string(&cmd).expect("serialize failed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // build_args omitted when empty; no_cache omitted when false
+        assert!(v["build_args"].is_null());
+        assert!(v["no_cache"].is_null());
+    }
+
+    #[test]
+    fn volume_command_serializes() {
+        let cmd = GuestCommand::Volume {
+            sub: "create".into(),
+            name: Some("myvol".into()),
+        };
+        let json = serde_json::to_string(&cmd).expect("serialize failed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "volume");
+        assert_eq!(v["sub"], "create");
+        assert_eq!(v["name"], "myvol");
+    }
+
+    #[test]
+    fn network_command_serializes() {
+        let cmd = GuestCommand::Network {
+            sub: "ls".into(),
+            args: vec![],
+        };
+        let json = serde_json::to_string(&cmd).expect("serialize failed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "network");
+        assert_eq!(v["sub"], "ls");
+        // args omitted when empty
+        assert!(v["args"].is_null());
+    }
+
+    #[test]
+    fn network_clap_parses_subnet_flag() {
+        // Verify that clap's trailing_var_arg actually captures --subnet into args
+        let cli = Cli::try_parse_from([
+            "pelagos",
+            "--kernel",
+            "/dev/null",
+            "--initrd",
+            "/dev/null",
+            "--disk",
+            "/dev/null",
+            "--cmdline",
+            "console=hvc0",
+            "network",
+            "create",
+            "--subnet",
+            "10.88.1.0/24",
+            "testnet",
+        ])
+        .expect("parse failed");
+        match cli.command {
+            Commands::Network { sub, args } => {
+                assert_eq!(sub, "create");
+                assert_eq!(args, vec!["--subnet", "10.88.1.0/24", "testnet"]);
+            }
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn network_command_with_args_serializes() {
+        let cmd = GuestCommand::Network {
+            sub: "create".into(),
+            args: vec!["--subnet".into(), "10.88.1.0/24".into(), "mynet".into()],
+        };
+        let json = serde_json::to_string(&cmd).expect("serialize failed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "network");
+        assert_eq!(v["sub"], "create");
+        assert_eq!(v["args"][0], "--subnet");
+        assert_eq!(v["args"][2], "mynet");
     }
 }

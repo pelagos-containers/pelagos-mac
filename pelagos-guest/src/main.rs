@@ -136,6 +136,36 @@ pub enum GuestCommand {
         tty: bool,
     },
     Ping,
+    /// Build an OCI image from a Dockerfile-compatible Remfile.
+    /// The build context is streamed as a gzipped tar immediately after the
+    /// JSON command line (raw bytes, no framing; length given by context_size).
+    Build {
+        tag: String,
+        #[serde(default = "default_dockerfile")]
+        dockerfile: String,
+        #[serde(default)]
+        build_args: Vec<String>,
+        #[serde(default)]
+        no_cache: bool,
+        context_size: u64,
+    },
+    /// Manage named volumes: sub is "create", "ls", or "rm".
+    Volume {
+        sub: String,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    /// Manage named networks: sub is "create", "ls", "rm", or "inspect".
+    /// All remaining args (name, --subnet, etc.) are forwarded verbatim.
+    Network {
+        sub: String,
+        #[serde(default)]
+        args: Vec<String>,
+    },
+}
+
+fn default_dockerfile() -> String {
+    "Dockerfile".to_string()
 }
 
 #[derive(Debug, Serialize)]
@@ -196,15 +226,23 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
     let _guard = ConnFd(fd);
 
     // FdReader/FdWriter use libc::read/write directly — no OwnedFd involved.
-    let reader = BufReader::new(FdReader(fd));
+    // Use a named BufReader (not an iterator) so it can be passed by value to
+    // handle_build, which must read the raw tar body after the JSON header line.
+    let mut reader = BufReader::new(FdReader(fd));
     let mut writer = FdWriter(fd);
 
-    for line in reader.lines() {
-        let line = line?;
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
+            Err(e) => return Err(e),
+        }
+        let line = line.trim_end_matches('\n').trim_end_matches('\r');
         if line.is_empty() {
             continue;
         }
-        let cmd: GuestCommand = match serde_json::from_str(&line) {
+        let cmd: GuestCommand = match serde_json::from_str(line) {
             Ok(c) => c,
             Err(e) => {
                 send_response(
@@ -302,6 +340,30 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                     handle_exec_piped(fd, cmd)?;
                 }
                 return Ok(());
+            }
+            GuestCommand::Build {
+                tag,
+                dockerfile,
+                build_args,
+                no_cache,
+                context_size,
+            } => {
+                handle_build(
+                    &mut writer,
+                    reader,
+                    &tag,
+                    &dockerfile,
+                    &build_args,
+                    no_cache,
+                    context_size,
+                )?;
+                return Ok(());
+            }
+            GuestCommand::Volume { sub, name } => {
+                handle_volume(&mut writer, &sub, name.as_deref())?;
+            }
+            GuestCommand::Network { sub, args } => {
+                handle_network(&mut writer, &sub, &args)?;
             }
         }
     }
@@ -597,6 +659,150 @@ fn run_detached(writer: &mut impl Write, mut cmd: Command) -> std::io::Result<()
 }
 
 // ---------------------------------------------------------------------------
+// Build handler
+// ---------------------------------------------------------------------------
+
+/// Receive a gzipped tar build context over vsock, extract it, and run
+/// `pelagos build`.  The raw tar bytes follow immediately after the JSON
+/// command line; their length is given by `context_size`.
+fn handle_build(
+    writer: &mut impl Write,
+    mut reader: BufReader<FdReader>,
+    tag: &str,
+    dockerfile: &str,
+    build_args: &[String],
+    no_cache: bool,
+    context_size: u64,
+) -> std::io::Result<()> {
+    let build_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    let ctx_dir = format!("/tmp/pelagos-build-{}", build_id);
+    std::fs::create_dir_all(&ctx_dir)?;
+
+    // Pipe exactly context_size bytes from the vsock reader into `tar xzf -`.
+    {
+        let mut tar_proc = match Command::new("tar")
+            .arg("xzf")
+            .arg("-")
+            .arg("-C")
+            .arg(&ctx_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&ctx_dir);
+                send_response(
+                    writer,
+                    &GuestResponse::Error {
+                        error: format!("tar spawn failed: {}", e),
+                    },
+                )?;
+                return Ok(());
+            }
+        };
+        let tar_stdin = tar_proc.stdin.take().unwrap();
+        let tar_stderr = tar_proc.stderr.take().unwrap();
+
+        // Drain tar stderr concurrently so the pipe never fills.
+        let stderr_thread = std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = BufReader::new(tar_stderr).read_to_string(&mut s);
+            s
+        });
+
+        let copy_result = {
+            let mut sink = tar_stdin;
+            let mut limited = (&mut reader).take(context_size);
+            std::io::copy(&mut limited, &mut sink)
+        }; // sink dropped here → EOF to tar
+
+        let tar_status = tar_proc.wait()?;
+        let tar_stderr_str = stderr_thread.join().unwrap_or_default();
+
+        if copy_result.is_err() || !tar_status.success() {
+            let _ = std::fs::remove_dir_all(&ctx_dir);
+            send_response(
+                writer,
+                &GuestResponse::Error {
+                    error: format!(
+                        "build context extract failed (exit {}): {}",
+                        tar_status.code().unwrap_or(-1),
+                        tar_stderr_str.trim()
+                    ),
+                },
+            )?;
+            return Ok(());
+        }
+    }
+
+    // Pre-pull the base image declared in the first FROM line.
+    let dockerfile_path = format!("{}/{}", ctx_dir, dockerfile);
+    if let Ok(content) = std::fs::read_to_string(&dockerfile_path) {
+        for line in content.lines() {
+            if line.trim().to_ascii_uppercase().starts_with("FROM") {
+                let base = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                if !base.is_empty()
+                    && !base.eq_ignore_ascii_case("scratch")
+                    && !pull_image(writer, &base)?
+                {
+                    let _ = std::fs::remove_dir_all(&ctx_dir);
+                    return Ok(());
+                }
+                break;
+            }
+        }
+    }
+
+    // Run pelagos build.
+    // Use --network none: the VM's minimal kernel has no bridge/veth modules or
+    // pasta binary, so the default "auto" mode (bridge) fails. Network access
+    // during RUN steps requires kernel bridge support; revisit when kernel is extended.
+    let mut cmd = Command::new(pelagos_bin());
+    cmd.arg("build")
+        .arg("-t")
+        .arg(tag)
+        .arg("-f")
+        .arg(&dockerfile_path)
+        .arg("--network")
+        .arg("none");
+    for arg in build_args {
+        cmd.arg("--build-arg").arg(arg);
+    }
+    if no_cache {
+        cmd.arg("--no-cache");
+    }
+    cmd.arg(&ctx_dir);
+
+    let result = spawn_and_stream(writer, cmd);
+    let _ = std::fs::remove_dir_all(&ctx_dir);
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Volume and network passthrough handlers
+// ---------------------------------------------------------------------------
+
+fn handle_volume(writer: &mut impl Write, sub: &str, name: Option<&str>) -> std::io::Result<()> {
+    let mut cmd = Command::new(pelagos_bin());
+    cmd.arg("volume").arg(sub);
+    if let Some(n) = name {
+        cmd.arg(n);
+    }
+    spawn_and_stream(writer, cmd)
+}
+
+fn handle_network(writer: &mut impl Write, sub: &str, args: &[String]) -> std::io::Result<()> {
+    let mut cmd = Command::new(pelagos_bin());
+    cmd.arg("network").arg(sub).args(args);
+    spawn_and_stream(writer, cmd)
+}
+
+// ---------------------------------------------------------------------------
 // Exec handler
 // ---------------------------------------------------------------------------
 
@@ -779,8 +985,8 @@ fn open_ns_fds(pid: u32) -> std::io::Result<[libc::c_int; 5]> {
         // No O_CLOEXEC: fd must survive into pre_exec (before exec).
         let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
         if fd < 0 {
-            for j in 0..i {
-                unsafe { libc::close(fds[j]) };
+            for fd in fds.iter().take(i) {
+                unsafe { libc::close(*fd) };
             }
             return Err(std::io::Error::last_os_error());
         }
@@ -1340,6 +1546,82 @@ mod tests {
         let json = serde_json::to_string(&resp).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["error"]["error"], "oops");
+    }
+
+    #[test]
+    fn build_deserializes() {
+        let json =
+            r#"{"cmd":"build","tag":"myapp:latest","dockerfile":"Dockerfile","context_size":1234}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        match cmd {
+            GuestCommand::Build {
+                tag,
+                dockerfile,
+                build_args,
+                no_cache,
+                context_size,
+            } => {
+                assert_eq!(tag, "myapp:latest");
+                assert_eq!(dockerfile, "Dockerfile");
+                assert!(build_args.is_empty());
+                assert!(!no_cache);
+                assert_eq!(context_size, 1234);
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_deserializes_with_build_args() {
+        let json = r#"{"cmd":"build","tag":"myapp:1.0","dockerfile":"Dockerfile.prod","build_args":["KEY=VAL"],"no_cache":true,"context_size":9999}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        match cmd {
+            GuestCommand::Build {
+                tag,
+                build_args,
+                no_cache,
+                ..
+            } => {
+                assert_eq!(tag, "myapp:1.0");
+                assert_eq!(build_args, vec!["KEY=VAL"]);
+                assert!(no_cache);
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn volume_deserializes() {
+        let json = r#"{"cmd":"volume","sub":"create","name":"myvol"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        match cmd {
+            GuestCommand::Volume { sub, name } => {
+                assert_eq!(sub, "create");
+                assert_eq!(name.as_deref(), Some("myvol"));
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn volume_ls_deserializes() {
+        let json = r#"{"cmd":"volume","sub":"ls"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        assert!(matches!(cmd, GuestCommand::Volume { ref sub, name: None } if sub == "ls"));
+    }
+
+    #[test]
+    fn network_deserializes() {
+        let json = r#"{"cmd":"network","sub":"create","args":["--subnet","10.88.1.0/24","mynet"]}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        match cmd {
+            GuestCommand::Network { sub, args } => {
+                assert_eq!(sub, "create");
+                assert_eq!(args[2], "mynet");
+                assert_eq!(args[0], "--subnet");
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
     }
 
     #[test]
