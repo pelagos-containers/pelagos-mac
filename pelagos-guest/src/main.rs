@@ -919,6 +919,22 @@ fn handle_cp_from(writer: &mut impl Write, container: &str, src: &str) -> std::i
         }
     };
 
+    let root_fd = match open_root_fd(pid) {
+        Ok(f) => f,
+        Err(e) => {
+            for &nfd in &ns_fds {
+                unsafe { libc::close(nfd) };
+            }
+            send_response(
+                writer,
+                &GuestResponse::Error {
+                    error: format!("cp: open root: {}", e),
+                },
+            )?;
+            return Ok(());
+        }
+    };
+
     let src_path = Path::new(src);
     let parent = src_path
         .parent()
@@ -929,7 +945,6 @@ fn handle_cp_from(writer: &mut impl Write, container: &str, src: &str) -> std::i
 
     let mut cmd = Command::new("tar");
     cmd.arg("-cC").arg(parent).arg(name);
-    // Enter container namespaces in the child after fork, before exec.
     unsafe {
         cmd.pre_exec(move || {
             for &ns_fd in &ns_fds {
@@ -938,15 +953,23 @@ fn handle_cp_from(writer: &mut impl Write, container: &str, src: &str) -> std::i
                 }
                 libc::close(ns_fd);
             }
+            if libc::fchdir(root_fd) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::chroot(b".\0".as_ptr() as *const libc::c_char) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::chdir(b"/\0".as_ptr() as *const libc::c_char);
+            libc::close(root_fd);
             Ok(())
         });
     }
 
     let output = cmd.output();
-    // Close parent's copies of ns_fds.
     for &ns_fd in &ns_fds {
         unsafe { libc::close(ns_fd) };
     }
+    unsafe { libc::close(root_fd) };
 
     let output = match output {
         Ok(o) => o,
@@ -1018,12 +1041,27 @@ fn handle_cp_to(
         }
     };
 
+    let root_fd = match open_root_fd(pid) {
+        Ok(f) => f,
+        Err(e) => {
+            for &nfd in &ns_fds {
+                unsafe { libc::close(nfd) };
+            }
+            send_response(
+                writer,
+                &GuestResponse::Error {
+                    error: format!("cp: open root: {}", e),
+                },
+            )?;
+            return Ok(());
+        }
+    };
+
     let mut cmd = Command::new("tar");
     cmd.arg("-xC")
         .arg(dst)
         .stdin(Stdio::piped())
         .stderr(Stdio::piped());
-    // Enter container namespaces in the child after fork, before exec.
     unsafe {
         cmd.pre_exec(move || {
             for &ns_fd in &ns_fds {
@@ -1032,6 +1070,14 @@ fn handle_cp_to(
                 }
                 libc::close(ns_fd);
             }
+            if libc::fchdir(root_fd) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::chroot(b".\0".as_ptr() as *const libc::c_char) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::chdir(b"/\0".as_ptr() as *const libc::c_char);
+            libc::close(root_fd);
             Ok(())
         });
     }
@@ -1042,6 +1088,7 @@ fn handle_cp_to(
             for &ns_fd in &ns_fds {
                 unsafe { libc::close(ns_fd) };
             }
+            unsafe { libc::close(root_fd) };
             send_response(
                 writer,
                 &GuestResponse::Error {
@@ -1051,10 +1098,10 @@ fn handle_cp_to(
             return Ok(());
         }
     };
-    // Close parent's copies of ns_fds.
     for &ns_fd in &ns_fds {
         unsafe { libc::close(ns_fd) };
     }
+    unsafe { libc::close(root_fd) };
 
     let mut tar_stdin = child.stdin.take().unwrap();
     let copy_result = {
@@ -1157,7 +1204,7 @@ fn handle_exec(
 /// exit 0, wrong data.
 ///
 /// Any guest code that runs commands inside a container MUST use the direct
-/// setns pattern shown here and in `handle_cp_from` / `handle_cp_to`.
+/// setns + fchdir/chroot pattern shown here and in `handle_cp_from` / `handle_cp_to`.
 /// See docs/GUEST_CONTAINER_EXEC.md for the full analysis and a reusable template.
 fn handle_exec_into(
     fd: libc::c_int,
@@ -1190,6 +1237,23 @@ fn handle_exec_into(
         e
     })?;
 
+    // Open the container's root directory via /proc/<pid>/root.
+    // pelagos uses chroot (not pivot_root), so after setns(mnt) "/" is still
+    // the guest root.  fchdir(root_fd) + chroot(".") in pre_exec fixes this.
+    let root_fd = open_root_fd(pid).map_err(|e| {
+        let mut w = FdWriter(fd);
+        let _ = send_response(
+            &mut w,
+            &GuestResponse::Error {
+                error: format!("exec-into: open root: {}", e),
+            },
+        );
+        for &nfd in &ns_fds {
+            unsafe { libc::close(nfd) };
+        }
+        e
+    })?;
+
     // Send ready — both sides switch to framed binary protocol.
     {
         let mut w = FdWriter(fd);
@@ -1199,10 +1263,10 @@ fn handle_exec_into(
     let (prog, rest) = match args.split_first() {
         Some(p) => p,
         None => {
-            // Close ns fds before returning.
-            for fd in ns_fds {
-                unsafe { libc::close(fd) };
+            for nfd in ns_fds {
+                unsafe { libc::close(nfd) };
             }
+            unsafe { libc::close(root_fd) };
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "exec-into: no command",
@@ -1216,9 +1280,10 @@ fn handle_exec_into(
         cmd.env(k, v);
     }
 
-    // Enter namespaces in the child after fork, before exec.
-    // Only async-signal-safe operations (setns, close) are used here.
+    // Enter namespaces and chroot into the container's rootfs.
+    // Only async-signal-safe operations (setns, fchdir, chroot, chdir, close) are used.
     // Order: net/uts/ipc first, pid before mnt (so /proc stays readable).
+    // After all setns: fchdir(root_fd) + chroot(".") enters the container rootfs.
     unsafe {
         cmd.pre_exec(move || {
             for &ns_fd in &ns_fds {
@@ -1227,22 +1292,29 @@ fn handle_exec_into(
                 }
                 libc::close(ns_fd);
             }
+            if libc::fchdir(root_fd) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::chroot(b".\0".as_ptr() as *const libc::c_char) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::chdir(b"/\0".as_ptr() as *const libc::c_char);
+            libc::close(root_fd);
             Ok(())
         });
     }
 
-    // Spawn and run; parent closes its copies of ns_fds after spawn returns.
+    // Spawn and run; parent closes its copies of fds after spawn returns.
     let result = if tty {
         handle_exec_tty(fd, cmd)
     } else {
         handle_exec_piped(fd, cmd)
     };
 
-    // Close parent copies of ns_fds (child already closed its copies in pre_exec,
-    // but the parent's copies are duplicates inherited at fork time).
     for &ns_fd in &ns_fds {
         unsafe { libc::close(ns_fd) };
     }
+    unsafe { libc::close(root_fd) };
 
     result
 }
@@ -1300,6 +1372,24 @@ fn open_ns_fds(pid: u32) -> std::io::Result<[libc::c_int; 5]> {
         fds[i] = fd;
     }
     Ok(fds)
+}
+
+/// Open an fd to the container's root directory via /proc/<pid>/root.
+///
+/// pelagos uses chroot (not pivot_root) for container rootfs isolation.  After
+/// setns(mnt) the mount namespace "/" is still the guest root, not the container's
+/// rootfs.  Callers should fchdir(root_fd) + chroot(".") + chdir("/") in pre_exec
+/// after all setns calls to enter the correct filesystem.  No O_CLOEXEC — must
+/// survive into pre_exec.  Caller must close the returned fd.
+fn open_root_fd(pid: u32) -> std::io::Result<libc::c_int> {
+    let path = format!("/proc/{}/root", pid);
+    let cpath = std::ffi::CString::new(path.as_str())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(fd)
 }
 
 /// Non-TTY exec: spawn with piped stdin/stdout/stderr, forward via frames.

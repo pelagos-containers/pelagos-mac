@@ -6,7 +6,8 @@
 inside a container.** It silently runs the command in the guest's root filesystem
 instead.
 
-**Always use `setns(2)` directly via `pre_exec`, exactly as `handle_exec_into` does.**
+**Always use `setns(2)` directly via `pre_exec` plus `fchdir`+`chroot` into the
+container rootfs, exactly as `handle_exec_into` does.**
 
 This is not a workaround — it is the correct approach for privileged in-VM code.
 The guest daemon runs as root with `CAP_SYS_ADMIN` and should directly manipulate
@@ -45,7 +46,7 @@ the rootless constraint that makes this hard.
 
 ---
 
-## Why Direct `setns` Is the Right Approach for pelagos-guest
+## Why Direct `setns` + `chroot` Is the Right Approach for pelagos-guest
 
 The guest daemon runs as root (uid 0, `CAP_SYS_ADMIN` in the initial user namespace).
 It is the privileged component whose job is to bridge the macOS host and the
@@ -60,6 +61,11 @@ container runtime. Direct namespace manipulation is correct here:
   retains the originals for cleanup after spawn.
 - Namespace join order matters: `[net, uts, ipc, pid, mnt]`. Mount last so `/proc`
   remains readable until the PID join completes.
+- **pelagos uses `chroot` (not `pivot_root`) for rootfs isolation.** After `setns(mnt)`
+  the mount namespace "/" is still the guest root, not the container's rootfs.
+  `open_root_fd(pid)` opens `/proc/<pid>/root` in the parent (before fork), then
+  `pre_exec` calls `fchdir(root_fd)` + `chroot(".")` + `chdir("/")` after all `setns`
+  calls to land inside the container's actual filesystem.
 
 ---
 
@@ -69,23 +75,34 @@ container runtime. Direct namespace manipulation is correct here:
 // 1. Get the container's PID from `pelagos ps --all`
 let pid = get_container_pid(container)?;
 
-// 2. Open /proc/<pid>/ns/{net,uts,ipc,pid,mnt} fds in the parent
+// 2. Open namespace fds in the parent (before fork)
 let ns_fds = open_ns_fds(pid)?;
 
-// 3. Build the command and enter namespaces in the child (after fork, before exec)
+// 3. Open the container's root dir via /proc/<pid>/root (before fork)
+let root_fd = open_root_fd(pid)?;
+
+// 4. Build the command; enter namespaces and chroot in the child (after fork, before exec)
 unsafe {
     cmd.pre_exec(move || {
         for &ns_fd in &ns_fds {
-            call_setns(ns_fd);      // setns(2) — async-signal-safe
+            if call_setns(ns_fd) < 0 { return Err(std::io::Error::last_os_error()); }
             libc::close(ns_fd);
         }
+        // Enter the container's rootfs (pelagos uses chroot, not pivot_root).
+        if libc::fchdir(root_fd) < 0 { return Err(std::io::Error::last_os_error()); }
+        if libc::chroot(b".\0".as_ptr() as *const libc::c_char) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        libc::chdir(b"/\0".as_ptr() as *const libc::c_char);
+        libc::close(root_fd);
         Ok(())
     });
 }
 
-// 4. Spawn (or .output()); close parent copies of ns_fds unconditionally
+// 5. Spawn (or .output()); close parent copies unconditionally
 let result = cmd.spawn()...;
 for &ns_fd in &ns_fds { unsafe { libc::close(ns_fd) }; }
+unsafe { libc::close(root_fd) };
 ```
 
 See `handle_exec_into`, `handle_cp_from`, `handle_cp_to` in `pelagos-guest/src/main.rs`
