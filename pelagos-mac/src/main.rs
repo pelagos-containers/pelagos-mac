@@ -80,6 +80,9 @@ enum Commands {
         /// Set an environment variable KEY=VALUE inside the container (repeatable)
         #[arg(short = 'e', long = "env")]
         env: Vec<String>,
+        /// Label KEY=VALUE (repeatable; forwarded to pelagos run --label)
+        #[arg(short = 'l', long = "label")]
+        labels: Vec<String>,
     },
     /// Run a command interactively in a container (stdin forwarded, optional TTY)
     Exec {
@@ -119,6 +122,16 @@ enum Commands {
         /// Follow log output
         #[arg(short = 'f', long)]
         follow: bool,
+    },
+    /// Print low-level JSON information about a container (delegates to `pelagos container inspect`)
+    Inspect {
+        /// Container name
+        name: String,
+    },
+    /// Restart a stopped container with its original parameters
+    Start {
+        /// Container name
+        name: String,
     },
     /// Stop a running container
     Stop {
@@ -245,6 +258,8 @@ enum GuestCommand {
         detach: bool,
         #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
         env: std::collections::HashMap<String, String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        labels: Vec<String>,
     },
     Exec {
         image: String,
@@ -273,6 +288,12 @@ enum GuestCommand {
         name: String,
         #[serde(skip_serializing_if = "is_false")]
         follow: bool,
+    },
+    ContainerInspect {
+        name: String,
+    },
+    Start {
+        name: String,
     },
     Stop {
         name: String,
@@ -490,10 +511,12 @@ fn main() {
             ref name,
             detach,
             ref env,
+            ref labels,
         } => {
             let image = image.clone();
             let args = args.clone();
             let name = name.clone();
+            let labels = labels.clone();
             let env_map: std::collections::HashMap<String, String> = env
                 .iter()
                 .filter_map(|kv| {
@@ -557,6 +580,7 @@ fn main() {
                     name,
                     detach,
                     env: env_map,
+                    labels,
                 },
             ));
         }
@@ -664,6 +688,31 @@ fn main() {
                 stream,
                 GuestCommand::Logs { name, follow },
             ));
+        }
+
+        Commands::Inspect { ref name } => {
+            let name = name.clone();
+            let daemon_args = daemon_args_from_cli(&cli);
+            if let Err(e) = daemon::ensure_running(&daemon_args) {
+                log::error!("failed to start VM daemon: {}", e);
+                process::exit(1);
+            }
+            let stream = connect_or_exit();
+            process::exit(passthrough_command(
+                stream,
+                GuestCommand::ContainerInspect { name },
+            ));
+        }
+
+        Commands::Start { ref name } => {
+            let name = name.clone();
+            let daemon_args = daemon_args_from_cli(&cli);
+            if let Err(e) = daemon::ensure_running(&daemon_args) {
+                log::error!("failed to start VM daemon: {}", e);
+                process::exit(1);
+            }
+            let stream = connect_or_exit();
+            process::exit(passthrough_command(stream, GuestCommand::Start { name }));
         }
 
         Commands::Stop { ref name } => {

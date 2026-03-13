@@ -95,6 +95,9 @@ pub enum GuestCommand {
         /// Run detached; maps to `pelagos run --detach`.
         #[serde(default)]
         detach: bool,
+        /// Labels KEY=VALUE forwarded to `pelagos run --label`.
+        #[serde(default)]
+        labels: Vec<String>,
     },
     Exec {
         image: String,
@@ -124,6 +127,14 @@ pub enum GuestCommand {
         name: String,
         #[serde(default)]
         follow: bool,
+    },
+    /// Inspect a container; maps to `pelagos container inspect <name>`.
+    ContainerInspect {
+        name: String,
+    },
+    /// Restart a stopped container; maps to `pelagos start <name>`.
+    Start {
+        name: String,
     },
     /// Stop a running container; maps to `pelagos stop <name>`.
     Stop {
@@ -301,6 +312,7 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 mounts,
                 name,
                 detach,
+                labels,
             } => {
                 run_container(
                     &mut writer,
@@ -310,6 +322,7 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                     &mounts,
                     name.as_deref(),
                     detach,
+                    &labels,
                 )?;
             }
             GuestCommand::Exec {
@@ -344,6 +357,16 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 if follow {
                     cmd.arg("--follow");
                 }
+                spawn_and_stream(&mut writer, cmd)?;
+            }
+            GuestCommand::ContainerInspect { name } => {
+                let mut cmd = Command::new(pelagos_bin());
+                cmd.arg("container").arg("inspect").arg(&name);
+                spawn_and_stream(&mut writer, cmd)?;
+            }
+            GuestCommand::Start { name } => {
+                let mut cmd = Command::new(pelagos_bin());
+                cmd.arg("start").arg(&name);
                 spawn_and_stream(&mut writer, cmd)?;
             }
             GuestCommand::Stop { name } => {
@@ -501,6 +524,7 @@ fn run_container(
     mounts: &[GuestMount],
     name: Option<&str>,
     detach: bool,
+    labels: &[String],
 ) -> std::io::Result<()> {
     let pelagos = pelagos_bin();
 
@@ -543,6 +567,9 @@ fn run_container(
         };
         cmd.arg("-v")
             .arg(format!("{}:{}", guest_src, mount.container_path));
+    }
+    for label in labels {
+        cmd.arg("--label").arg(label);
     }
     cmd.arg(image);
     if !args.is_empty() {
