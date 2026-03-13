@@ -110,6 +110,19 @@ enum DockerCmd {
         name_and_args: Vec<String>,
     },
 
+    /// Start one or more stopped containers.
+    Start {
+        /// One or more container names (Docker accepts multiple).
+        #[arg(value_name = "NAME")]
+        names: Vec<String>,
+        /// Attach STDOUT/STDERR (ignored; pelagos always runs detached).
+        #[arg(short = 'a', long)]
+        attach: bool,
+        /// Attach stdout/stderr before start (ignored).
+        #[arg(short = 'i', long)]
+        interactive: bool,
+    },
+
     /// Stop a running container.
     Stop { name: String },
 
@@ -261,6 +274,11 @@ fn main() {
             &env,
             &name_and_args,
         ),
+        DockerCmd::Start {
+            names,
+            attach: _,
+            interactive: _,
+        } => cmd_start(&cfg, &names),
         DockerCmd::Stop { name } => cmd_stop(&cfg, &name),
         DockerCmd::Rm { force, name } => cmd_rm(&cfg, force, &name),
         DockerCmd::Ps {
@@ -644,6 +662,25 @@ fn cmd_events() -> i32 {
             }
         }
     }
+}
+
+fn cmd_start(cfg: &Config, names: &[String]) -> i32 {
+    let mut exit = 0i32;
+    for name in names {
+        match run_pelagos_inherited(cfg, &args(&["start", name])) {
+            Ok(s) => {
+                let code = s.code().unwrap_or(1);
+                if code != 0 {
+                    exit = code;
+                }
+            }
+            Err(e) => {
+                eprintln!("pelagos-docker start: {}", e);
+                exit = 1;
+            }
+        }
+    }
+    exit
 }
 
 fn cmd_stop(cfg: &Config, name: &str) -> i32 {
