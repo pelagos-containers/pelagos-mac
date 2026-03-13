@@ -362,7 +362,7 @@ sleep 1
 # Test 7f: Ubuntu 24.04 container with apt-get (glibc + DNS)
 #
 # Verifies that glibc containers work and that DNS is functional inside them
-# (pelagos-guest bind-mounts /etc/resolv.conf from the VM).
+# (pelagos auto-injects host DNS via per-container resolv.conf since v0.25.0).
 # ---------------------------------------------------------------------------
 
 echo ""

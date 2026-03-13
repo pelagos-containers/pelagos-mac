@@ -52,51 +52,33 @@ All sub-issues resolved:
 | docker build, volume, network | #68 | ✅ PR #70 |
 | docker cp | #69 | ✅ PR #71 |
 
-**DNS workaround note:** pelagos-guest bind-mounts `/etc/resolv.conf` into every
-container as a workaround for the runtime not doing it automatically. The proper
-fix is tracked upstream: https://github.com/skeptomai/pelagos/issues/87
+---
 
 ---
 
 ## Remaining Work
 
-### pelagos runtime — DNS (pelagos/issues#87) — Next up
+### VS Code devcontainer — ready to re-test
 
-**Context:** pelagos does not automatically bind-mount `/etc/resolv.conf` into
-containers. The `auto_dns` block in `src/container.rs` (~line 2781) only runs for
-bridge and pasta network modes; `--network none` (the VM default) gets nothing.
+pelagos v0.27.1 (epic #96) replaced `chroot` with `pivot_root` as the default
+root isolation mechanism. After `setns(mnt_fd)`, the mount namespace root is now
+the container's rootfs directly (old root detached via `MNT_DETACH`). The guest
+daemon's `handle_exec_into` (setns-only, no extra chroot step) now correctly lands
+inside the container filesystem.
 
-**Code location:** `pelagos/src/container.rs`
-- `auto_dns` population: ~line 2781
-- DNS temp-file write + bind-mount: ~lines 2823–2843, 3416–3434
-- `host_upstream_dns()` helper: ~line 386
+The blocker that closed PR #85 is gone. The `fix/exec-into-chroot` branch and
+its workaround are superseded — the current unmodified master code is correct.
 
-**Fix strategy:** After the existing `auto_dns` block, add a fallback: when
-`auto_dns` is empty and a mount namespace + chroot are available, bind-mount
-`/etc/resolv.conf` directly from the host (no temp file needed — it's already the
-right format). A `host_resolv_bind: Option<CString>` field parallel to
-`dns_temp_file_cstring` is the cleanest approach.
-
-**Cleanup after fix:** Remove the explicit `--mount type=bind,source=/etc/resolv.conf`
-from `run_container()` in `pelagos-guest/src/main.rs` and close pelagos-mac issue #60.
+**Next step:** Run VS Code "Reopen in Container" against `devcontainer-test` and
+trace any remaining failures in the exec/lifecycle flow.
 
 ### pelagos-mac — Lower priority
 
 - **`docker volume inspect`** — `create/ls/rm` works; `inspect` not implemented.
   Bind mounts cover most real use cases so this is low priority.
-- **VS Code extension end-to-end test** — BLOCKED on pelagos runtime fix.
-  The shim layer (docker version/ps/run/inspect/label filtering) all work.
-  `docker exec` into a running container lands in the wrong filesystem because
-  pelagos uses `chroot` instead of `pivot_root` for container rootfs isolation.
-  After `setns(mnt_fd)`, `/` is still the guest Alpine root — the container's
-  actual rootfs is only reachable via the `chroot` pelagos called at startup.
-  A workaround (`fchdir(/proc/<pid>/root)` + `chroot(".")` after `setns`) exists
-  in branch `fix/exec-into-chroot` (PR #85, closed), but the correct fix is
-  upstream. **Resume after pelagos#96 lands** (switch `with_chroot` → `with_pivot_root`
-  in `src/cli/run.rs`). Once pelagos uses `pivot_root`, `setns(mnt)` gives the
-  correct container rootfs directly and PR #85 can be reopened/superseded.
 - **Signed installer** — `.pkg` for distribution. Requires Developer ID + notarization
   + `com.apple.security.virtualization` entitlement. Not yet scoped.
+
 
 ---
 
