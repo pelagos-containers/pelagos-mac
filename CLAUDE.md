@@ -100,10 +100,30 @@ cargo build --target aarch64-unknown-linux-gnu --release -p pelagos-guest
 **Building the host (on macOS):**
 ```bash
 cargo build --release -p pelagos-mac
+bash scripts/sign.sh          # MANDATORY — re-sign after every host build
 ```
+
+`cargo build` replaces the binary with a freshly linker-signed binary that lacks
+`com.apple.security.virtualization`. Without re-signing, the VM daemon is silently
+killed by macOS the moment it tries to use Virtualization.framework. The log will
+show nothing; `vm status` will say "stopped". Always run `sign.sh` after building.
 
 **Note:** `cargo build` at the workspace root will fail on Linux (pelagos-vz is
 macOS-only). This is intentional and expected.
+
+---
+
+## Testing with VS Code Dev Containers
+
+To point VS Code at `pelagos-docker` instead of the system Docker, add this to
+your VS Code **settings.json** (not devcontainer.json):
+
+```json
+"dev.containers.dockerPath": "/Users/cb/Projects/pelagos-mac/target/aarch64-apple-darwin/release/pelagos-docker"
+```
+
+This is a per-user VS Code setting, not a per-project setting. It persists across
+workspaces and does not belong in the repo.
 
 ---
 

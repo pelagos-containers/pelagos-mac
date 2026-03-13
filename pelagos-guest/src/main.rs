@@ -70,6 +70,11 @@ fn recv_frame(r: &mut impl Read) -> std::io::Result<(u8, Vec<u8>)> {
 pub struct GuestMount {
     /// virtiofs tag — the directory is already mounted at `/mnt/<tag>` in the guest.
     pub tag: String,
+    /// Relative subpath within the virtiofs mount (empty = root of the share).
+    /// When the daemon uses a broad share (e.g. $HOME as share0), the subpath
+    /// identifies the specific directory to bind-mount into the container.
+    #[serde(default)]
+    pub subpath: String,
     /// Absolute path inside the container.
     pub container_path: String,
 }
@@ -90,6 +95,9 @@ pub enum GuestCommand {
         /// Run detached; maps to `pelagos run --detach`.
         #[serde(default)]
         detach: bool,
+        /// Labels KEY=VALUE forwarded to `pelagos run --label`.
+        #[serde(default)]
+        labels: Vec<String>,
     },
     Exec {
         image: String,
@@ -119,6 +127,14 @@ pub enum GuestCommand {
         name: String,
         #[serde(default)]
         follow: bool,
+    },
+    /// Inspect a container; maps to `pelagos container inspect <name>`.
+    ContainerInspect {
+        name: String,
+    },
+    /// Restart a stopped container; maps to `pelagos start <name>`.
+    Start {
+        name: String,
     },
     /// Stop a running container; maps to `pelagos stop <name>`.
     Stop {
@@ -296,6 +312,7 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 mounts,
                 name,
                 detach,
+                labels,
             } => {
                 run_container(
                     &mut writer,
@@ -305,6 +322,7 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                     &mounts,
                     name.as_deref(),
                     detach,
+                    &labels,
                 )?;
             }
             GuestCommand::Exec {
@@ -339,6 +357,16 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 if follow {
                     cmd.arg("--follow");
                 }
+                spawn_and_stream(&mut writer, cmd)?;
+            }
+            GuestCommand::ContainerInspect { name } => {
+                let mut cmd = Command::new(pelagos_bin());
+                cmd.arg("container").arg("inspect").arg(&name);
+                spawn_and_stream(&mut writer, cmd)?;
+            }
+            GuestCommand::Start { name } => {
+                let mut cmd = Command::new(pelagos_bin());
+                cmd.arg("start").arg(&name);
                 spawn_and_stream(&mut writer, cmd)?;
             }
             GuestCommand::Stop { name } => {
@@ -496,6 +524,7 @@ fn run_container(
     mounts: &[GuestMount],
     name: Option<&str>,
     detach: bool,
+    labels: &[String],
 ) -> std::io::Result<()> {
     let pelagos = pelagos_bin();
 
@@ -524,10 +553,23 @@ fn run_container(
         cmd.arg("--detach");
     }
     // Pass each virtiofs guest-side path as a -v bind mount to pelagos run.
+    // If a subpath is specified, the bind source is a subdirectory of the share
+    // (used when $HOME is shared as share0 and individual project dirs are subpaths).
     for mount in mounts {
-        let guest_mnt = format!("/mnt/{}", mount.tag);
+        let guest_src = if mount.subpath.is_empty() {
+            format!("/mnt/{}", mount.tag)
+        } else {
+            format!(
+                "/mnt/{}/{}",
+                mount.tag,
+                mount.subpath.trim_start_matches('/')
+            )
+        };
         cmd.arg("-v")
-            .arg(format!("{}:{}", guest_mnt, mount.container_path));
+            .arg(format!("{}:{}", guest_src, mount.container_path));
+    }
+    for label in labels {
+        cmd.arg("--label").arg(label);
     }
     cmd.arg(image);
     if !args.is_empty() {
@@ -798,9 +840,10 @@ fn handle_build(
     }
 
     // Run pelagos build.
-    // Use --network none: the VM's minimal kernel has no bridge/veth modules or
-    // pasta binary, so the default "auto" mode (bridge) fails. Network access
-    // during RUN steps requires kernel bridge support; revisit when kernel is extended.
+    // Use --network pasta: pasta is a userspace TCP/UDP proxy that works without
+    // bridge/veth kernel modules. Falls back gracefully when RUN steps don't need
+    // network. The default "auto" mode would pick "bridge" (we run as root) which
+    // requires kernel bridge support we don't have in the virt kernel.
     let mut cmd = Command::new(pelagos_bin());
     cmd.arg("build")
         .arg("-t")
@@ -808,7 +851,7 @@ fn handle_build(
         .arg("-f")
         .arg(&dockerfile_path)
         .arg("--network")
-        .arg("none");
+        .arg("pasta");
     for arg in build_args {
         cmd.arg("--build-arg").arg(arg);
     }

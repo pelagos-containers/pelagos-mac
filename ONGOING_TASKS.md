@@ -1,6 +1,6 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-03-12, SHA 70cfd27 (post-PR #71)*
+*Last updated: 2026-03-13, SHA (chore/nat-diagnostics branch)*
 
 ---
 
@@ -84,8 +84,16 @@ from `run_container()` in `pelagos-guest/src/main.rs` and close pelagos-mac issu
 
 - **`docker volume inspect`** — `create/ls/rm` works; `inspect` not implemented.
   Bind mounts cover most real use cases so this is low priority.
-- **VS Code extension end-to-end test** — exercise the full Remote-Containers
-  extension flow (not just devcontainer CLI). Validation work, no code changes expected.
+- **VS Code extension end-to-end test** — BLOCKED on pelagos runtime fixes.
+  The devcontainer probe runs successfully (`docker run --sig-proxy=false ...`
+  → "Container started"), but VS Code immediately calls `docker exec` into the
+  container before `docker start` is called. pelagos destroys the container on
+  exit, so exec-into fails. Two upstream issues must be fixed first:
+  - **pelagos#90**: container exited-state persistence (don't destroy on exit)
+  - **pelagos#91**: exec into stopped container without a live PID
+  Client-side workarounds were attempted (sidecar state cache, keepalive
+  processes) but are not viable — the blocking/race conditions are fundamental.
+  Resume this after pelagos#90 and #91 land.
 - **Signed installer** — `.pkg` for distribution. Requires Developer ID + notarization
   + `com.apple.security.virtualization` entitlement. Not yet scoped.
 

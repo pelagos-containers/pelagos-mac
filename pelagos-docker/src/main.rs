@@ -440,6 +440,11 @@ fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
         sub.push("-e".into());
         sub.push(e.into());
     }
+    // Pass labels natively to pelagos run via --label KEY=VALUE (must be before image).
+    for kv in &label_args {
+        sub.push("--label".into());
+        sub.push(kv.into());
+    }
     if let Some(ep) = &entrypoint {
         // Prepend entrypoint to the command args.
         let mut new_args = vec![ep.clone()];
@@ -453,12 +458,6 @@ fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
         for a in &cmd_args {
             sub.push(a.into());
         }
-    }
-
-    // Pass labels natively to pelagos run via --label KEY=VALUE.
-    for kv in &label_args {
-        sub.push("--label".into());
-        sub.push(kv.into());
     }
 
     let exit_code = match run_pelagos_inherited(cfg, &sub) {
@@ -629,7 +628,8 @@ fn cmd_events() -> i32 {
                         .as_secs();
                     // Include native pelagos labels in Actor.Attributes so devcontainer CLI
                     // can verify the event belongs to the container it launched.
-                    let mut attrs: HashMap<String, String> = pelagos_container_labels(&cfg, &e.name);
+                    let mut attrs: HashMap<String, String> =
+                        pelagos_container_labels(&cfg, &e.name);
                     attrs.insert("image".into(), e.image.clone());
                     attrs.insert("name".into(), e.name.clone());
                     let event = serde_json::json!({
@@ -699,10 +699,10 @@ fn cmd_rm(cfg: &Config, force: bool, name: &str) -> i32 {
     }
 }
 
-/// Fetch native pelagos labels for a container by calling `pelagos container inspect`.
+/// Fetch native pelagos labels for a container via `pelagos inspect <name>`.
 /// Returns an empty map if the container is not found or inspect fails.
 fn pelagos_container_labels(cfg: &Config, name: &str) -> HashMap<String, String> {
-    let out = match run_pelagos(cfg, &args(&["container", "inspect", name])) {
+    let out = match run_pelagos(cfg, &args(&["inspect", name])) {
         Ok(o) if o.status.success() => o,
         _ => return HashMap::new(),
     };
