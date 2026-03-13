@@ -759,13 +759,6 @@ fn cmd_ps(cfg: &Config, all: bool, quiet: bool, filters: &[String], format: Opti
     if all {
         sub.push("--all".into());
     }
-    // Pass label= filters to pelagos natively; handle name= filters ourselves below.
-    for f in filters {
-        if f.starts_with("label=") {
-            sub.push("--filter".into());
-            sub.push(f.as_str().into());
-        }
-    }
     let out = match run_pelagos(cfg, &sub) {
         Ok(o) => o,
         Err(e) => {
@@ -777,12 +770,29 @@ fn cmd_ps(cfg: &Config, all: bool, quiet: bool, filters: &[String], format: Opti
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut entries = parse_pelagos_ps(&stdout);
 
-    // Apply remaining filters that pelagos doesn't handle (name=).
+    // Apply client-side filters (pelagos ps has no --filter support).
+    let label_filters: Vec<(&str, &str)> = filters
+        .iter()
+        .filter_map(|f| {
+            let kv = f.strip_prefix("label=")?;
+            let eq = kv.find('=')?;
+            Some((&kv[..eq], &kv[eq + 1..]))
+        })
+        .collect();
+
+    if !label_filters.is_empty() {
+        entries.retain(|e| {
+            let labels = pelagos_container_labels(cfg, &e.name);
+            label_filters
+                .iter()
+                .all(|(k, v)| labels.get(*k).map(|lv| lv == v).unwrap_or(false))
+        });
+    }
+
     for f in filters {
         if let Some(val) = f.strip_prefix("name=") {
             entries.retain(|e| e.name.contains(val));
         }
-        // label= already forwarded to pelagos; other types silently ignored.
     }
 
     // -q: output only container IDs (we use names as IDs).
