@@ -41,7 +41,7 @@ DISK_IMG="$OUT/root.img"
 INITRAMFS_OUT="$OUT/initramfs-custom.gz"
 KERNEL_OUT="$OUT/vmlinuz"
 
-PELAGOS_VERSION="0.26.0"
+PELAGOS_VERSION="0.28.0"
 PELAGOS_BIN="$WORK/pelagos-aarch64-linux"
 PELAGOS_URL="https://github.com/skeptomai/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-aarch64-linux"
 
@@ -432,34 +432,77 @@ UDHCPC
 
     # Replace /init: mounts vfs, loads vsock modules, execs pelagos-guest.
     # Without root= in cmdline the kernel uses the initramfs as root and runs /init.
+    #
+    # This init runs in two passes:
+    #   Pass 1  root = rootfs (initramfs)  →  load modules, copy tree to tmpfs, switch_root
+    #   Pass 2  root = tmpfs               →  mount vfs, network, run pelagos-guest
+    #
+    # pivot_root(2) returns EINVAL when the calling process root is the "rootfs"
+    # pseudo-filesystem (documented in pivot_root(2) §ERRORS). pelagos v0.27+
+    # uses pivot_root for container root isolation, so all container spawns failed
+    # with EINVAL. Escaping to a tmpfs via switch_root fixes this permanently.
     cat > "$INITRD_TMP/init" <<INIT_EOF
 #!/bin/sh
 
-# Mount kernel virtual filesystems — required by container namespaces and cgroups.
+# Mount /proc first — needed for the rootfs detection check below.
+busybox mount -t proc proc /proc 2>/dev/null || true
+
+# Pass 1: if we are still on the initramfs rootfs, load kernel modules and
+# switch_root to a tmpfs so that pivot_root(2) works for container spawns.
+if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
+    echo "[pelagos-init] pass 1: escaping initramfs rootfs via switch_root"
+
+    # Load all kernel modules now; they remain in kernel memory across
+    # switch_root and do not need to be loaded again in pass 2.
+
+    # virtio-rng: seed the CSPRNG early so TLS works after switch_root.
+    busybox insmod /lib/modules/$KVER/kernel/drivers/char/hw_random/rng-core.ko 2>/dev/null || true
+    busybox insmod /lib/modules/$KVER/kernel/drivers/char/hw_random/virtio-rng.ko 2>/dev/null || true
+
+    # vsock: host↔guest communication channel.
+    busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vsock.ko 2>/dev/null || true
+    busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko 2>/dev/null || true
+    busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko 2>/dev/null || true
+
+    # overlay: required by pelagos for container rootfs overlay mounts.
+    busybox insmod /lib/modules/$KVER/kernel/fs/overlayfs/overlay.ko 2>/dev/null || true
+
+    # virtio-net: not built into the Alpine virt kernel.
+    busybox insmod /lib/modules/$KVER/kernel/net/core/failover.ko 2>/dev/null || true
+    busybox insmod /lib/modules/$KVER/kernel/drivers/net/net_failover.ko 2>/dev/null || true
+    busybox insmod /lib/modules/$KVER/kernel/drivers/net/virtio_net.ko 2>/dev/null || true
+
+    # Build tmpfs root and copy the initramfs tree into it.
+    # The initramfs is already in RAM; copying to tmpfs consumes no additional
+    # memory because the kernel frees the initramfs after switch_root.
+    busybox mkdir -p /newroot
+    busybox mount -t tmpfs -o size=512m tmpfs /newroot
+    for d in bin sbin usr lib etc root mnt var; do
+        [ -d "/\$d" ] && busybox cp -a "/\$d" /newroot/ 2>/dev/null || true
+    done
+    busybox cp /init /newroot/init
+    busybox mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/dev/pts \
+                     /newroot/tmp /newroot/run /newroot/run/pelagos \
+                     /newroot/sys/fs/cgroup /newroot/newroot
+
+    # Pivot into the tmpfs. The kernel frees the initramfs memory after this.
+    # /init re-execs from the new root and falls through to pass 2 below.
+    exec busybox switch_root /newroot /init
+
+    # Not reached unless switch_root fails.
+    echo "[pelagos-init] FATAL: switch_root failed" >/dev/console 2>&1
+    exec busybox sh
+fi
+
+# Pass 2: root is tmpfs. Kernel modules are already loaded (done in pass 1).
+# Mount the remaining virtual filesystems.
 busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 busybox mkdir -p /dev/pts
 busybox mount -t devpts   devpts   /dev/pts 2>/dev/null || true
-busybox mount -t proc     proc     /proc 2>/dev/null || true
+# /proc is already mounted (from the check above); re-mount is a no-op.
 busybox mount -t sysfs    sysfs    /sys 2>/dev/null || true
 busybox mkdir -p /sys/fs/cgroup
 busybox mount -t cgroup2  cgroup2  /sys/fs/cgroup 2>/dev/null || true
-
-# Load virtio-rng early so the kernel CSPRNG is seeded before TLS is attempted.
-busybox insmod /lib/modules/$KVER/kernel/drivers/char/hw_random/rng-core.ko 2>/dev/null || true
-busybox insmod /lib/modules/$KVER/kernel/drivers/char/hw_random/virtio-rng.ko 2>/dev/null || true
-
-# Load vsock kernel modules.
-busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vsock.ko 2>/dev/null || true
-busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko 2>/dev/null || true
-busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko 2>/dev/null || true
-
-# Load overlay filesystem module (required by pelagos for container rootfs).
-busybox insmod /lib/modules/$KVER/kernel/fs/overlayfs/overlay.ko 2>/dev/null || true
-
-# Load virtio-net modules (not built into the Alpine virt kernel).
-busybox insmod /lib/modules/$KVER/kernel/net/core/failover.ko 2>/dev/null || true
-busybox insmod /lib/modules/$KVER/kernel/drivers/net/net_failover.ko 2>/dev/null || true
-busybox insmod /lib/modules/$KVER/kernel/drivers/net/virtio_net.ko 2>/dev/null || true
 
 # Configure networking via DHCP (socket_vmnet provides a DHCP server through
 # vmnet.framework shared mode).
