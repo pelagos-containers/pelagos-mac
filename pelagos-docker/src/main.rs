@@ -184,9 +184,20 @@ enum DockerCmd {
         /// Do not use the cache.
         #[arg(long)]
         no_cache: bool,
+        /// Set the target build stage in a multi-stage Dockerfile.
+        #[arg(long)]
+        target: Option<String>,
         /// Build context path (default: .).
         #[arg(default_value = ".")]
         context: String,
+    },
+
+    /// BuildKit stub — not supported; exits 1 so callers fall back to plain build.
+    #[command(name = "buildx")]
+    Buildx {
+        /// Subcommand and args (ignored).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        _args: Vec<String>,
     },
 
     /// Manage named volumes.
@@ -195,6 +206,9 @@ enum DockerCmd {
         sub: String,
         /// Volume name.
         name: Option<String>,
+        /// Only display volume names.
+        #[arg(short = 'q', long = "quiet")]
+        quiet: bool,
     },
 
     /// Manage named networks.
@@ -203,6 +217,9 @@ enum DockerCmd {
         sub: String,
         /// Network name.
         name: Option<String>,
+        /// Only display network IDs.
+        #[arg(short = 'q', long = "quiet")]
+        quiet: bool,
     },
 
     /// Copy files between the host and a running container.
@@ -299,10 +316,20 @@ fn main() {
             file,
             build_args,
             no_cache,
+            target,
             context,
-        } => cmd_build(&cfg, &tag, &file, &build_args, no_cache, &context),
-        DockerCmd::Volume { sub, name } => cmd_volume(&cfg, &sub, name.as_deref()),
-        DockerCmd::Network { sub, name } => cmd_network(&cfg, &sub, name.as_deref()),
+        } => cmd_build(
+            &cfg,
+            &tag,
+            &file,
+            &build_args,
+            no_cache,
+            target.as_deref(),
+            &context,
+        ),
+        DockerCmd::Buildx { .. } => 1,
+        DockerCmd::Volume { sub, name, quiet } => cmd_volume(&cfg, &sub, name.as_deref(), quiet),
+        DockerCmd::Network { sub, name, quiet } => cmd_network(&cfg, &sub, name.as_deref(), quiet),
         DockerCmd::Cp { src, dst } => cmd_cp(&cfg, &src, &dst),
     };
 
@@ -969,6 +996,7 @@ fn cmd_build(
     file: &str,
     build_args: &[String],
     no_cache: bool,
+    target: Option<&str>,
     context: &str,
 ) -> i32 {
     let mut sub: Vec<OsString> = args(&["build", "-t", tag, "-f", file]);
@@ -979,6 +1007,11 @@ fn cmd_build(
     if no_cache {
         sub.push("--no-cache".into());
     }
+    // --target is accepted but not forwarded: pelagos build does not yet support
+    // multi-stage target selection. The devcontainer CLI always makes
+    // dev_containers_target_stage the final stage, so omitting --target produces
+    // the same image. Re-wire once pelagos build gains --target support.
+    let _ = target;
     sub.push(context.into());
     match run_pelagos_inherited(cfg, &sub) {
         Ok(s) => s.code().unwrap_or(1),
@@ -989,10 +1022,28 @@ fn cmd_build(
     }
 }
 
-fn cmd_volume(cfg: &Config, sub: &str, name: Option<&str>) -> i32 {
+fn cmd_volume(cfg: &Config, sub: &str, name: Option<&str>, quiet: bool) -> i32 {
     let mut a: Vec<OsString> = args(&["volume", sub]);
     if let Some(n) = name {
         a.push(n.into());
+    }
+    if sub == "ls" && quiet {
+        // Capture output and print only the name column (skip header).
+        let out = match run_pelagos(cfg, &a) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("pelagos-docker volume ls: {}", e);
+                return 1;
+            }
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines().skip(1) {
+            let name_col = line.split_whitespace().last().unwrap_or("").to_string();
+            if !name_col.is_empty() {
+                println!("{}", name_col);
+            }
+        }
+        return if out.status.success() { 0 } else { 1 };
     }
     match run_pelagos_inherited(cfg, &a) {
         Ok(s) => s.code().unwrap_or(1),
@@ -1016,7 +1067,7 @@ fn cmd_cp(cfg: &Config, src: &str, dst: &str) -> i32 {
     }
 }
 
-fn cmd_network(cfg: &Config, sub: &str, name: Option<&str>) -> i32 {
+fn cmd_network(cfg: &Config, sub: &str, name: Option<&str>, _quiet: bool) -> i32 {
     let mut a: Vec<OsString> = args(&["network", sub]);
     // `docker network create <name>` auto-assigns a subnet; pelagos requires one explicitly.
     // Pick 10.88.<hash>.0/24 derived from the name so repeated calls are idempotent.
