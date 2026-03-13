@@ -746,7 +746,24 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
         process::exit(1);
     });
 
-    let virtiofs_shares = parse_volumes(&cli.volumes);
+    // Always-on volumes share: ~/.local/share/pelagos/volumes → /var/lib/pelagos/volumes in VM.
+    // This makes named pelagos volumes (images, bind data) persistent across VM restarts.
+    let volumes_host = pelagos_volumes_host_path();
+    if let Err(e) = std::fs::create_dir_all(&volumes_host) {
+        log::warn!(
+            "could not create volumes directory {}: {}",
+            volumes_host.display(),
+            e
+        );
+    }
+    let mut virtiofs_shares = vec![daemon::VirtiofsShare {
+        host_path: volumes_host,
+        tag: "pelagos-volumes".to_string(),
+        read_only: false,
+        container_path: "/var/lib/pelagos/volumes".to_string(),
+    }];
+    virtiofs_shares.extend(parse_volumes(&cli.volumes));
+
     let port_forwards = parse_ports(&cli.ports);
 
     daemon::DaemonArgs {
@@ -759,6 +776,17 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
         virtiofs_shares,
         port_forwards,
     }
+}
+
+/// Returns `~/.local/share/pelagos/volumes`, the host-side backing directory for
+/// the always-on `pelagos-volumes` virtiofs share.
+fn pelagos_volumes_host_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home)
+        .join(".local")
+        .join("share")
+        .join("pelagos")
+        .join("volumes")
 }
 
 /// Parse `-p host_port:container_port` strings into `PortForward`s.

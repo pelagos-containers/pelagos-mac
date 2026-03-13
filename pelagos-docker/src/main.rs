@@ -8,7 +8,6 @@
 mod config;
 mod docker_types;
 mod invoke;
-mod labels;
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -456,18 +455,10 @@ fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
         }
     }
 
-    // Store labels in sidecar under the effective container name.
-    if !label_args.is_empty() {
-        let container_name = effective_name.clone();
-        let mut label_map = HashMap::new();
-        for kv in &label_args {
-            if let Some((k, v)) = kv.split_once('=') {
-                label_map.insert(k.to_string(), v.to_string());
-            } else {
-                label_map.insert(kv.clone(), String::new());
-            }
-        }
-        let _ = labels::set(&container_name, label_map);
+    // Pass labels natively to pelagos run via --label KEY=VALUE.
+    for kv in &label_args {
+        sub.push("--label".into());
+        sub.push(kv.into());
     }
 
     let exit_code = match run_pelagos_inherited(cfg, &sub) {
@@ -636,9 +627,9 @@ fn cmd_events() -> i32 {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
-                    // Include sidecar labels in Actor.Attributes so devcontainer CLI
+                    // Include native pelagos labels in Actor.Attributes so devcontainer CLI
                     // can verify the event belongs to the container it launched.
-                    let mut attrs: HashMap<String, String> = labels::get(&e.name);
+                    let mut attrs: HashMap<String, String> = pelagos_container_labels(&cfg, &e.name);
                     attrs.insert("image".into(), e.image.clone());
                     attrs.insert("name".into(), e.name.clone());
                     let event = serde_json::json!({
@@ -699,7 +690,6 @@ fn cmd_rm(cfg: &Config, force: bool, name: &str) -> i32 {
     } else {
         args(&["rm", name])
     };
-    labels::remove(name);
     match run_pelagos_inherited(cfg, &sub) {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => {
@@ -709,10 +699,36 @@ fn cmd_rm(cfg: &Config, force: bool, name: &str) -> i32 {
     }
 }
 
+/// Fetch native pelagos labels for a container by calling `pelagos container inspect`.
+/// Returns an empty map if the container is not found or inspect fails.
+fn pelagos_container_labels(cfg: &Config, name: &str) -> HashMap<String, String> {
+    let out = match run_pelagos(cfg, &args(&["container", "inspect", name])) {
+        Ok(o) if o.status.success() => o,
+        _ => return HashMap::new(),
+    };
+    serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .ok()
+        .and_then(|v| {
+            v.get("labels")?.as_object().map(|obj| {
+                obj.iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
 fn cmd_ps(cfg: &Config, all: bool, quiet: bool, filters: &[String], format: Option<&str>) -> i32 {
     let mut sub = args(&["ps"]);
     if all {
         sub.push("--all".into());
+    }
+    // Pass label= filters to pelagos natively; handle name= filters ourselves below.
+    for f in filters {
+        if f.starts_with("label=") {
+            sub.push("--filter".into());
+            sub.push(f.as_str().into());
+        }
     }
     let out = match run_pelagos(cfg, &sub) {
         Ok(o) => o,
@@ -725,25 +741,12 @@ fn cmd_ps(cfg: &Config, all: bool, quiet: bool, filters: &[String], format: Opti
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut entries = parse_pelagos_ps(&stdout);
 
-    // Apply --filter filters.
+    // Apply remaining filters that pelagos doesn't handle (name=).
     for f in filters {
         if let Some(val) = f.strip_prefix("name=") {
             entries.retain(|e| e.name.contains(val));
-        } else if let Some(kv) = f.strip_prefix("label=") {
-            // Filter by sidecar label. Format: label=key=value or label=key.
-            entries.retain(|e| {
-                let container_labels = labels::get(&e.name);
-                if let Some((label_key, label_val)) = kv.split_once('=') {
-                    container_labels
-                        .get(label_key)
-                        .map(|v| v == label_val)
-                        .unwrap_or(false)
-                } else {
-                    container_labels.contains_key(kv)
-                }
-            });
         }
-        // Other filter types (status=, etc.) silently ignored for now.
+        // label= already forwarded to pelagos; other types silently ignored.
     }
 
     // -q: output only container IDs (we use names as IDs).
@@ -849,7 +852,7 @@ fn cmd_inspect_container(cfg: &Config, names: &[String]) -> i32 {
 
     for name in names {
         if let Some(entry) = entries.iter().find(|e| &e.name == name) {
-            let container_labels = labels::get(name);
+            let container_labels = pelagos_container_labels(cfg, name);
             let ports = build_ports_map(name, &port_map);
             results.push(ContainerInspect {
                 id: entry.name.clone(),
