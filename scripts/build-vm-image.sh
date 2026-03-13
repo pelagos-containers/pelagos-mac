@@ -456,9 +456,12 @@ while [ \$i -lt 15 ]; do
 done
 
 # Mount virtiofs shares requested by the host.
-# The host appends "virtiofs.tags=share0,share1,..." to the kernel cmdline
-# when -v flags are used.  Parse and mount each tag at /mnt/<tag>.
+# The host appends "virtiofs.tags=tag0,tag1,..." to the kernel cmdline.
+# User shares (share0, share1, ...) are mounted at /mnt/<tag>.
+# The built-in "pelagos-volumes" share is mounted at /var/lib/pelagos/volumes
+# AFTER the ext2 disk is mounted below — track it with a flag.
 CMDLINE=\$(busybox cat /proc/cmdline)
+PELAGOS_VOLUMES_PRESENT=0
 for kv in \$CMDLINE; do
     case "\$kv" in
         virtiofs.tags=*)
@@ -467,10 +470,14 @@ for kv in \$CMDLINE; do
             IFS=","
             for TAG in \$TAGS; do
                 IFS="\$OLD_IFS"
-                busybox mkdir -p "/mnt/\$TAG"
-                busybox mount -t virtiofs "\$TAG" "/mnt/\$TAG" && \
-                    echo "[pelagos-init] mounted virtiofs tag \$TAG at /mnt/\$TAG" || \
-                    echo "[pelagos-init] WARNING: failed to mount virtiofs tag \$TAG" >&2
+                if [ "\$TAG" = "pelagos-volumes" ]; then
+                    PELAGOS_VOLUMES_PRESENT=1
+                else
+                    busybox mkdir -p "/mnt/\$TAG"
+                    busybox mount -t virtiofs "\$TAG" "/mnt/\$TAG" && \
+                        echo "[pelagos-init] mounted virtiofs tag \$TAG at /mnt/\$TAG" || \
+                        echo "[pelagos-init] WARNING: failed to mount virtiofs tag \$TAG" >&2
+                fi
                 IFS=","
             done
             IFS="\$OLD_IFS"
@@ -488,6 +495,16 @@ else
     echo "[pelagos-init] formatting /dev/vda as ext2 for image cache..."
     mke2fs -F /dev/vda 2>/dev/null && \
         busybox mount -t ext2 /dev/vda /var/lib/pelagos 2>/dev/null || true
+fi
+
+# Mount the always-on pelagos-volumes virtiofs share at /var/lib/pelagos/volumes.
+# This makes named volumes (e.g. for VS Code server, persistent data) survive VM restarts
+# by backing them on the macOS host at ~/.local/share/pelagos/volumes/.
+if [ "\$PELAGOS_VOLUMES_PRESENT" = "1" ]; then
+    busybox mkdir -p /var/lib/pelagos/volumes
+    busybox mount -t virtiofs pelagos-volumes /var/lib/pelagos/volumes && \
+        echo "[pelagos-init] mounted pelagos-volumes virtiofs at /var/lib/pelagos/volumes" || \
+        echo "[pelagos-init] WARNING: failed to mount pelagos-volumes virtiofs" >&2
 fi
 
 export PELAGOS_IMAGE_STORE=/var/lib/pelagos
