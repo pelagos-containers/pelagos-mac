@@ -505,6 +505,63 @@ does not manifest.
 
 ---
 
+## VM Lifetime Policy
+
+**Decision (2026-03-12):** The VM runs from first use until explicit
+`pelagos vm stop` or system restart. It is never automatically shut down.
+
+### Rationale
+
+Every comparable developer tool follows this model: Docker Desktop, Rancher
+Desktop, Colima, Lima in daemon mode. Auto-shutdown based on container state
+is an anti-pattern because:
+
+1. **It creates bad latency surprises.** A developer finishes one container
+   run, then immediately starts the next. If the VM shuts down on container
+   exit, the next `pelagos run` (or `docker exec`, or `docker start`) stalls
+   for a 3–8 s cold boot at exactly the moment the user is iterating.
+
+2. **It creates a race condition in tooling.** The VS Code devcontainer flow
+   runs a probe container that exits immediately, then issues `docker inspect`
+   and `docker exec` moments later. If the VM shuts down on the probe's exit,
+   those subsequent calls fail. This was the direct cause of the
+   `while sleep 1000` keepalive workaround in `pelagos-docker`.
+
+3. **Developer workflow is "start once, use all day."** Auto-shutdown solves
+   a problem (idle resource consumption) that users don't notice, while
+   creating a problem (unexpected stalls) that they do.
+
+### Lifecycle model
+
+| Event | VM state |
+|-------|----------|
+| First container operation after boot / after `vm stop` | VM starts (lazy, same path as `pelagos run` today) |
+| Container exits | VM stays running |
+| All containers exited | VM stays running |
+| `pelagos vm stop` | VM shuts down cleanly |
+| System restart | VM is gone; lazy-start on next operation |
+
+`pelagos vm status` reports whether the VM is running at any time.
+
+### User responsibility
+
+The VM holds 2–4 GB of guest RAM while running. Users who want to reclaim
+that memory explicitly call `pelagos vm stop`. Documentation should state
+the typical RAM footprint clearly, and a future menu-bar indicator (if
+pelagos-mac grows a systray component) should make the running state visible.
+
+### Future: quiescent VM memory optimisation
+
+Once the core devcontainer workflow is solid, investigate reducing the RAM
+footprint of a VM that is running but has no active containers. Linux guests
+support memory ballooning (virtio-balloon); the Apple Virtualization Framework
+exposes `VZVirtioTraditionalMemoryBalloonDeviceConfiguration`. Docker Desktop
+uses this to reclaim idle guest pages back to the host. This is explicitly
+**not a blocker** for any current work — file a separate issue when the time
+comes.
+
+---
+
 ## Recommendation
 
 Security analysis reverses any suggestion to evolve toward Option C.
