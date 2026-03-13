@@ -92,7 +92,7 @@ from `run_container()` in `pelagos-guest/src/main.rs` and close pelagos-mac issu
   actual rootfs is only reachable via the `chroot` pelagos called at startup.
   A workaround (`fchdir(/proc/<pid>/root)` + `chroot(".")` after `setns`) exists
   in branch `fix/exec-into-chroot` (PR #85, closed), but the correct fix is
-  upstream. **Resume after pelagos#95 lands** (switch `with_chroot` → `with_pivot_root`
+  upstream. **Resume after pelagos#96 lands** (switch `with_chroot` → `with_pivot_root`
   in `src/cli/run.rs`). Once pelagos uses `pivot_root`, `setns(mnt)` gives the
   correct container rootfs directly and PR #85 can be reopened/superseded.
 - **Signed installer** — `.pkg` for distribution. Requires Developer ID + notarization
