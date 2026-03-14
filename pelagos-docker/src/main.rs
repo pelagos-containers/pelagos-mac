@@ -74,7 +74,7 @@ enum DockerCmd {
         /// Attach to stdout/stderr (ignored: output is always streamed).
         #[arg(short = 'a', long = "attach")]
         attach: Vec<String>,
-        /// Proxy signals to container process (ignored).
+        /// Proxy signals to container process (accepted and ignored).
         #[arg(long = "sig-proxy")]
         sig_proxy: Option<String>,
         /// Image and optional command+args.
@@ -482,6 +482,7 @@ fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
         detach = true;
     }
 
+
     let (image, cmd_args) = match image_and_args.split_first() {
         Some((img, rest)) => (img.clone(), rest.to_vec()),
         None => {
@@ -546,26 +547,6 @@ fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
         sub.push(image.as_str().into());
         for a in &cmd_args {
             sub.push(a.into());
-        }
-    }
-
-    if is_probe {
-        // Capture output so we can suppress pelagos's "container name" stdout
-        // and instead emit the "Container started" line VS Code expects.
-        let out = match run_pelagos(cfg, &sub) {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("pelagos-docker run: {}", e);
-                return 1;
-            }
-        };
-        if out.status.success() {
-            println!("Container started");
-            return 0;
-        } else {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            eprint!("{}", stderr);
-            return out.status.code().unwrap_or(1);
         }
     }
 
@@ -1037,7 +1018,7 @@ fn cmd_inspect_container(cfg: &Config, names: &[String]) -> i32 {
         if let Some(entry) = entries.iter().find(|e| &e.name == name) {
             // `pelagos container inspect` gives us labels AND volume/bind specs.
             let native = pelagos_container_inspect_json(cfg, name);
-            let container_labels = native
+            let container_labels: HashMap<String, String> = native
                 .as_ref()
                 .and_then(|v| {
                     v.get("labels")?.as_object().map(|obj| {

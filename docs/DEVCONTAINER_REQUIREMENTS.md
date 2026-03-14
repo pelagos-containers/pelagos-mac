@@ -27,29 +27,28 @@ is **met** only when all its test cases pass and have been verified against a li
 
 These are contracts that the VM and the pelagos runtime must uphold for the shim to work.
 
-### R-VM-01 — VM stays up while any container is running
+### R-VM-01 — VM stays up between commands; never auto-shuts-down
 
-**Description:** The VM daemon must not exit while one or more containers are alive
-(status: running). It may exit only when explicitly told to (`pelagos vm stop`) or when
-the last container has exited AND a configurable idle timeout has elapsed.
+**Description:** The VM daemon must not exit on its own. It runs until explicit
+`pelagos vm stop` or system restart. This eliminates any race between consecutive
+devcontainer CLI commands.
 
 **Rationale:** devcontainer CLI sends `docker run` then, milliseconds later, `docker ps`
-and `docker inspect`. If the VM shuts down between commands, those calls fail with no
-diagnostic.
+and `docker inspect`. If the VM could shut down spontaneously, those calls would fail
+silently.
 
 **Acceptance Criteria:**
-- After `pelagos run --detach ...`, the VM daemon is still running
-- Consecutive `pelagos inspect`, `pelagos ps`, `pelagos exec-into` commands all succeed
-  within 2 seconds of `run` returning
-- The VM does NOT shut down between `docker run` and the subsequent `docker ps` in a
-  devcontainer session
+- VM daemon is running after `pelagos run`, `pelagos stop`, and `pelagos rm`
+- Consecutive commands within a devcontainer session all succeed without any sleep
+  between them
+- Explicit `pelagos vm stop` is the only way to stop the VM
 
-**Current State:** PARTIAL — keepalive hack (`while sleep 1000; do :; done`) appended
-to the probe container command keeps the container alive so the VM stays up. This is a
-shim-layer workaround for a runtime-layer gap.
+**Current State:** MEETS — resolved by design decision in pelagos (issue #91, gap 3,
+closed 2026-03-13). The VM never auto-shuts-down. The keepalive hack that previously
+existed in the shim has been removed.
 
-**Real Fix Target:** pelagos issue #91 (exec-into preserved rootfs) + issue #93 (VM
-stays up while containers exist).
+**Removed Hack:** `while sleep 1000; do :; done` was appended to probe container
+commands to keep the VM alive. No longer present or needed.
 
 ---
 
@@ -167,30 +166,32 @@ concurrently with foreground `ps`/`inspect` calls.
 
 ---
 
-### R-SH-02 — Probe run detection and keepalive injection
+### R-SH-02 — Probe run runs normally; container restartable after exit
 
 **Description:** When devcontainer CLI sends:
 ```
 docker run --sig-proxy=false ... <image> /bin/sh -c "echo Container started"
 ```
-the shim must:
-1. Detect this as the probe pattern
-2. Inject `; while sleep 1000; do :; done` after the echo
-3. Force `--detach`
-4. Run the container, suppress pelagos output, print exactly `Container started\n`
-5. Return exit code 0
+the shim must run it as a normal foreground container. The container prints
+`Container started`, exits, and its state is preserved. devcontainer CLI then:
+1. Calls `docker ps -a --filter label=...` to find the exited container
+2. Calls `docker inspect` (shows `State.Running=false`)
+3. Calls `docker start` to restart it
+4. Calls `docker exec` to enter the running container
 
-**Rationale:** This keeps the container alive so subsequent `exec` calls can enter its
-namespaces. Without this, the container exits in milliseconds, its PID is reused, and
-exec enters the wrong namespace.
+**Rationale:** The VM never auto-shuts-down (R-VM-01) and pelagos persists exited
+container state (R-VM-02). No keepalive injection needed; the correct fix is in the
+runtime, not the shim.
 
 **Acceptance Criteria:**
-- Stdout is exactly `Container started\n`
-- Exit code is 0
-- Container is running after the command returns
-- `docker ps` immediately after shows the container
+- `docker run ... sh -c "echo Container started"` prints `Container started` and exits 0
+- Container appears in `docker ps -q -a --filter label=...` immediately after exit
+- `docker inspect` shows `State.Running=false`, `State.Status=exited`
+- `docker start <name>` restarts the container successfully
+- `docker exec` into the restarted container enters the correct rootfs
 
-**Detection rule:** `--sig-proxy=false` AND any arg contains `echo Container started`.
+**Note:** `--sig-proxy` is accepted and silently ignored by the shim (no special
+handling).
 
 ---
 
@@ -440,35 +441,35 @@ T1 and T2 must be scriptable, non-interactive, and runnable with a single comman
 
 ### T1 — Shim Command Tests (`test-devcontainer-shim.sh`)
 
-Current coverage (31 tests):
+Fully rewritten to test the correct lifecycle (probe exits → start → exec) and to
+produce clear diagnostic output on failures. Run with `--debug` for full output.
 
-| Phase | Tests | Requirements Covered |
+| Phase | Tests | Requirements |
 |---|---|---|
-| Preflight | 8 | R-SH-01 |
-| Image check | 1 | R-SH-01 |
-| Probe run | 1 | R-SH-02 |
-| Container discovery | 1 | R-SH-03 |
-| Container inspect | 2 | R-SH-04, R-SH-05 |
-| Exec | 3 | R-SH-06 |
-| Shell server + patching | 14 | R-SH-06 |
-| **Cleanup** | — | — |
+| 1  — pre-flight | 7 | R-SH-01 |
+| 2  — volume CRUD | 3 | R-SH-08 |
+| 3  — ps baseline (no containers) | 2 | R-SH-03 |
+| 4  — probe run + post-exit ps | 3 | R-SH-02, R-VM-02, R-SH-03 |
+| 5  — inspect exited | 3 | R-SH-04, R-SH-05 |
+| 6  — docker start | 2 | R-VM-01 (pelagos start) |
+| 7  — inspect running | 2 | R-SH-04 |
+| 8  — exec | 4 | R-SH-06 |
+| 9  — shell server pattern | 5 | R-SH-06 |
+| 10 — system-config patching | 3 | R-SH-06 |
+| 11 — timing: ps with no sleep | 1 | R-VM-02, R-SH-03 |
+| 12 — multi-label AND filter | 2 | R-SH-03 |
+| 13 — label path values | 2 | R-VM-03, R-SH-03 |
+| 14 — inspect field types | 5 | R-SH-04 |
+| 15 — stop + rm | 3 | — |
 
-**Gaps (must add):**
+**Remaining gaps (T2 or manual):**
 
 | TC-ID | Test case | Requirement |
 |---|---|---|
-| TC-T1-30 | `docker ps -q -a` returns container immediately after `docker run` | R-SH-03, R-VM-02 |
-| TC-T1-31 | Label filter matches label with `/` in value (path) | R-SH-03, R-VM-03 |
-| TC-T1-32 | Label filter with two filters ANDed, both must match | R-SH-03 |
-| TC-T1-33 | `docker inspect` `Config.Env` is array not object | R-SH-04 |
-| TC-T1-34 | `docker inspect` bind mount `Source` is host path not `/mnt/...` | R-SH-04, R-SH-05 |
-| TC-T1-35 | `docker inspect` `State.Running` is boolean `true` not string | R-SH-04 |
-| TC-T1-36 | `docker volume create vscode && volume ls` shows it | R-SH-08 |
-| TC-T1-37 | Named volume data persists across VM restart | R-VM-05 |
-| TC-T1-38 | `docker events` emits start event then doesn't immediately exit | R-SH-10 |
-| TC-T1-39 | `docker build` single-stage Dockerfile + `docker run` the result | R-SH-07 |
+| TC-T1-37 | Named volume data survives VM restart | R-VM-05 |
+| TC-T1-38 | `docker events` emits start event | R-SH-10 |
+| TC-T1-39 | `docker build` single-stage Dockerfile | R-SH-07 |
 | TC-T1-40 | `docker build` multi-stage Dockerfile | R-SH-07 |
-| TC-T1-41 | VM still running 5s after exited container (no premature shutdown) | R-VM-01 |
 
 ---
 
@@ -518,5 +519,5 @@ See issue #91. Must be performed by a human with VS Code installed. Not automata
 | #92 | docker build end-to-end with features + custom Dockerfile | R-SH-07, R-DC-02, R-DC-03 | High |
 | #93 | Named volume backing store persistence across VM restart | R-VM-05 | High |
 | #74 | Dynamic virtiofs host-directory sharing | R-SH-05 (path translation) | Low |
-| NEW | Add T1 gap test cases TC-T1-30 through TC-T1-41 | All T1 gaps | High |
-| NEW | Build `test-devcontainer-e2e.sh` (T2 integration harness) | R-DC-01 through R-DC-04 | High |
+| #95 | T1 gap tests — ✅ **Done** (TC-T1-30..TC-T1-41 incorporated into rewritten harness) | All T1 gaps | — |
+| #96 | Build `test-devcontainer-e2e.sh` (T2 integration harness) | R-DC-01 through R-DC-04 | High |

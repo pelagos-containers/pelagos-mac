@@ -1,17 +1,35 @@
 #!/usr/bin/env bash
-# test-devcontainer-shim.sh — Replay VS Code devcontainer CLI's exact docker command
-# sequence and verify every response, without needing VS Code running.
+# test-devcontainer-shim.sh — pelagos-docker devcontainer compatibility test harness
 #
-# Derived from a real VS Code 1.112.0-insider / devcontainers 0.449.0 session log.
-# The test exercises all shim commands in the same order VS Code sends them, checks
-# JSON structure and field values, and fails early with a clear message on any gap.
+# Tests the pelagos-docker shim against the real lifecycle the devcontainer CLI
+# uses, without requiring VS Code. Each test checks one specific contract from
+# docs/DEVCONTAINER_REQUIREMENTS.md and prints full diagnostic output on failure.
+#
+# Lifecycle under test (correct post-keepalive-removal flow):
+#   Phase 1  pre-flight commands (version, context, buildx, info)
+#   Phase 2  volume CRUD
+#   Phase 3  ps label filtering (empty — no containers yet)
+#   Phase 4  probe run → container exits → ps -a finds it (R-SH-02, R-SH-03)
+#   Phase 5  docker inspect on EXITED container (R-SH-04, R-SH-05)
+#   Phase 6  docker start → container becomes RUNNING (R-VM-01 via pelagos start)
+#   Phase 7  docker inspect on RUNNING container (State.Running=true)
+#   Phase 8  docker exec into running container (R-SH-06)
+#   Phase 9  interactive shell server pattern (R-SH-06)
+#   Phase 10 system-config patching (R-SH-06)
+#   Phase 11 timing: ps immediately after run (no sleep) (R-VM-02, R-SH-03)
+#   Phase 12 multi-label AND filter (R-SH-03)
+#   Phase 13 mount path translation (R-SH-05, host path not /mnt/...)
+#   Phase 14 inspect field types (Env=array, Running=bool, Ports=object)
+#   Phase 15 docker stop + rm lifecycle cleanup
 #
 # Usage:
-#   bash scripts/test-devcontainer-shim.sh
+#   bash scripts/test-devcontainer-shim.sh [--debug]
+#
+#   --debug   Dump full output for every test, not just failures.
 #
 # Prerequisites:
-#   - VM running (or this script will start it)
-#   - pelagos and pelagos-docker built and signed
+#   - VM running (the script checks and errors if not)
+#   - pelagos and pelagos-docker built and signed (scripts/sign.sh)
 
 set -uo pipefail
 
@@ -24,31 +42,66 @@ DISK="$REPO_ROOT/out/root.img"
 BINARY="$REPO_ROOT/target/aarch64-apple-darwin/release/pelagos"
 SHIM="$REPO_ROOT/target/aarch64-apple-darwin/release/pelagos-docker"
 
+DEBUG=0
+for arg in "$@"; do [ "$arg" = "--debug" ] && DEBUG=1; done
+
 PASS=0
 FAIL=0
+SKIP=0
 
-# Workspace folder VS Code uses for devcontainer.
+# Container name used throughout the session.
+CNAME=""
 WORKSPACE_FOLDER="$REPO_ROOT"
 DC_CONFIG="$REPO_ROOT/.devcontainer/devcontainer.json"
 DC_IMAGE="public.ecr.aws/docker/library/ubuntu:22.04"
 
-pass() { PASS=$((PASS + 1)); echo "  [PASS] $1"; }
-fail() { FAIL=$((FAIL + 1)); echo "  [FAIL] $1"; }
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-shim() {
-    "$SHIM" "$@" 2>&1
+# Colours only if a terminal.
+if [ -t 1 ]; then
+    GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[0;33m'; NC='\033[0m'
+else
+    GREEN=''; RED=''; YELLOW=''; NC=''
+fi
+
+pass() {
+    PASS=$((PASS + 1))
+    printf "  ${GREEN}[PASS]${NC} %s\n" "$1"
 }
 
-# ---------------------------------------------------------------------------
-# Preflight
-# ---------------------------------------------------------------------------
+fail() {
+    FAIL=$((FAIL + 1))
+    printf "  ${RED}[FAIL]${NC} %s\n" "$1"
+    if [ -n "${2:-}" ]; then
+        printf "         expected : %s\n" "$3"
+        printf "         got      : %s\n" "$2"
+    fi
+}
 
-echo "=== preflight ==="
-for f in "$KERNEL" "$INITRD" "$DISK" "$BINARY" "$SHIM"; do
-    if [ -f "$f" ]; then echo "  [OK]   $(basename "$f")";
-    else echo "  [FAIL] missing: $f"; exit 1; fi
-done
+skip() {
+    SKIP=$((SKIP + 1))
+    printf "  ${YELLOW}[SKIP]${NC} %s\n" "$1"
+}
 
+# Print a labelled block of output — always in debug mode, only on failure otherwise.
+dump() {
+    local label="$1"; local content="$2"
+    if [ "$DEBUG" -eq 1 ] || [ "${DUMP_ON_FAIL:-0}" -eq 1 ]; then
+        printf "         --- %s ---\n" "$label"
+        echo "$content" | sed 's/^/         /'
+        printf "         ---\n"
+    fi
+}
+
+# Run via the shim, capturing combined stdout+stderr.
+shim() { "$SHIM" "$@" 2>&1; }
+
+# Run via the shim, stderr to /dev/null (for commands where we only want stdout).
+shim_stdout() { "$SHIM" "$@" 2>/dev/null; }
+
+# Run pelagos with VM flags.
 pelagos() {
     "$BINARY" \
         --kernel  "$KERNEL" \
@@ -58,436 +111,717 @@ pelagos() {
         "$@" 2>&1
 }
 
-# Ensure VM is running.
-pelagos ping | grep -q pong || {
-    echo "  VM not responding — waiting for start..."
-    sleep 5
-    pelagos ping | grep -q pong || { echo "  [FAIL] VM not responding"; exit 1; }
+# Assert json field equals expected value.  Usage: assert_json_field LABEL JSON PATH EXPECTED
+assert_json_field() {
+    local label="$1" json="$2" path="$3" expected="$4"
+    local got
+    got=$(echo "$json" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+parts = '$path'.split('.')
+v = data
+for p in parts:
+    if isinstance(v, list): v = v[int(p)] if p.isdigit() else v[0]
+    else: v = v[p]
+print(json.dumps(v) if not isinstance(v, str) else v)
+" 2>/dev/null)
+    if [ "$got" = "$expected" ]; then
+        pass "$label = $expected"
+    else
+        DUMP_ON_FAIL=1 dump "JSON" "$json"
+        fail "$label" "$got" "$expected"
+        DUMP_ON_FAIL=0
+    fi
 }
+
+# ---------------------------------------------------------------------------
+# Preflight checks
+# ---------------------------------------------------------------------------
+
+echo "=== preflight ==="
+
+MISSING=0
+for f in "$KERNEL" "$INITRD" "$DISK" "$BINARY" "$SHIM"; do
+    if [ -f "$f" ]; then
+        [ "$DEBUG" -eq 1 ] && echo "  [OK]   $(basename "$f")"
+    else
+        echo "  [FAIL] missing: $f"
+        MISSING=1
+    fi
+done
+[ "$MISSING" -eq 1 ] && echo "Build and sign first. See ONGOING_TASKS.md Build Reference." && exit 1
+
+# VM must be running.
+if ! pelagos ping 2>&1 | grep -q pong; then
+    echo "  [FAIL] VM not responding to ping."
+    echo "         Run: target/aarch64-apple-darwin/release/pelagos ping"
+    echo "         (the VM starts automatically on first pelagos command)"
+    exit 1
+fi
 echo "  [OK]   VM responding"
 
+# Clean up any leftover test containers from a previous aborted run.
+shim rm -f "dc-shimtest" >/dev/null 2>&1 || true
+shim rm -f "dc-timertest" >/dev/null 2>&1 || true
+shim volume rm "vsc-shimtest" >/dev/null 2>&1 || true
+
 # ---------------------------------------------------------------------------
-# Phase 1: Pre-flight commands VS Code sends before starting any container
+# Phase 1 — pre-flight commands (R-SH-01)
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== phase 1: pre-flight ==="
+echo "=== phase 1: pre-flight commands ==="
 
-# docker version → JSON with Client and Server keys
-OUT=$(shim version 2>&1)
-if echo "$OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'Client' in d and 'Server' in d" 2>/dev/null; then
-    pass "version: valid JSON with Client and Server"
-else
-    fail "version: expected JSON with Client+Server, got: $OUT"
-fi
-
-# docker version --format {{.Server.Version}} → bare version string
-OUT=$(shim version --format '{{.Server.Version}}' 2>&1)
-if echo "$OUT" | grep -qE '^[0-9]+\.[0-9]+'; then
-    pass "version --format {{.Server.Version}}: '$OUT'"
-else
-    fail "version --format: expected bare version, got: $OUT"
-fi
-
-# docker -v → version string (devcontainer CLI calls this)
-OUT=$(shim -v 2>&1)
-if echo "$OUT" | grep -qi "docker\|version\|pelagos"; then
+# docker -v
+OUT=$(shim -v)
+if echo "$OUT" | grep -qiE "docker|version|pelagos"; then
     pass "docker -v: '$OUT'"
 else
-    fail "docker -v: unexpected output: $OUT"
+    fail "docker -v" "$OUT" "string containing docker/version/pelagos"
 fi
 
-# docker context ls --format {{json .}} → devcontainer pre-flight check
-OUT=$(shim context ls --format '{{json .}}' 2>&1)
+# docker version → JSON with Client + Server
+OUT=$(shim version)
+if echo "$OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'Client' in d and 'Server' in d" 2>/dev/null; then
+    pass "docker version: valid JSON with Client and Server"
+else
+    DUMP_ON_FAIL=1 dump "version output" "$OUT"; DUMP_ON_FAIL=0
+    fail "docker version" "$OUT" "JSON {Client:..., Server:...}"
+fi
+
+# docker version --format {{.Server.Version}}
+OUT=$(shim version --format '{{.Server.Version}}')
+if echo "$OUT" | grep -qE '^[0-9]+\.[0-9]+'; then
+    pass "docker version --format: '$OUT'"
+else
+    fail "docker version --format" "$OUT" "bare version like 20.10.0"
+fi
+
+# docker context ls
+OUT=$(shim context ls --format '{{json .}}')
 if echo "$OUT" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); assert d.get('Name')=='default'" 2>/dev/null; then
-    pass "context ls: returned default context JSON"
+    pass "docker context ls: Name=default"
 else
-    fail "context ls: unexpected output: $OUT"
+    DUMP_ON_FAIL=1 dump "context ls" "$OUT"; DUMP_ON_FAIL=0
+    fail "docker context ls" "$OUT" "JSON {Name: default}"
 fi
 
-# docker context show → current context name
-OUT=$(shim context show 2>&1)
+# docker context show
+OUT=$(shim context show)
 if [ "$OUT" = "default" ]; then
-    pass "context show: 'default'"
+    pass "docker context show: default"
 else
-    fail "context show: expected 'default', got: $OUT"
+    fail "docker context show" "$OUT" "default"
 fi
 
-# docker buildx version → must exit non-zero (VS Code tolerates this)
-shim buildx version >/dev/null 2>&1
-RC=$?
+# docker buildx → must exit non-zero (signals no BuildKit; devcontainer falls back to plain build)
+shim buildx version >/dev/null 2>&1; RC=$?
 if [ "$RC" -ne 0 ]; then
-    pass "buildx version: exits $RC (expected non-zero)"
+    pass "docker buildx: exits $RC (non-zero — correct, forces plain build fallback)"
 else
-    fail "buildx version: expected non-zero exit, got 0"
+    fail "docker buildx: expected non-zero exit" "$RC" "non-zero"
 fi
 
-# docker volume ls -q
-OUT=$(shim volume ls -q 2>&1)
-pass "volume ls -q: '$OUT'"
-
-# docker volume create vscode
-OUT=$(shim volume create vscode 2>&1)
-if echo "$OUT" | grep -q "vscode"; then
-    pass "volume create vscode: got '$OUT'"
+# docker info → JSON with ServerVersion and OSType=linux
+OUT=$(shim info)
+if echo "$OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d.get('OSType')=='linux' and d.get('ServerVersion')" 2>/dev/null; then
+    pass "docker info: OSType=linux, ServerVersion present"
 else
-    fail "volume create vscode: expected 'vscode', got: $OUT"
+    DUMP_ON_FAIL=1 dump "info" "$OUT"; DUMP_ON_FAIL=0
+    fail "docker info" "$OUT" "JSON {OSType:linux, ServerVersion:...}"
 fi
 
-# docker ps -q -a --filter label=vsch.local.folder=<folder>  (VS Code pre-check)
-OUT=$(shim ps -q -a --filter "label=vsch.local.folder=$WORKSPACE_FOLDER" --filter "label=vsch.quality=insider" 2>&1)
-pass "ps -q --filter vsch.local.folder: '$OUT'"
+# ---------------------------------------------------------------------------
+# Phase 2 — volume CRUD (R-SH-08)
+# ---------------------------------------------------------------------------
 
-# docker ps -q -a --filter label=devcontainer.local_folder + devcontainer.config_file
+echo ""
+echo "=== phase 2: volume CRUD ==="
+
+# create
+OUT=$(shim volume create vsc-shimtest)
+if echo "$OUT" | grep -q "vsc-shimtest"; then
+    pass "volume create: '$OUT'"
+else
+    fail "volume create" "$OUT" "vsc-shimtest"
+fi
+
+# ls
+OUT=$(shim volume ls)
+if echo "$OUT" | grep -q "vsc-shimtest"; then
+    pass "volume ls: contains vsc-shimtest"
+else
+    fail "volume ls" "$OUT" "output containing vsc-shimtest"
+fi
+
+# ls -q
+OUT=$(shim volume ls -q)
+if echo "$OUT" | grep -q "vsc-shimtest"; then
+    pass "volume ls -q: contains vsc-shimtest"
+else
+    fail "volume ls -q" "$OUT" "output containing vsc-shimtest"
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 3 — ps label filter when no containers exist (R-SH-03 baseline)
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== phase 3: label filter baseline (no containers) ==="
+
 OUT=$(shim ps -q -a \
     --filter "label=devcontainer.local_folder=$WORKSPACE_FOLDER" \
-    --filter "label=devcontainer.config_file=$DC_CONFIG" 2>&1)
-pass "ps -q --filter devcontainer labels: '$OUT'"
-
-# ---------------------------------------------------------------------------
-# Phase 2: Image check
-# ---------------------------------------------------------------------------
-
-echo ""
-echo "=== phase 2: image check ==="
-
-# docker inspect --type image ubuntu:22.04
-# VS Code uses this to check if image is already present before pulling.
-# Expected: JSON array (possibly empty/error if not cached — VS Code then pulls).
-OUT=$(shim inspect --type image "$DC_IMAGE" 2>&1)
-EC=$?
-if [ "$EC" -eq 0 ] && echo "$OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert isinstance(d,list)" 2>/dev/null; then
-    pass "inspect --type image $DC_IMAGE: cached, valid JSON array"
-elif [ "$EC" -ne 0 ]; then
-    pass "inspect --type image $DC_IMAGE: exit $EC (image not cached, VS Code will pull)"
+    --filter "label=devcontainer.config_file=$DC_CONFIG")
+if [ -z "$OUT" ]; then
+    pass "ps --filter (no containers): correctly empty"
 else
-    fail "inspect --type image $DC_IMAGE: unexpected output: $OUT"
+    fail "ps --filter (no containers)" "$OUT" "(empty)"
 fi
 
+# Also test that a non-matching single label returns empty (not everything).
+shim run --detach --name dc-nolabel public.ecr.aws/docker/library/alpine:latest sleep 30 >/dev/null 2>&1 || true
+OUT=$(shim ps -q -a --filter "label=devcontainer.local_folder=$WORKSPACE_FOLDER")
+if [ -z "$OUT" ]; then
+    pass "ps --filter (unlabelled container not returned)"
+else
+    fail "ps --filter (unlabelled container must not match)" "$OUT" "(empty)"
+fi
+shim stop dc-nolabel >/dev/null 2>&1; shim rm dc-nolabel >/dev/null 2>&1 || true
+
 # ---------------------------------------------------------------------------
-# Phase 3: Container startup — the probe run
+# Phase 4 — probe run: correct lifecycle without keepalive (R-SH-02, R-VM-02)
+#
+# The probe run exits normally. devcontainer CLI then calls ps -a to find the
+# exited container, inspect to read state, start to restart it, exec to attach.
+# No keepalive injection. No special probe detection.
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== phase 3: probe run (--sig-proxy=false) ==="
+echo "=== phase 4: probe run and post-exit discovery ==="
 
-# This is the exact command VS Code sends to verify the image is runnable.
-# Our shim intercepts it: detaches with a keepalive, prints "Container started".
-# The workspace bind mount and volume mounts are included (as VS Code sends them).
-VSCODE_VOL="vscode-server-testid"
-shim volume create "$VSCODE_VOL" >/dev/null 2>&1 || true
-
-OUT=$(shim run \
+# Run the exact probe command devcontainer CLI sends.
+RUN_OUT=$(shim run \
     --sig-proxy=false \
     -a STDOUT -a STDERR \
+    --name dc-shimtest \
     --mount "source=$WORKSPACE_FOLDER,target=/workspace,type=bind" \
-    --mount "type=volume,src=$VSCODE_VOL,dst=/root/.vscode-server" \
-    --mount "type=volume,src=vscode,dst=/vscode" \
+    --mount "type=volume,src=vsc-shimtest,dst=/root/.vscode-server" \
     -l "devcontainer.local_folder=$WORKSPACE_FOLDER" \
     -l "devcontainer.config_file=$DC_CONFIG" \
     -e DEVCONTAINER=1 \
     -e DEBIAN_FRONTEND=noninteractive \
     --entrypoint /bin/sh \
-    -l 'devcontainer.metadata=[{"remoteUser":"root"}]' \
     "$DC_IMAGE" \
     -c "echo Container started" 2>&1)
 
-if echo "$OUT" | grep -q "^Container started$"; then
-    pass "probe run: printed 'Container started'"
+if echo "$RUN_OUT" | grep -q "Container started"; then
+    pass "probe run: stdout contains 'Container started'"
 else
-    fail "probe run: expected 'Container started', got: $OUT"
+    DUMP_ON_FAIL=1 dump "run output" "$RUN_OUT"; DUMP_ON_FAIL=0
+    fail "probe run: missing 'Container started'" "$RUN_OUT" "line: Container started"
 fi
 
-# ---------------------------------------------------------------------------
-# Phase 4: Container discovery after probe
-# ---------------------------------------------------------------------------
+CNAME="dc-shimtest"
 
-echo ""
-echo "=== phase 4: container discovery ==="
-
-# docker ps -q -a --filter label=devcontainer.local_folder=... --filter label=devcontainer.config_file=...
-# Must return the container name that was just started.
-sleep 1
-CNAME=$(shim ps -q -a \
+# ps -q -a immediately after run (no sleep) — R-VM-02 timing test.
+FOUND=$(shim ps -q -a \
     --filter "label=devcontainer.local_folder=$WORKSPACE_FOLDER" \
-    --filter "label=devcontainer.config_file=$DC_CONFIG" 2>&1 | head -1)
-
-if [ -n "$CNAME" ]; then
-    pass "ps -q --filter: found container '$CNAME'"
+    --filter "label=devcontainer.config_file=$DC_CONFIG" | head -1)
+if [ "$FOUND" = "$CNAME" ]; then
+    pass "ps --filter immediately after run: found '$CNAME' (no sleep needed)"
 else
-    fail "ps -q --filter: no container found after probe run"
-    echo ""
-    echo "================================"
-    echo "FAIL  ($FAIL failed, $PASS passed)"
-    exit 1
+    DUMP_ON_FAIL=1 dump "ps -q -a --filter output" "$(shim ps -a 2>&1)"; DUMP_ON_FAIL=0
+    fail "ps --filter immediately after run" "$FOUND" "$CNAME"
+fi
+
+# Container should be EXITED (not running) — it ran 'echo' and exited.
+STATE=$(shim ps -a --filter "name=$CNAME" | grep "$CNAME" | awk '{print $2}')
+if [ "$STATE" = "exited" ]; then
+    pass "container is exited after probe run (correct — no keepalive)"
+else
+    fail "container state after probe run" "$STATE" "exited"
 fi
 
 # ---------------------------------------------------------------------------
-# Phase 5: docker inspect --type container <name>
-# This is the command that failed in the live VS Code log.
+# Phase 5 — inspect EXITED container (R-SH-04, R-SH-05)
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== phase 5: inspect container ==="
+echo "=== phase 5: inspect exited container ==="
 
-OUT=$(shim inspect --type container "$CNAME" 2>&1)
+INSPECT_JSON=$(shim inspect --type container "$CNAME")
 EC=$?
 
 if [ "$EC" -ne 0 ]; then
-    fail "inspect container '$CNAME': exit $EC; output: $OUT"
-else
-    # Check JSON structure — pipe $OUT via a temp file to avoid shell quote issues.
-    INSPECT_TMP=$(mktemp /tmp/pelagos-inspect-XXXXXX.json)
-    printf '%s' "$OUT" > "$INSPECT_TMP"
-    python3 - "$CNAME" "$WORKSPACE_FOLDER" "$INSPECT_TMP" <<'PYEOF' 2>/tmp/pelagos-inspect-py-err.txt
+    fail "inspect exited container: exit $EC"
+    dump "inspect output" "$INSPECT_JSON"
+    echo "ABORT: cannot proceed without working inspect"
+    echo "FAIL ($FAIL failed, $PASS passed)" && exit 1
+fi
+
+# Parse and validate required fields.
+python3 - "$CNAME" "$WORKSPACE_FOLDER" <<PYEOF
 import sys, json
-name, workspace, path = sys.argv[1], sys.argv[2], sys.argv[3]
-data = json.loads(open(path).read())
+name, workspace = sys.argv[1], sys.argv[2]
+raw = """$INSPECT_JSON"""
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError as e:
+    print(f"  [FAIL] inspect: invalid JSON: {e}")
+    print(f"         raw: {raw[:300]}")
+    sys.exit(1)
 assert isinstance(data, list) and len(data) > 0, "not a non-empty array"
 c = data[0]
-assert c.get("State", {}).get("Running") == True, f"State.Running not true: {c.get('State')}"
-assert c.get("Id"), "Id missing"
-assert c.get("Name"), "Name missing"
-assert "Config" in c, "Config missing"
-assert "Labels" in c.get("Config", {}), "Config.Labels missing"
-assert "HostConfig" in c, "HostConfig missing — VS Code needs Binds"
-assert "Mounts" in c, "Mounts missing"
+errors = []
+
+# Required fields
+for field in ["Id", "Name", "Created", "State", "Config", "HostConfig", "Mounts", "NetworkSettings"]:
+    if field not in c:
+        errors.append(f"missing top-level field: {field}")
+
+if "State" in c:
+    for f in ["Running", "Status", "StartedAt"]:
+        if f not in c["State"]:
+            errors.append(f"State.{f} missing")
+    # Must be boolean false (exited container)
+    if c["State"].get("Running") is not False:
+        errors.append(f"State.Running should be false for exited container, got: {c['State'].get('Running')!r}")
+
+if "Config" in c:
+    for f in ["Image", "Labels", "User", "Env", "Cmd"]:
+        if f not in c["Config"]:
+            errors.append(f"Config.{f} missing")
+    env = c["Config"].get("Env", None)
+    if not isinstance(env, list):
+        errors.append(f"Config.Env must be list, got {type(env).__name__}: {env!r}")
+
+ports = c.get("NetworkSettings", {}).get("Ports")
+if not isinstance(ports, dict):
+    errors.append(f"NetworkSettings.Ports must be object, got: {ports!r}")
+
+# Labels round-trip
+labels = c.get("Config", {}).get("Labels", {})
+if labels.get("devcontainer.local_folder") != workspace:
+    errors.append(f"Label devcontainer.local_folder mismatch: {labels.get('devcontainer.local_folder')!r} != {workspace!r}")
+
+if errors:
+    for e in errors:
+        print(f"  [FAIL] inspect field: {e}")
+    sys.exit(1)
+
+# Workspace mount present
 mounts = c.get("Mounts", [])
 binds  = c.get("HostConfig", {}).get("Binds", [])
-workspace_found = (
-    any("/workspace" in str(m) for m in mounts) or
-    any("/workspace" in str(b) for b in binds)
-)
-assert workspace_found, f"workspace mount not found in Mounts={mounts} or HostConfig.Binds={binds}"
-print("  [OK]   State.Running=true")
-print("  [OK]   Id, Name, Config.Labels present")
-print(f"  [OK]   HostConfig.Binds: {binds}")
-print(f"  [OK]   Mounts: {[m.get('Source') + ':' + m.get('Destination') for m in mounts]}")
+ws_found = any("/workspace" in str(m) for m in mounts) or any("/workspace" in b for b in binds)
+if not ws_found:
+    print(f"  [FAIL] workspace mount missing: Mounts={mounts}, Binds={binds}")
+    sys.exit(1)
+
+print(f"  [OK]   Id={c['Id']}, State.Running=false, Config.Env=list({len(c['Config'].get('Env',[]))})")
+print(f"  [OK]   Labels: devcontainer.local_folder present")
+print(f"  [OK]   Workspace mount found")
+print(f"  [OK]   NetworkSettings.Ports is object")
 PYEOF
-
-    PY_RC=$?
-    rm -f "$INSPECT_TMP"
-    if [ "$PY_RC" -eq 0 ]; then
-        pass "inspect container '$CNAME': JSON structure correct"
-    else
-        PY_ERR=$(cat /tmp/pelagos-inspect-py-err.txt 2>/dev/null)
-        fail "inspect container '$CNAME': JSON structure wrong — $PY_ERR; output: $OUT"
-    fi
-fi
-
-# ---------------------------------------------------------------------------
-# Phase 5.5: Extended inspect fields (what devcontainer CLI's FJ function reads)
-# ---------------------------------------------------------------------------
-
-echo ""
-echo "=== phase 5.5: inspect fields devcontainer CLI reads ==="
-
-INSPECT_TMP2=$(mktemp /tmp/pelagos-inspect-ext-XXXXXX.json)
-OUT=$(shim inspect --type container "$CNAME" 2>&1)
-printf '%s' "$OUT" > "$INSPECT_TMP2"
-python3 - "$INSPECT_TMP2" <<'PYEOF2' 2>/tmp/pelagos-inspect-ext-err.txt
-import sys, json, re
-path = sys.argv[1]
-data = json.loads(open(path).read())
-c = data[0]
-
-# Created timestamp (used by devcontainer for lifecycle marker idempotency)
-assert c.get("Created"), "Created field missing or empty — devcontainer uses it for lifecycle markers"
-print(f"  [OK]   Created: {c['Created']}")
-
-# State.StartedAt (used for postStartCommand markers)
-assert c.get("State", {}).get("StartedAt"), "State.StartedAt missing — devcontainer uses it for postStart markers"
-print(f"  [OK]   State.StartedAt: {c['State']['StartedAt']}")
-
-# Config.User (devcontainer falls back to 'root' if empty, but field must exist)
-assert "User" in c.get("Config", {}), "Config.User field missing"
-print(f"  [OK]   Config.User: '{c['Config']['User']}'")
-
-# Config.Env must be a list (devcontainer calls Dt() which iterates it)
-env = c.get("Config", {}).get("Env", [])
-assert isinstance(env, list), f"Config.Env must be a list, got: {type(env)}"
-print(f"  [OK]   Config.Env: list of {len(env)} entries")
-
-# NetworkSettings.Ports must be an object (devcontainer iterates keys)
-ports = c.get("NetworkSettings", {}).get("Ports", None)
-assert isinstance(ports, dict), f"NetworkSettings.Ports must be object, got: {ports}"
-print(f"  [OK]   NetworkSettings.Ports: dict ({len(ports)} entries)")
-PYEOF2
 PY_RC=$?
-rm -f "$INSPECT_TMP2"
 if [ "$PY_RC" -eq 0 ]; then
-    pass "inspect: Created, State.StartedAt, Config.User, Config.Env, NetworkSettings.Ports all present"
+    pass "inspect exited: all required fields valid"
 else
-    PY_ERR=$(cat /tmp/pelagos-inspect-ext-err.txt 2>/dev/null)
-    fail "inspect: missing fields — $PY_ERR"
+    FAIL=$((FAIL + 1))
+fi
+
+# Mount Source must be a host path, not a VM-internal /mnt/... path (R-SH-05).
+MOUNT_SOURCES=$(echo "$INSPECT_JSON" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+mounts = data[0].get('Mounts', [])
+for m in mounts:
+    src = m.get('Source', '')
+    if src:
+        print(src)
+" 2>/dev/null)
+if echo "$MOUNT_SOURCES" | grep -q "^/mnt/"; then
+    fail "inspect mount translation: Source contains /mnt/ (VM path, not host path)" \
+         "$MOUNT_SOURCES" "host path (not /mnt/...)"
+elif [ -n "$MOUNT_SOURCES" ]; then
+    pass "inspect mount Source: host paths (no /mnt/... leakage)"
+else
+    skip "inspect mount Source: no bind mounts in output (volume-only mounts)"
 fi
 
 # ---------------------------------------------------------------------------
-# Phase 6: docker exec into the running container
+# Phase 6 — docker start → container becomes RUNNING (R-VM-01 / pelagos start)
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== phase 6: exec into container ==="
+echo "=== phase 6: docker start (restart exited container) ==="
+
+START_OUT=$(shim start "$CNAME" 2>&1)
+EC=$?
+if [ "$EC" -eq 0 ]; then
+    pass "docker start: exit 0"
+else
+    DUMP_ON_FAIL=1 dump "start output" "$START_OUT"; DUMP_ON_FAIL=0
+    fail "docker start" "exit $EC" "exit 0"
+fi
+
+# Give pelagos a moment to record the new running state.
+sleep 1
+
+STATE=$(shim ps --filter "name=$CNAME" | grep "$CNAME" | awk '{print $2}')
+if [ "$STATE" = "running" ]; then
+    pass "container is running after docker start"
+else
+    fail "container state after docker start" "$STATE" "running"
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 7 — inspect RUNNING container (R-SH-04)
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== phase 7: inspect running container ==="
+
+INSPECT_JSON=$(shim inspect --type container "$CNAME")
+RUNNING=$(echo "$INSPECT_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['State']['Running'])" 2>/dev/null)
+if [ "$RUNNING" = "True" ]; then
+    pass "inspect running: State.Running=true (boolean)"
+else
+    DUMP_ON_FAIL=1 dump "inspect" "$INSPECT_JSON"; DUMP_ON_FAIL=0
+    fail "inspect running: State.Running" "$RUNNING" "True"
+fi
+
+# Labels must survive restart.
+LABEL_FOLDER=$(echo "$INSPECT_JSON" | python3 -c "
+import sys, json
+print(json.load(sys.stdin)[0]['Config']['Labels'].get('devcontainer.local_folder', ''))
+" 2>/dev/null)
+if [ "$LABEL_FOLDER" = "$WORKSPACE_FOLDER" ]; then
+    pass "labels survive docker start: devcontainer.local_folder intact"
+else
+    fail "labels after docker start" "$LABEL_FOLDER" "$WORKSPACE_FOLDER"
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 8 — docker exec (R-SH-06)
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== phase 8: docker exec ==="
 
 OUT=$(shim exec "$CNAME" /bin/sh -c "echo exec-ok" 2>&1)
 if echo "$OUT" | grep -q "exec-ok"; then
-    pass "exec: command ran inside container"
+    pass "exec: command ran in container"
 else
-    fail "exec: expected 'exec-ok', got: $OUT"
+    DUMP_ON_FAIL=1 dump "exec output" "$OUT"; DUMP_ON_FAIL=0
+    fail "exec: echo exec-ok" "$OUT" "exec-ok"
 fi
 
 OUT=$(shim exec "$CNAME" /bin/sh -c "uname -s" 2>&1)
-if echo "$OUT" | grep -q "Linux"; then
+if [ "$OUT" = "Linux" ]; then
     pass "exec: uname -s = Linux (correct rootfs)"
 else
-    fail "exec: expected 'Linux', got: $OUT"
+    fail "exec: uname -s" "$OUT" "Linux"
 fi
 
-# Verify exec is inside the container's rootfs (ubuntu), not Alpine
 OUT=$(shim exec "$CNAME" /bin/sh -c "cat /etc/os-release" 2>&1)
 if echo "$OUT" | grep -qi "ubuntu"; then
-    pass "exec: /etc/os-release shows Ubuntu (correct container rootfs)"
+    pass "exec: /etc/os-release = Ubuntu (container rootfs, not Alpine/VM)"
 else
-    fail "exec: expected Ubuntu os-release, got: $OUT"
+    DUMP_ON_FAIL=1 dump "os-release" "$OUT"; DUMP_ON_FAIL=0
+    fail "exec: container rootfs" "$OUT" "/etc/os-release containing 'ubuntu'"
+fi
+
+OUT=$(shim exec "$CNAME" /bin/sh -c "exit 42" 2>&1); EC=$?
+if [ "$EC" -eq 42 ]; then
+    pass "exec: exit code propagated (42)"
+else
+    fail "exec: exit code propagation" "$EC" "42"
 fi
 
 # ---------------------------------------------------------------------------
-# Phase 6.5: VS Code devcontainer shell server pattern
-# devcontainer CLI (FJ function) opens an interactive shell and runs commands
-# through stdin/stdout using sentinel tokens to demarcate output.
+# Phase 9 — shell server pattern: interactive exec with sentinel tokens (R-SH-06)
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== phase 6.5: VS Code shell server pattern ==="
+echo "=== phase 9: shell server pattern (interactive exec) ==="
 
-SHIM_ABS="$SHIM"
-SENTINEL="pelagos-sentinel-$$"
-
-# devcontainer starts: docker exec -i -u root -e VSCODE_REMOTE_CONTAINERS_SESSION=xxx <container> /bin/sh
-# then probes $PATH, getent passwd, uname -m, /etc/os-release through stdin.
+S="sentinel-$$"
 SHELL_OUT=$(printf \
-    'echo -n %s; ( echo $PATH ); echo -n %s$?%s; echo -n %s >&2\n
-echo -n %s; ( getent passwd root ); echo -n %s$?%s; echo -n %s >&2\n
-echo -n %s; ( uname -m ); echo -n %s$?%s; echo -n %s >&2\n
-echo -n %s; ( cat /etc/os-release ); echo -n %s$?%s; echo -n %s >&2\n
+    'echo -n %s; echo $PATH; echo -n %s\n
+echo -n %s; getent passwd root; echo -n %s\n
+echo -n %s; uname -m; echo -n %s\n
+echo -n %s; cat /etc/os-release; echo -n %s\n
 exit\n' \
-    "$SENTINEL" "$SENTINEL" "$SENTINEL" "$SENTINEL" \
-    "$SENTINEL" "$SENTINEL" "$SENTINEL" "$SENTINEL" \
-    "$SENTINEL" "$SENTINEL" "$SENTINEL" "$SENTINEL" \
-    "$SENTINEL" "$SENTINEL" "$SENTINEL" "$SENTINEL" \
-    | "$SHIM_ABS" exec -i -u root -e VSCODE_REMOTE_CONTAINERS_SESSION=test-session \
+    "$S" "$S" "$S" "$S" "$S" "$S" "$S" "$S" \
+    | "$SHIM" exec -i -u root -e VSCODE_REMOTE_CONTAINERS_SESSION=test-session \
       "$CNAME" /bin/sh 2>&1)
 
-# PATH must be non-empty
+[ "$DEBUG" -eq 1 ] && dump "shell-server output" "$SHELL_OUT"
+
 if echo "$SHELL_OUT" | grep -q "/bin\|/usr"; then
-    pass "shell-server: echo \$PATH returned a non-empty path"
+    pass "shell-server: \$PATH non-empty"
 else
-    fail "shell-server: echo \$PATH returned empty/nothing; out=$SHELL_OUT"
+    DUMP_ON_FAIL=1 dump "shell-server" "$SHELL_OUT"; DUMP_ON_FAIL=0
+    fail "shell-server: \$PATH" "$SHELL_OUT" "path containing /bin or /usr"
 fi
 
-# getent passwd root must return root entry (output is interleaved with sentinels,
-# so don't anchor with ^)
 if echo "$SHELL_OUT" | grep -q "root:x:0:0"; then
-    pass "shell-server: getent passwd root returned root entry"
+    pass "shell-server: getent passwd root"
 else
-    fail "shell-server: getent passwd root missing; out=$SHELL_OUT"
+    fail "shell-server: getent passwd root" "${SHELL_OUT:0:200}" "root:x:0:0"
 fi
 
-# uname -m must return architecture
 if echo "$SHELL_OUT" | grep -qE "aarch64|x86_64|arm"; then
-    pass "shell-server: uname -m returned architecture"
+    pass "shell-server: uname -m = architecture"
 else
-    fail "shell-server: uname -m unexpected; out=$SHELL_OUT"
+    fail "shell-server: uname -m" "$SHELL_OUT" "aarch64|x86_64|arm"
 fi
 
-# /etc/os-release must show Ubuntu
 if echo "$SHELL_OUT" | grep -qi "ubuntu"; then
-    pass "shell-server: /etc/os-release shows Ubuntu"
+    pass "shell-server: /etc/os-release = Ubuntu"
 else
-    fail "shell-server: /etc/os-release no Ubuntu; out=$SHELL_OUT"
+    fail "shell-server: os-release" "$SHELL_OUT" "ubuntu"
 fi
 
-# ---------------------------------------------------------------------------
-# Phase 6.6: VS Code user-env probe pattern (login interactive shell)
-# devcontainer calls: docker exec -i -u root <container> /bin/bash -l -i -c "<cmd>"
-# to probe the user's full login environment.
-# ---------------------------------------------------------------------------
-
-echo ""
-echo "=== phase 6.6: VS Code user-env probe (login shell) ==="
-
-PROBE_UUID="probe-$(date +%s)"
-PROBE_OUT=$("$SHIM_ABS" exec -i -u root "$CNAME" \
+# env probe — /proc/self/environ may be unavailable (PID ns boundary); printenv is the fallback.
+PROBE_UUID="probe-$$"
+PROBE_OUT=$("$SHIM" exec -i -u root "$CNAME" \
     /bin/bash -l -i -c "echo -n $PROBE_UUID; cat /proc/self/environ; echo -n $PROBE_UUID" 2>&1)
-
 if echo "$PROBE_OUT" | grep -q "$PROBE_UUID"; then
-    pass "user-env probe: /bin/bash -lic ran and produced sentinel output"
+    pass "env probe: bash -lic ran (sentinel present)"
 else
-    fail "user-env probe: /bin/bash -lic failed; out=$PROBE_OUT"
+    DUMP_ON_FAIL=1 dump "env probe" "$PROBE_OUT"; DUMP_ON_FAIL=0
+    fail "env probe: bash -lic" "$PROBE_OUT" "sentinel $PROBE_UUID in output"
 fi
 
-# /proc/self/environ contains null-separated KEY=VAL entries.
-# Note: /proc/self is only accessible if exec'd process is in the container's PID
-# namespace. pelagos exec-into enters the mount namespace but stays in the outer
-# PID namespace, so /proc/self/environ is typically unavailable.
-# devcontainer CLI falls back to `printenv` automatically when this happens.
 if echo "$PROBE_OUT" | tr '\0' '\n' | grep -q "="; then
-    pass "user-env probe: /proc/self/environ returned env data"
+    pass "env probe: /proc/self/environ returned K=V data"
 else
-    # /proc/self/environ not available (expected: PID namespace boundary).
-    # Verify devcontainer's printenv fallback path returns some env vars.
-    PRINTENV_OUT=$("$SHIM_ABS" exec -i -u root "$CNAME" /bin/sh -c 'printenv' 2>&1)
+    PRINTENV_OUT=$("$SHIM" exec -i -u root "$CNAME" /bin/sh -c 'printenv' 2>&1)
     if echo "$PRINTENV_OUT" | grep -q "="; then
-        pass "user-env probe: /proc/self/environ unavailable (PID ns); printenv fallback returns env vars"
+        pass "env probe: printenv fallback works (PID ns boundary expected)"
     else
-        fail "user-env probe: neither /proc/self/environ nor printenv returned env data; out=$PROBE_OUT"
+        fail "env probe: neither /proc/self/environ nor printenv" \
+             "$PROBE_OUT" "K=V env data via /proc/self/environ or printenv"
     fi
 fi
 
 # ---------------------------------------------------------------------------
-# Phase 6.7: VS Code system-config patching
-# devcontainer patches /etc/environment and /etc/profile to set env vars.
-# Both use exec -i -u root through the shell server.
+# Phase 10 — system-config patching (R-SH-06)
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== phase 6.7: VS Code system-config patching ==="
+echo "=== phase 10: system-config patching ==="
 
-# Test /etc/environment write (devcontainer adds env vars here)
-PATCH_OUT=$("$SHIM_ABS" exec -i -u root "$CNAME" /bin/sh -c \
+# /var/devcontainer marker
+PATCH_OUT=$("$SHIM" exec -i -u root "$CNAME" /bin/sh -c \
     "mkdir -p /var/devcontainer && test ! -f /var/devcontainer/.envmarker && touch /var/devcontainer/.envmarker && echo patched-env" 2>&1)
 if echo "$PATCH_OUT" | grep -q "patched-env"; then
-    pass "system-config: mkdir /var/devcontainer + marker file + echo works"
+    pass "system-config: /var/devcontainer marker created"
+elif "$SHIM" exec "$CNAME" /bin/sh -c "test -f /var/devcontainer/.envmarker && echo exists" 2>&1 | grep -q "exists"; then
+    pass "system-config: /var/devcontainer marker already exists (idempotent)"
 else
-    # Accept if marker already exists (idempotent)
-    EXIST_OUT=$("$SHIM_ABS" exec -i -u root "$CNAME" /bin/sh -c \
-        "test -f /var/devcontainer/.envmarker && echo marker-exists" 2>&1)
-    if echo "$EXIST_OUT" | grep -q "marker-exists"; then
-        pass "system-config: /var/devcontainer marker already exists (idempotent)"
-    else
-        fail "system-config: mkdir/marker failed; out=$PATCH_OUT"
-    fi
+    DUMP_ON_FAIL=1 dump "patch output" "$PATCH_OUT"; DUMP_ON_FAIL=0
+    fail "system-config: /var/devcontainer marker" "$PATCH_OUT" "patched-env or marker-exists"
 fi
 
-# Test /etc/environment append (devcontainer appends env vars)
-APPEND_OUT=$("$SHIM_ABS" exec -i -u root "$CNAME" /bin/sh -c \
-    "cat >> /etc/environment <<'EOF'
-TEST_ENV_VAR=\"test-value\"
-EOF
-grep TEST_ENV_VAR /etc/environment" 2>&1)
-if echo "$APPEND_OUT" | grep -q "TEST_ENV_VAR"; then
-    pass "system-config: cat >> /etc/environment works"
+# /etc/environment append
+APPEND_OUT=$("$SHIM" exec -i -u root "$CNAME" /bin/sh -c \
+    'printf "TEST_DC_VAR=\"test-value\"\n" >> /etc/environment && grep TEST_DC_VAR /etc/environment' 2>&1)
+if echo "$APPEND_OUT" | grep -q "TEST_DC_VAR"; then
+    pass "system-config: /etc/environment append"
 else
-    fail "system-config: /etc/environment append failed; out=$APPEND_OUT"
+    DUMP_ON_FAIL=1 dump "append output" "$APPEND_OUT"; DUMP_ON_FAIL=0
+    fail "system-config: /etc/environment append" "$APPEND_OUT" "TEST_DC_VAR in /etc/environment"
 fi
 
-# Test /etc/profile sed (devcontainer normalizes PATH in /etc/profile)
-SED_OUT=$("$SHIM_ABS" exec -i -u root "$CNAME" /bin/sh -c \
+# /etc/profile sed (extended regex, in-place)
+SED_OUT=$("$SHIM" exec -i -u root "$CNAME" /bin/sh -c \
     "sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true && echo sed-ok" 2>&1)
 if echo "$SED_OUT" | grep -q "sed-ok"; then
-    pass "system-config: sed -i on /etc/profile works"
+    pass "system-config: sed -i -E on /etc/profile"
 else
-    fail "system-config: sed /etc/profile failed; out=$SED_OUT"
+    DUMP_ON_FAIL=1 dump "sed output" "$SED_OUT"; DUMP_ON_FAIL=0
+    fail "system-config: sed /etc/profile" "$SED_OUT" "sed-ok"
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 11 — timing: ps immediately after a fresh run (R-VM-02, R-SH-03)
+# Runs a new short-lived container and queries ps with NO sleep.
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== phase 11: timing — ps immediately after run ==="
+
+T11_LABEL="test.timing=$(date +%s)"
+shim run \
+    --name dc-timertest \
+    --label "$T11_LABEL" \
+    "$DC_IMAGE" /bin/sh -c "exit 0" >/dev/null 2>&1
+
+# No sleep. ps must find it immediately.
+FOUND=$(shim ps -q -a --filter "label=$T11_LABEL" 2>/dev/null | head -1)
+if [ "$FOUND" = "dc-timertest" ]; then
+    pass "timing: ps finds container immediately after run (no sleep)"
+else
+    fail "timing: ps immediately after run" "$FOUND" "dc-timertest"
+fi
+shim rm dc-timertest >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# Phase 12 — multi-label AND filter: both labels must match (R-SH-03)
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== phase 12: multi-label AND filter ==="
+
+# Container with both labels — must appear.
+shim run --detach \
+    --name dc-multilabel \
+    --label "dc.test.k1=v1" \
+    --label "dc.test.k2=v2" \
+    "$DC_IMAGE" sleep 30 >/dev/null 2>&1
+
+FOUND=$(shim ps -q -a --filter "label=dc.test.k1=v1" --filter "label=dc.test.k2=v2" | head -1)
+if [ "$FOUND" = "dc-multilabel" ]; then
+    pass "multi-label AND filter: both labels match → found"
+else
+    fail "multi-label AND filter (both match)" "$FOUND" "dc-multilabel"
+fi
+
+# Filter where second label doesn't match — must NOT appear.
+FOUND=$(shim ps -q -a --filter "label=dc.test.k1=v1" --filter "label=dc.test.k2=WRONG" | head -1)
+if [ -z "$FOUND" ]; then
+    pass "multi-label AND filter: one mismatch → not found"
+else
+    fail "multi-label AND filter (one mismatch)" "$FOUND" "(empty)"
+fi
+
+# Label value containing path separators and dots (the devcontainer pattern).
+shim stop dc-multilabel >/dev/null 2>&1; shim rm dc-multilabel >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# Phase 13 — label with path value round-trip (R-VM-03, R-SH-03)
+# devcontainer uses label values that are absolute paths like /Users/cb/Projects/foo
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== phase 13: label path values ==="
+
+PATH_LABEL="devcontainer.local_folder=$WORKSPACE_FOLDER"
+shim run --detach \
+    --name dc-pathlabel \
+    --label "$PATH_LABEL" \
+    "$DC_IMAGE" sleep 30 >/dev/null 2>&1
+
+FOUND=$(shim ps -q -a --filter "label=$PATH_LABEL" | head -1)
+if [ "$FOUND" = "dc-pathlabel" ]; then
+    pass "label path value: filter matches '$WORKSPACE_FOLDER'"
+else
+    DUMP_ON_FAIL=1 dump "all containers" "$(shim ps -a 2>&1)"; DUMP_ON_FAIL=0
+    fail "label path value filter" "$FOUND" "dc-pathlabel"
+fi
+
+STORED=$(shim inspect dc-pathlabel 2>/dev/null | python3 -c \
+    "import sys,json; print(json.load(sys.stdin)[0]['Config']['Labels'].get('devcontainer.local_folder',''))" 2>/dev/null)
+if [ "$STORED" = "$WORKSPACE_FOLDER" ]; then
+    pass "label path value: round-trips through inspect verbatim"
+else
+    fail "label path value in inspect" "$STORED" "$WORKSPACE_FOLDER"
+fi
+
+shim stop dc-pathlabel >/dev/null 2>&1; shim rm dc-pathlabel >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# Phase 14 — inspect field types (R-SH-04 type correctness)
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== phase 14: inspect field types ==="
+
+TINSPECT=$(shim inspect --type container "$CNAME" 2>/dev/null)
+
+# State.Running must be boolean true (not string "true" or "True")
+RUNNING_TYPE=$(echo "$TINSPECT" | python3 -c "
+import sys, json
+c = json.load(sys.stdin)[0]
+v = c['State']['Running']
+print(type(v).__name__ + ':' + str(v))
+" 2>/dev/null)
+if [ "$RUNNING_TYPE" = "bool:True" ]; then
+    pass "State.Running type: boolean true"
+else
+    fail "State.Running type" "$RUNNING_TYPE" "bool:True"
+fi
+
+# Config.Env must be list of strings
+ENV_TYPE=$(echo "$TINSPECT" | python3 -c "
+import sys, json
+c = json.load(sys.stdin)[0]
+env = c['Config']['Env']
+print(type(env).__name__ + ':' + str(len(env)))
+" 2>/dev/null)
+if echo "$ENV_TYPE" | grep -q "^list:"; then
+    pass "Config.Env type: list (${ENV_TYPE#list:} entries)"
+else
+    fail "Config.Env type" "$ENV_TYPE" "list:N"
+fi
+
+# NetworkSettings.Ports must be dict
+PORTS_TYPE=$(echo "$TINSPECT" | python3 -c "
+import sys, json
+c = json.load(sys.stdin)[0]
+ports = c['NetworkSettings']['Ports']
+print(type(ports).__name__)
+" 2>/dev/null)
+if [ "$PORTS_TYPE" = "dict" ]; then
+    pass "NetworkSettings.Ports type: dict"
+else
+    fail "NetworkSettings.Ports type" "$PORTS_TYPE" "dict"
+fi
+
+# Created and State.StartedAt must be non-empty ISO-8601 strings.
+CREATED=$(echo "$TINSPECT" | python3 -c "import sys,json; print(json.load(sys.stdin)[0].get('Created',''))" 2>/dev/null)
+if echo "$CREATED" | grep -qE "^[0-9]{4}-[0-9]{2}-[0-9]{2}T"; then
+    pass "Created timestamp: ISO-8601 '$CREATED'"
+else
+    fail "Created timestamp" "$CREATED" "ISO-8601 datetime"
+fi
+
+STARTEDAT=$(echo "$TINSPECT" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['State'].get('StartedAt',''))" 2>/dev/null)
+if echo "$STARTEDAT" | grep -qE "^[0-9]{4}-[0-9]{2}-[0-9]{2}T"; then
+    pass "State.StartedAt timestamp: ISO-8601 '$STARTEDAT'"
+else
+    fail "State.StartedAt" "$STARTEDAT" "ISO-8601 datetime"
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 15 — stop + rm lifecycle (R-SH-09-adjacent)
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== phase 15: stop and rm ==="
+
+OUT=$(shim stop "$CNAME" 2>&1); EC=$?
+if [ "$EC" -eq 0 ]; then
+    pass "docker stop: exit 0"
+else
+    fail "docker stop" "exit $EC" "exit 0"
+fi
+
+OUT=$(shim rm "$CNAME" 2>&1); EC=$?
+if [ "$EC" -eq 0 ]; then
+    pass "docker rm: exit 0"
+else
+    fail "docker rm" "exit $EC" "exit 0"
+fi
+
+# Container must no longer appear in ps -a.
+FOUND=$(shim ps -q -a --filter "name=$CNAME" 2>/dev/null | head -1)
+if [ -z "$FOUND" ]; then
+    pass "post-rm: container gone from ps -a"
+else
+    fail "post-rm: container still in ps -a" "$FOUND" "(empty)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -496,9 +830,8 @@ fi
 
 echo ""
 echo "=== cleanup ==="
-shim stop "$CNAME" >/dev/null 2>&1 || true
-shim rm "$CNAME" >/dev/null 2>&1 || true
-shim volume rm "$VSCODE_VOL" >/dev/null 2>&1 || true
+shim volume rm "vsc-shimtest" >/dev/null 2>&1 || true
+shim rm -f dc-shimtest dc-timertest dc-multilabel dc-pathlabel >/dev/null 2>&1 || true
 echo "  done"
 
 # ---------------------------------------------------------------------------
@@ -506,11 +839,17 @@ echo "  done"
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "================================"
+echo "========================================"
+TOTAL=$((PASS + FAIL + SKIP))
 if [ "$FAIL" -eq 0 ]; then
-    echo "PASS  ($PASS passed)"
+    printf "${GREEN}PASS${NC}  %d passed" "$PASS"
+    [ "$SKIP" -gt 0 ] && printf ", %d skipped" "$SKIP"
+    printf " / %d total\n" "$TOTAL"
     exit 0
 else
-    echo "FAIL  ($FAIL failed, $PASS passed)"
+    printf "${RED}FAIL${NC}  %d failed, %d passed" "$FAIL" "$PASS"
+    [ "$SKIP" -gt 0 ] && printf ", %d skipped" "$SKIP"
+    printf " / %d total\n" "$TOTAL"
+    printf "\nRe-run with --debug for full output on all tests.\n"
     exit 1
 fi
