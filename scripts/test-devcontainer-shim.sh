@@ -151,15 +151,23 @@ for f in "$KERNEL" "$INITRD" "$DISK" "$BINARY" "$SHIM"; do
 done
 [ "$MISSING" -eq 1 ] && echo "Build and sign first. See ONGOING_TASKS.md Build Reference." && exit 1
 
-# Boot the VM and stream its hvc0 console while waiting.
-# pelagos ping calls ensure_running() which spawns the daemon and boots the VM.
-# We run it in the background, then as soon as console.sock appears we attach
-# `pelagos vm console` so the full kernel+init output is visible in real time.
+# Boot the VM, capturing hvc0 console to a log file.
+# Console output is NOT mixed into stdout (terminal escape sequences from the
+# Alpine shell cause garbage on the test output). In --debug mode the log is
+# tailed live to stderr so it doesn't corrupt stdout. On boot failure the last
+# 30 lines are always printed.
 CONSOLE_SOCK="$HOME/.local/share/pelagos/console.sock"
+CONSOLE_LOG=$(mktemp /tmp/pelagos-console-XXXXXX.log)
 PING_TMP=$(mktemp /tmp/pelagos-ping-XXXXXX)
 
-echo "  Booting VM — streaming hvc0 console:"
-echo "  --------------------------------------------------------"
+echo "  Booting VM (console → $CONSOLE_LOG)"
+
+# In debug mode, tail the console log to stderr while booting.
+TAIL_PID=""
+if [ "$DEBUG" -eq 1 ]; then
+    tail -f "$CONSOLE_LOG" >&2 &
+    TAIL_PID=$!
+fi
 
 pelagos ping >"$PING_TMP" 2>&1 &
 PING_PID=$!
@@ -168,11 +176,10 @@ CONSOLE_PID=""
 TICKS=0
 while kill -0 "$PING_PID" 2>/dev/null; do
     if [ -z "$CONSOLE_PID" ] && [ -S "$CONSOLE_SOCK" ]; then
-        # console.sock is live — stream hvc0 to stdout.
-        # stdin=/dev/null so pelagos vm console doesn't enter raw mode.
-        # Use $BINARY directly (the pelagos() shell function adds VM flags already).
+        # console.sock appeared — attach vm console, write to log file only.
+        # stdin=/dev/null: no raw mode. 2>/dev/null: suppress "connected" banner.
         "$BINARY" --kernel "$KERNEL" --initrd "$INITRD" --disk "$DISK" \
-                  --cmdline "console=hvc0" vm console </dev/null 2>/dev/null &
+                  --cmdline "console=hvc0" vm console </dev/null >>"$CONSOLE_LOG" 2>/dev/null &
         CONSOLE_PID=$!
     fi
     sleep 0.5
@@ -180,16 +187,18 @@ while kill -0 "$PING_PID" 2>/dev/null; do
     [ "$TICKS" -gt 140 ] && break  # 70s hard timeout
 done
 
-[ -n "$CONSOLE_PID" ] && kill "$CONSOLE_PID" 2>/dev/null; wait "$CONSOLE_PID" 2>/dev/null || true
-echo ""
-echo "  --------------------------------------------------------"
+# SIGKILL: vm console blocks in read() and ignores SIGTERM.
+[ -n "$CONSOLE_PID" ] && kill -9 "$CONSOLE_PID" 2>/dev/null || true
+[ -n "$TAIL_PID"    ] && kill    "$TAIL_PID"    2>/dev/null || true
+disown "$CONSOLE_PID" 2>/dev/null || true
 
 wait "$PING_PID"; PING_RC=$?
 if [ "$PING_RC" -eq 0 ] && grep -q pong "$PING_TMP" 2>/dev/null; then
-    echo "  [OK]   VM ready"
+    echo "  [OK]   VM ready  (console log: $CONSOLE_LOG)"
 else
     echo "  [FAIL] VM did not respond (exit $PING_RC)."
-    echo "         ping output: $(cat "$PING_TMP")"
+    echo "         Last 30 lines of console:"
+    tail -30 "$CONSOLE_LOG" | sed 's/^/         /'
     echo "         Check: sudo brew services list | grep socket_vmnet"
     rm -f "$PING_TMP"
     exit 1
