@@ -113,10 +113,27 @@ macOS-only). This is intentional and expected.
 
 ---
 
-## Testing with VS Code Dev Containers
+## Testing devcontainer Support — No VS Code in the Test Loop
 
-To point VS Code at `pelagos-docker` instead of the system Docker, add this to
-your VS Code **settings.json** (not devcontainer.json):
+**Rule: every devcontainer requirement must be verifiable outside VS Code.**
+
+VS Code is the ultimate consumer, not a test tool. Do not iterate on devcontainer
+bugs inside VS Code — its failure messages are opaque and it cannot be scripted.
+
+**The test tools:**
+
+| What to test | How |
+|---|---|
+| Individual shim commands | `bash scripts/test-devcontainer-shim.sh [--debug]` |
+| Full `devcontainer up` + exec flows | `bash scripts/test-devcontainer-e2e.sh [--debug] [--suite A\|B\|C\|D]` |
+| Manual IDE attach (last resort) | VS Code "Reopen in Container" |
+
+The e2e script drives `devcontainer` CLI directly with `DOCKER_PATH=pelagos-docker`.
+Fixture projects live in `test/fixtures/` (prebuilt, custom Dockerfile, features,
+postCreateCommand). Run the appropriate suite, fix the failure, re-run. Only open
+VS Code after both T1 and T2 scripts pass.
+
+**VS Code config (for final manual verification only):**
 
 ```json
 "dev.containers.dockerPath": "/Users/cb/Projects/pelagos-mac/target/aarch64-apple-darwin/release/pelagos-docker"

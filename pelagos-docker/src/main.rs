@@ -33,6 +33,7 @@ struct Cli {
     command: DockerCmd,
 }
 
+#[allow(clippy::large_enum_variant)] // Run variant is large by necessity (many CLI flags); instantiated once per process.
 #[derive(Subcommand)]
 enum DockerCmd {
     /// Pull an image.
@@ -77,6 +78,21 @@ enum DockerCmd {
         /// Proxy signals to container process (accepted and ignored).
         #[arg(long = "sig-proxy")]
         sig_proxy: Option<String>,
+        /// Working directory inside the container (accepted and ignored).
+        #[arg(short = 'w', long = "workdir")]
+        workdir: Option<String>,
+        /// Username or UID (accepted and ignored; exec-into handles user).
+        #[arg(short = 'u', long = "user")]
+        user: Option<String>,
+        /// Network mode (accepted and ignored).
+        #[arg(long = "network")]
+        network: Option<String>,
+        /// Use init process (accepted and ignored).
+        #[arg(long = "init")]
+        init: bool,
+        /// Additional labels as key=value (accept repeated --label-file; ignored).
+        #[arg(long = "label-file")]
+        label_file: Vec<String>,
         /// Image and optional command+args.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         image_and_args: Vec<String>,
@@ -277,6 +293,11 @@ fn main() {
             rm: _,
             attach: _,
             sig_proxy,
+            workdir: _,
+            user: _,
+            network: _,
+            init: _,
+            label_file: _,
             image_and_args,
         } => cmd_run(
             &cfg,
@@ -1340,6 +1361,87 @@ fn pull_base_images(cfg: &Config, dockerfile_path: &str, build_args: &[String]) 
     0
 }
 
+/// Substitute `--build-arg` values into `FROM` lines in a Dockerfile.
+///
+/// The devcontainer CLI generates Dockerfiles like:
+///   ARG _DEV_CONTAINERS_BASE_IMAGE=some_stage_alias
+///   FROM ${_DEV_CONTAINERS_BASE_IMAGE} AS dev_containers_target_stage
+/// and passes `--build-arg _DEV_CONTAINERS_BASE_IMAGE=some_stage_alias`.
+///
+/// pelagos build does not substitute ARG values in FROM lines, so it tries to
+/// pull `$_DEV_CONTAINERS_BASE_IMAGE` literally and fails. We preprocess the
+/// Dockerfile here so pelagos receives fully-resolved FROM lines.
+///
+/// Returns the path of a temp file if substitution was needed, or None if the
+/// Dockerfile needed no changes (caller uses the original path).
+fn preprocess_dockerfile_args(dockerfile_path: &str, build_args: &[String]) -> Option<String> {
+    let content = std::fs::read_to_string(dockerfile_path).ok()?;
+
+    // Collect --build-arg values (highest priority).
+    let mut arg_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for kv in build_args {
+        if let Some((k, v)) = kv.split_once('=') {
+            arg_map.insert(k.to_string(), v.to_string());
+        }
+    }
+
+    // Parse global ARG defaults (before the first FROM) as fallback.
+    let mut in_global = true;
+    for line in content.lines() {
+        let t = line.trim();
+        if in_global && t.to_ascii_uppercase().starts_with("FROM") {
+            in_global = false;
+        }
+        if in_global && t.to_ascii_uppercase().starts_with("ARG ") {
+            let rest = t[4..].trim();
+            if let Some((k, v)) = rest.split_once('=') {
+                arg_map
+                    .entry(k.trim().to_string())
+                    .or_insert_with(|| v.trim().to_string());
+            }
+        }
+    }
+
+    // Skip preprocessing if no FROM line contains a variable reference.
+    let needs_subst = content
+        .lines()
+        .any(|l| l.trim().to_ascii_uppercase().starts_with("FROM") && l.contains('$'));
+    if !needs_subst {
+        return None;
+    }
+
+    // Substitute $VAR and ${VAR} in FROM lines.
+    let resolved: String = content
+        .lines()
+        .map(|line| {
+            let mut out = line.to_string();
+            if line.trim().to_ascii_uppercase().starts_with("FROM") {
+                for (k, v) in &arg_map {
+                    out = out.replace(&format!("${{{}}}", k), v);
+                    out = out.replace(&format!("${}", k), v);
+                }
+            }
+            out + "\n"
+        })
+        .collect();
+
+    // Write to a temp file alongside the original Dockerfile.
+    let tmp_path = format!("{}.pelagos-resolved", dockerfile_path);
+    if std::fs::write(&tmp_path, &resolved).is_err() {
+        let tmp_path2 = format!(
+            "/tmp/pelagos-dockerfile-{}.resolved",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_millis()
+        );
+        std::fs::write(&tmp_path2, &resolved).ok()?;
+        return Some(tmp_path2);
+    }
+    Some(tmp_path)
+}
+
 fn cmd_build(
     cfg: &Config,
     tag: &str,
@@ -1349,14 +1451,22 @@ fn cmd_build(
     target: Option<&str>,
     context: &str,
 ) -> i32 {
+    // Preprocess: substitute --build-arg values into FROM lines so pelagos
+    // receives fully-resolved image/stage references.
+    let resolved = preprocess_dockerfile_args(file, build_args);
+    let dockerfile = resolved.as_deref().unwrap_or(file);
+
     // Pull all FROM base images first — pelagos build requires them locally,
     // Docker does this transparently as part of build.
-    let rc = pull_base_images(cfg, file, build_args);
+    let rc = pull_base_images(cfg, dockerfile, build_args);
     if rc != 0 {
+        if let Some(ref p) = resolved {
+            let _ = std::fs::remove_file(p);
+        }
         return rc;
     }
 
-    let mut sub: Vec<OsString> = args(&["build", "-t", tag, "-f", file]);
+    let mut sub: Vec<OsString> = args(&["build", "-t", tag, "-f", dockerfile]);
     for arg in build_args {
         sub.push("--build-arg".into());
         sub.push(arg.into());
@@ -1370,13 +1480,18 @@ fn cmd_build(
     // the same image. Re-wire once pelagos build gains --target support.
     let _ = target;
     sub.push(context.into());
-    match run_pelagos_inherited(cfg, &sub) {
+    let rc = match run_pelagos_inherited(cfg, &sub) {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => {
             eprintln!("pelagos-docker build: {}", e);
             1
         }
+    };
+    // Clean up temp file regardless of exit code.
+    if let Some(ref p) = resolved {
+        let _ = std::fs::remove_file(p);
     }
+    rc
 }
 
 fn cmd_volume(cfg: &Config, sub: &str, name: Option<&str>, quiet: bool) -> i32 {

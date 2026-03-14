@@ -1,5 +1,6 @@
 # pelagos-mac — Ongoing Tasks
 
+
 *Last updated: 2026-03-16*
 
 ---
@@ -52,12 +53,14 @@ remain (issues #91, #92).
 | docker build (native via pelagos) | #68 | ✅ PR #70 |
 | docker cp | #69 | ✅ PR #71 |
 | overlayfs / linux-lts kernel | #89 | ✅ PR #90 |
+
 | docker build multi-stage + features test | #92 | ✅ PR #94+#100 |
 | VS Code full extension integration test | #91 | 🔲 |
 
 ---
 
 ## Remaining Work
+
 
 ### VS Code devcontainer — current state
 

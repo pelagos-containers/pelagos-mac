@@ -4,6 +4,24 @@
 
 ---
 
+## Governing Rule — No VS Code Dependency in Tests
+
+**Every devcontainer requirement must be verifiable outside VS Code.**
+
+VS Code is the ultimate consumer, but it is not a test tool. Its output is opaque,
+its failure messages are vague, and it cannot be scripted. Every R-DC-* requirement
+must have a corresponding test case in `scripts/test-devcontainer-e2e.sh` that uses
+only the `devcontainer` CLI directly — no IDE, no extension, no GUI.
+
+Corollary: if a requirement cannot be tested without VS Code, it is not well-defined.
+Rewrite it until it can be expressed as a `devcontainer` CLI assertion.
+
+The only exception is R-DC-05 (IDE-specific extension behavior) which is inherently
+manual. All other requirements are automatable and must be automated before being
+declared "met".
+
+---
+
 ## How to Use This Document
 
 Every requirement has an ID (`R-VM-*`, `R-SH-*`, `R-DC-*`). Each maps to one or
@@ -473,34 +491,40 @@ produce clear diagnostic output on failures. Run with `--debug` for full output.
 
 ---
 
-### T2 — Integration Test (`test-devcontainer-e2e.sh`, to build)
+### T2 — Integration Test (`test-devcontainer-e2e.sh`)
 
 Drives the actual `devcontainer` CLI (not just `pelagos-docker` directly). Requires
 `devcontainer` CLI installed (`npm install -g @devcontainers/cli`).
 
+Run: `bash scripts/test-devcontainer-e2e.sh [--debug] [--suite A|B|C|D]`
+
 **Test cases:**
 
-| TC-ID | Scenario | Requirements |
-|---|---|---|
-| TC-T2-01 | Pre-built image: `devcontainer up` exits 0, outcome=success | R-DC-01 |
-| TC-T2-02 | Pre-built image: `devcontainer exec -- uname -s` = `Linux` | R-DC-01, R-DC-04 |
-| TC-T2-03 | Pre-built image: `devcontainer exec -- cat /etc/os-release` contains image distro | R-DC-04 |
-| TC-T2-04 | Pre-built image: labels present after up | R-VM-03, R-SH-03 |
-| TC-T2-05 | Pre-built image: second `devcontainer up` on same workspace reuses container | R-DC-01 |
-| TC-T2-06 | Custom Dockerfile: `devcontainer up` builds image then starts container | R-DC-02 |
-| TC-T2-07 | Custom Dockerfile: `devcontainer exec -- <tool-from-dockerfile>` works | R-DC-02, R-DC-04 |
-| TC-T2-08 | `devcontainer up` with `postCreateCommand` runs and succeeds | R-DC-01 |
-| TC-T2-09 | `devcontainer down` stops the container cleanly | R-DC-01 |
-| TC-T2-10 | Features: `devcontainer up` with node feature, `node --version` works | R-DC-03 |
+| TC-ID | Suite | Scenario | Requirements |
+|---|---|---|---|
+| TC-T2-01 | A | Pre-built image: `devcontainer up` exits 0, outcome=success | R-DC-01 |
+| TC-T2-02 | A | Pre-built image: `devcontainer exec -- uname -s` = `Linux` | R-DC-01, R-DC-04 |
+| TC-T2-03 | A | Pre-built image: `devcontainer exec -- cat /etc/os-release` contains image distro | R-DC-04 |
+| TC-T2-04 | A | Pre-built image: `devcontainer.local_folder` label present after up | R-VM-03, R-SH-03 |
+| TC-T2-05 | A | Second `devcontainer up` on same workspace reuses same container | R-DC-01 |
+| TC-T2-06 | B | Custom Dockerfile: `devcontainer up` builds image then starts container | R-DC-02 |
+| TC-T2-07 | B | Custom Dockerfile: marker file from RUN step present in container | R-DC-02, R-DC-04 |
+| TC-T2-07b | B | Custom Dockerfile: `curl` installed by `apt-get` in Dockerfile works | R-DC-02 |
+| TC-T2-08 | D | `devcontainer up` with `postCreateCommand` runs and exits 0 | R-DC-01 |
+| TC-T2-08b | D | `postCreateCommand` ran: marker file exists inside container | R-DC-01 |
+| TC-T2-09 | D | `devcontainer down` stops the container cleanly | R-DC-01 |
+| TC-T2-10 | C | Features: `devcontainer up` with node feature, exits 0 | R-DC-03 |
+| TC-T2-10b | C | Features: `node --version` works inside container | R-DC-03, R-DC-04 |
+| TC-T2-10c | C | Features: `npm --version` works inside container | R-DC-03, R-DC-04 |
 
 **Fixture projects** (`test/fixtures/`):
 
 ```
 test/fixtures/
-  dc-prebuilt/       .devcontainer/devcontainer.json  { "image": "ubuntu:22.04" }
-  dc-dockerfile/     .devcontainer/devcontainer.json + Dockerfile
-  dc-features/       .devcontainer/devcontainer.json  { features: { node:1 } }
-  dc-postcreate/     .devcontainer/devcontainer.json  { postCreateCommand: "touch /tmp/created" }
+  dc-prebuilt/    .devcontainer/devcontainer.json  { "image": "ubuntu:22.04" }
+  dc-dockerfile/  .devcontainer/{devcontainer.json,Dockerfile}  (installs curl, marker file)
+  dc-features/    .devcontainer/devcontainer.json  { features: { node:lts } }
+  dc-postcreate/  .devcontainer/devcontainer.json  { postCreateCommand: "touch /tmp/..." }
 ```
 
 ---

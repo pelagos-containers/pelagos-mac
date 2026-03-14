@@ -11,7 +11,7 @@
 #   Phase 3  ps label filtering (empty — no containers yet)
 #   Phase 4  probe run → container exits → ps -a finds it (R-SH-02, R-SH-03)
 #   Phase 5  docker inspect on EXITED container (R-SH-04, R-SH-05)
-#   Phase 6  docker start → container becomes RUNNING (R-VM-01 via pelagos start)
+#   Phase 6  docker run --detach (persistent container for exec tests, R-VM-01)
 #   Phase 7  docker inspect on RUNNING container (State.Running=true)
 #   Phase 8  docker exec into running container (R-SH-06)
 #   Phase 9  interactive shell server pattern (R-SH-06)
@@ -49,8 +49,9 @@ PASS=0
 FAIL=0
 SKIP=0
 
-# Container name used throughout the session.
-CNAME=""
+# Container names used throughout the session.
+CNAME=""       # probe container (exited after phase 4)
+EXEC_CNAME=""  # long-running container for exec tests (phases 7-10)
 WORKSPACE_FOLDER="$REPO_ROOT"
 DC_CONFIG="$REPO_ROOT/.devcontainer/devcontainer.json"
 DC_IMAGE="public.ecr.aws/docker/library/ubuntu:22.04"
@@ -157,8 +158,8 @@ done
 # tailed live to stderr so it doesn't corrupt stdout. On boot failure the last
 # 30 lines are always printed.
 CONSOLE_SOCK="$HOME/.local/share/pelagos/console.sock"
-CONSOLE_LOG=$(mktemp /tmp/pelagos-console-XXXXXX.log)
-PING_TMP=$(mktemp /tmp/pelagos-ping-XXXXXX)
+CONSOLE_LOG=$(mktemp /tmp/pelagos-consoleXXXXXX)
+PING_TMP=$(mktemp /tmp/pelagos-pingXXXXXX)
 
 echo "  Booting VM (console → $CONSOLE_LOG)"
 
@@ -219,6 +220,8 @@ shim stop "dc-pathlabel"  >/dev/null 2>&1 || true
 shim rm   "dc-pathlabel"  >/dev/null 2>&1 || true
 shim stop "dc-nolabel"    >/dev/null 2>&1 || true
 shim rm   "dc-nolabel"    >/dev/null 2>&1 || true
+shim stop "dc-exectest"   >/dev/null 2>&1 || true
+shim rm   "dc-exectest"   >/dev/null 2>&1 || true
 shim volume rm "vsc-shimtest" >/dev/null 2>&1 || true
 echo "  [OK]   cleaned up any leftovers"
 
@@ -506,29 +509,47 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Phase 6 — docker start → container becomes RUNNING (R-VM-01 / pelagos start)
+# Phase 6 — start a persistent container for exec tests (R-VM-01, R-VM-02)
+#
+# The devcontainer CLI's real flow is:
+#   1. probe run (exits) → determine image exists
+#   2. docker run --detach with a persistent command (VS Code server / sleep)
+#   3. docker exec into the running container
+#
+# We do NOT restart the probe container (its command exits in <1s and it would
+# immediately return to exited state). Instead we run a new detached container
+# with "sleep 60" — the exec tests (phases 7-10) target this container.
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== phase 6: docker start (restart exited container) ==="
+echo "=== phase 6: start persistent container for exec tests ==="
 
-START_OUT=$(shim start "$CNAME" 2>&1)
+EXEC_CNAME="dc-exectest"
+EXEC_OUT=$(shim run --detach \
+    --name "$EXEC_CNAME" \
+    --mount "source=$WORKSPACE_FOLDER,target=/workspace,type=bind" \
+    -l "devcontainer.local_folder=$WORKSPACE_FOLDER" \
+    -l "devcontainer.config_file=$DC_CONFIG" \
+    -e DEVCONTAINER=1 \
+    "$DC_IMAGE" sleep 60 2>&1)
 EC=$?
+
 if [ "$EC" -eq 0 ]; then
-    pass "docker start: exit 0"
+    pass "docker run --detach sleep 60: exit 0"
 else
-    DUMP_ON_FAIL=1 dump "start output" "$START_OUT"; DUMP_ON_FAIL=0
-    fail "docker start" "exit $EC" "exit 0"
+    DUMP_ON_FAIL=1 dump "run output" "$EXEC_OUT"; DUMP_ON_FAIL=0
+    fail "docker run --detach" "exit $EC" "exit 0"
 fi
 
-# Give pelagos a moment to record the new running state.
+# Give pelagos a moment to record running state.
 sleep 1
 
-STATE=$(shim ps --filter "name=$CNAME" | grep "$CNAME" | awk '{print $2}')
+STATE=$(shim ps --filter "name=$EXEC_CNAME" | grep "$EXEC_CNAME" | awk '{print $2}')
 if [ "$STATE" = "running" ]; then
-    pass "container is running after docker start"
+    pass "exec container is running"
 else
-    fail "container state after docker start" "$STATE" "running"
+    DUMP_ON_FAIL=1 dump "ps output" "$(shim ps -a 2>&1)"; DUMP_ON_FAIL=0
+    fail "exec container state" "$STATE" "running"
 fi
 
 # ---------------------------------------------------------------------------
@@ -538,7 +559,7 @@ fi
 echo ""
 echo "=== phase 7: inspect running container ==="
 
-INSPECT_JSON=$(shim inspect --type container "$CNAME")
+INSPECT_JSON=$(shim inspect --type container "$EXEC_CNAME")
 RUNNING=$(echo "$INSPECT_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['State']['Running'])" 2>/dev/null)
 if [ "$RUNNING" = "True" ]; then
     pass "inspect running: State.Running=true (boolean)"
@@ -547,15 +568,15 @@ else
     fail "inspect running: State.Running" "$RUNNING" "True"
 fi
 
-# Labels must survive restart.
+# Labels must be present on the exec container.
 LABEL_FOLDER=$(echo "$INSPECT_JSON" | python3 -c "
 import sys, json
 print(json.load(sys.stdin)[0]['Config']['Labels'].get('devcontainer.local_folder', ''))
 " 2>/dev/null)
 if [ "$LABEL_FOLDER" = "$WORKSPACE_FOLDER" ]; then
-    pass "labels survive docker start: devcontainer.local_folder intact"
+    pass "labels on running container: devcontainer.local_folder intact"
 else
-    fail "labels after docker start" "$LABEL_FOLDER" "$WORKSPACE_FOLDER"
+    fail "labels on running container" "$LABEL_FOLDER" "$WORKSPACE_FOLDER"
 fi
 
 # ---------------------------------------------------------------------------
@@ -565,7 +586,7 @@ fi
 echo ""
 echo "=== phase 8: docker exec ==="
 
-OUT=$(shim exec "$CNAME" /bin/sh -c "echo exec-ok" 2>&1)
+OUT=$(shim exec "$EXEC_CNAME" /bin/sh -c "echo exec-ok" 2>&1)
 if echo "$OUT" | grep -q "exec-ok"; then
     pass "exec: command ran in container"
 else
@@ -573,14 +594,14 @@ else
     fail "exec: echo exec-ok" "$OUT" "exec-ok"
 fi
 
-OUT=$(shim exec "$CNAME" /bin/sh -c "uname -s" 2>&1)
+OUT=$(shim exec "$EXEC_CNAME" /bin/sh -c "uname -s" 2>&1)
 if [ "$OUT" = "Linux" ]; then
     pass "exec: uname -s = Linux (correct rootfs)"
 else
     fail "exec: uname -s" "$OUT" "Linux"
 fi
 
-OUT=$(shim exec "$CNAME" /bin/sh -c "cat /etc/os-release" 2>&1)
+OUT=$(shim exec "$EXEC_CNAME" /bin/sh -c "cat /etc/os-release" 2>&1)
 if echo "$OUT" | grep -qi "ubuntu"; then
     pass "exec: /etc/os-release = Ubuntu (container rootfs, not Alpine/VM)"
 else
@@ -588,7 +609,7 @@ else
     fail "exec: container rootfs" "$OUT" "/etc/os-release containing 'ubuntu'"
 fi
 
-OUT=$(shim exec "$CNAME" /bin/sh -c "exit 42" 2>&1); EC=$?
+OUT=$(shim exec "$EXEC_CNAME" /bin/sh -c "exit 42" 2>&1); EC=$?
 if [ "$EC" -eq 42 ]; then
     pass "exec: exit code propagated (42)"
 else
@@ -611,7 +632,7 @@ echo -n %s; cat /etc/os-release; echo -n %s\n
 exit\n' \
     "$S" "$S" "$S" "$S" "$S" "$S" "$S" "$S" \
     | "$SHIM" exec -i -u root -e VSCODE_REMOTE_CONTAINERS_SESSION=test-session \
-      "$CNAME" /bin/sh 2>&1)
+      "$EXEC_CNAME" /bin/sh 2>&1)
 
 [ "$DEBUG" -eq 1 ] && dump "shell-server output" "$SHELL_OUT"
 
@@ -642,7 +663,7 @@ fi
 
 # env probe — /proc/self/environ may be unavailable (PID ns boundary); printenv is the fallback.
 PROBE_UUID="probe-$$"
-PROBE_OUT=$("$SHIM" exec -i -u root "$CNAME" \
+PROBE_OUT=$("$SHIM" exec -i -u root "$EXEC_CNAME" \
     /bin/bash -l -i -c "echo -n $PROBE_UUID; cat /proc/self/environ; echo -n $PROBE_UUID" 2>&1)
 if echo "$PROBE_OUT" | grep -q "$PROBE_UUID"; then
     pass "env probe: bash -lic ran (sentinel present)"
@@ -654,7 +675,7 @@ fi
 if echo "$PROBE_OUT" | tr '\0' '\n' | grep -q "="; then
     pass "env probe: /proc/self/environ returned K=V data"
 else
-    PRINTENV_OUT=$("$SHIM" exec -i -u root "$CNAME" /bin/sh -c 'printenv' 2>&1)
+    PRINTENV_OUT=$("$SHIM" exec -i -u root "$EXEC_CNAME" /bin/sh -c 'printenv' 2>&1)
     if echo "$PRINTENV_OUT" | grep -q "="; then
         pass "env probe: printenv fallback works (PID ns boundary expected)"
     else
@@ -671,11 +692,11 @@ echo ""
 echo "=== phase 10: system-config patching ==="
 
 # /var/devcontainer marker
-PATCH_OUT=$("$SHIM" exec -i -u root "$CNAME" /bin/sh -c \
+PATCH_OUT=$("$SHIM" exec -i -u root "$EXEC_CNAME" /bin/sh -c \
     "mkdir -p /var/devcontainer && test ! -f /var/devcontainer/.envmarker && touch /var/devcontainer/.envmarker && echo patched-env" 2>&1)
 if echo "$PATCH_OUT" | grep -q "patched-env"; then
     pass "system-config: /var/devcontainer marker created"
-elif "$SHIM" exec "$CNAME" /bin/sh -c "test -f /var/devcontainer/.envmarker && echo exists" 2>&1 | grep -q "exists"; then
+elif "$SHIM" exec "$EXEC_CNAME" /bin/sh -c "test -f /var/devcontainer/.envmarker && echo exists" 2>&1 | grep -q "exists"; then
     pass "system-config: /var/devcontainer marker already exists (idempotent)"
 else
     DUMP_ON_FAIL=1 dump "patch output" "$PATCH_OUT"; DUMP_ON_FAIL=0
@@ -683,7 +704,7 @@ else
 fi
 
 # /etc/environment append
-APPEND_OUT=$("$SHIM" exec -i -u root "$CNAME" /bin/sh -c \
+APPEND_OUT=$("$SHIM" exec -i -u root "$EXEC_CNAME" /bin/sh -c \
     'printf "TEST_DC_VAR=\"test-value\"\n" >> /etc/environment && grep TEST_DC_VAR /etc/environment' 2>&1)
 if echo "$APPEND_OUT" | grep -q "TEST_DC_VAR"; then
     pass "system-config: /etc/environment append"
@@ -693,7 +714,7 @@ else
 fi
 
 # /etc/profile sed (extended regex, in-place)
-SED_OUT=$("$SHIM" exec -i -u root "$CNAME" /bin/sh -c \
+SED_OUT=$("$SHIM" exec -i -u root "$EXEC_CNAME" /bin/sh -c \
     "sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true && echo sed-ok" 2>&1)
 if echo "$SED_OUT" | grep -q "sed-ok"; then
     pass "system-config: sed -i -E on /etc/profile"
@@ -760,12 +781,15 @@ shim stop dc-multilabel >/dev/null 2>&1; shim rm dc-multilabel >/dev/null 2>&1 |
 # ---------------------------------------------------------------------------
 # Phase 13 — label with path value round-trip (R-VM-03, R-SH-03)
 # devcontainer uses label values that are absolute paths like /Users/cb/Projects/foo
+# Use a unique path so it doesn't collide with dc-shimtest which also has
+# devcontainer.local_folder=$WORKSPACE_FOLDER.
 # ---------------------------------------------------------------------------
 
 echo ""
 echo "=== phase 13: label path values ==="
 
-PATH_LABEL="devcontainer.local_folder=$WORKSPACE_FOLDER"
+UNIQUE_PATH="$WORKSPACE_FOLDER/test-phase13-$$"
+PATH_LABEL="devcontainer.local_folder=$UNIQUE_PATH"
 shim run --detach \
     --name dc-pathlabel \
     --label "$PATH_LABEL" \
@@ -773,7 +797,7 @@ shim run --detach \
 
 FOUND=$(shim ps -q -a --filter "label=$PATH_LABEL" | head -1)
 if [ "$FOUND" = "dc-pathlabel" ]; then
-    pass "label path value: filter matches '$WORKSPACE_FOLDER'"
+    pass "label path value: filter matches '$UNIQUE_PATH'"
 else
     DUMP_ON_FAIL=1 dump "all containers" "$(shim ps -a 2>&1)"; DUMP_ON_FAIL=0
     fail "label path value filter" "$FOUND" "dc-pathlabel"
@@ -781,10 +805,10 @@ fi
 
 STORED=$(shim inspect dc-pathlabel 2>/dev/null | python3 -c \
     "import sys,json; print(json.load(sys.stdin)[0]['Config']['Labels'].get('devcontainer.local_folder',''))" 2>/dev/null)
-if [ "$STORED" = "$WORKSPACE_FOLDER" ]; then
+if [ "$STORED" = "$UNIQUE_PATH" ]; then
     pass "label path value: round-trips through inspect verbatim"
 else
-    fail "label path value in inspect" "$STORED" "$WORKSPACE_FOLDER"
+    fail "label path value in inspect" "$STORED" "$UNIQUE_PATH"
 fi
 
 shim stop dc-pathlabel >/dev/null 2>&1; shim rm dc-pathlabel >/dev/null 2>&1 || true
@@ -796,7 +820,7 @@ shim stop dc-pathlabel >/dev/null 2>&1; shim rm dc-pathlabel >/dev/null 2>&1 || 
 echo ""
 echo "=== phase 14: inspect field types ==="
 
-TINSPECT=$(shim inspect --type container "$CNAME" 2>/dev/null)
+TINSPECT=$(shim inspect --type container "$EXEC_CNAME" 2>/dev/null)
 
 # State.Running must be boolean true (not string "true" or "True")
 RUNNING_TYPE=$(echo "$TINSPECT" | python3 -c "
@@ -859,26 +883,41 @@ fi
 echo ""
 echo "=== phase 15: stop and rm ==="
 
-OUT=$(shim stop "$CNAME" 2>&1); EC=$?
+# Stop and remove the exec container (running).
+OUT=$(shim stop "$EXEC_CNAME" 2>&1); EC=$?
 if [ "$EC" -eq 0 ]; then
-    pass "docker stop: exit 0"
+    pass "docker stop (running): exit 0"
 else
-    fail "docker stop" "exit $EC" "exit 0"
+    fail "docker stop (running)" "exit $EC" "exit 0"
 fi
 
+OUT=$(shim rm "$EXEC_CNAME" 2>&1); EC=$?
+if [ "$EC" -eq 0 ]; then
+    pass "docker rm (was running): exit 0"
+else
+    fail "docker rm (was running)" "exit $EC" "exit 0"
+fi
+
+FOUND=$(shim ps -q -a --filter "name=$EXEC_CNAME" 2>/dev/null | head -1)
+if [ -z "$FOUND" ]; then
+    pass "post-rm (exec container): gone from ps -a"
+else
+    fail "post-rm (exec container): still in ps -a" "$FOUND" "(empty)"
+fi
+
+# Remove the probe container (exited).
 OUT=$(shim rm "$CNAME" 2>&1); EC=$?
 if [ "$EC" -eq 0 ]; then
-    pass "docker rm: exit 0"
+    pass "docker rm (probe/exited): exit 0"
 else
-    fail "docker rm" "exit $EC" "exit 0"
+    fail "docker rm (probe/exited)" "exit $EC" "exit 0"
 fi
 
-# Container must no longer appear in ps -a.
 FOUND=$(shim ps -q -a --filter "name=$CNAME" 2>/dev/null | head -1)
 if [ -z "$FOUND" ]; then
-    pass "post-rm: container gone from ps -a"
+    pass "post-rm (probe container): gone from ps -a"
 else
-    fail "post-rm: container still in ps -a" "$FOUND" "(empty)"
+    fail "post-rm (probe container): still in ps -a" "$FOUND" "(empty)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -888,7 +927,7 @@ fi
 echo ""
 echo "=== cleanup ==="
 shim volume rm "vsc-shimtest" >/dev/null 2>&1 || true
-shim rm -f dc-shimtest dc-timertest dc-multilabel dc-pathlabel >/dev/null 2>&1 || true
+shim rm -f dc-shimtest dc-exectest dc-timertest dc-multilabel dc-pathlabel >/dev/null 2>&1 || true
 echo "  done"
 
 # ---------------------------------------------------------------------------
