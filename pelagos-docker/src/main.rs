@@ -17,8 +17,8 @@ use clap::{Parser, Subcommand};
 
 use config::Config;
 use docker_types::{
-    parse_pelagos_ps, ContainerConfig, ContainerInspect, ContainerState, ImageInspect,
-    NetworkSettings, PortBinding, PsRow,
+    parse_pelagos_ps, ContainerConfig, ContainerInspect, ContainerState, HostConfig, ImageInspect,
+    MountEntry, NetworkSettings, PortBinding, PsRow,
 };
 use invoke::{args, run_pelagos, run_pelagos_inherited};
 
@@ -237,6 +237,12 @@ enum DockerCmd {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // `docker -v` prints version info; intercept before clap since it's not a subcommand.
+    if std::env::args().any(|a| a == "-v") {
+        println!("Docker version 20.10.0, build pelagos");
+        process::exit(0);
+    }
+
     let cli = Cli::parse();
     let cfg = match Config::load() {
         Ok(c) => c,
@@ -259,7 +265,7 @@ fn main() {
             entrypoint,
             rm: _,
             attach: _,
-            sig_proxy: _,
+            sig_proxy,
             image_and_args,
         } => cmd_run(
             &cfg,
@@ -273,6 +279,7 @@ fn main() {
                 label_args: labels,
                 entrypoint,
                 image_and_args,
+                sig_proxy,
             },
         ),
         DockerCmd::Exec {
@@ -383,6 +390,7 @@ struct RunOpts {
     label_args: Vec<String>,
     entrypoint: Option<String>,
     image_and_args: Vec<String>,
+    sig_proxy: Option<String>,
 }
 
 /// Parse `--mount type=bind,source=X,target=Y[,...]` into a `-v X:Y` string.
@@ -420,15 +428,40 @@ fn parse_mount_as_volume(mount_spec: &str) -> Option<String> {
 fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
     let RunOpts {
         name,
-        detach,
+        mut detach,
         volumes,
         mounts,
         env,
         ports,
         label_args,
         entrypoint,
-        image_and_args,
+        mut image_and_args,
+        sig_proxy,
     } = opts;
+
+    // Detect the devcontainer probe pattern:
+    //   docker run --sig-proxy=false ... /bin/sh -c "echo Container started"
+    // VS Code sends this to verify the container image is runnable. The container
+    // exits in milliseconds, after which VS Code calls `docker exec` — but by then
+    // the PID is dead and may be reused by an Alpine process, causing exec to enter
+    // the wrong namespace. We intercept this: run the container detached with a
+    // sleep keepalive appended, suppress pelagos's output, and synthesize the
+    // expected "Container started" line ourselves.
+    let is_probe = sig_proxy.as_deref() == Some("false")
+        && image_and_args
+            .iter()
+            .any(|a| a.contains("echo Container started"));
+    if is_probe {
+        // Append keepalive to the shell command so the container stays alive.
+        for a in &mut image_and_args {
+            if a.contains("echo Container started") {
+                *a = format!("{}; while sleep 1000; do :; done", a);
+                break;
+            }
+        }
+        detach = true;
+    }
+
     let (image, cmd_args) = match image_and_args.split_first() {
         Some((img, rest)) => (img.clone(), rest.to_vec()),
         None => {
@@ -493,6 +526,26 @@ fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
         sub.push(image.as_str().into());
         for a in &cmd_args {
             sub.push(a.into());
+        }
+    }
+
+    if is_probe {
+        // Capture output so we can suppress pelagos's "container name" stdout
+        // and instead emit the "Container started" line VS Code expects.
+        let out = match run_pelagos(cfg, &sub) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("pelagos-docker run: {}", e);
+                return 1;
+            }
+        };
+        if out.status.success() {
+            println!("Container started");
+            return 0;
+        } else {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprint!("{}", stderr);
+            return out.status.code().unwrap_or(1);
         }
     }
 
@@ -735,15 +788,21 @@ fn cmd_rm(cfg: &Config, force: bool, name: &str) -> i32 {
     }
 }
 
-/// Fetch native pelagos labels for a container via `pelagos inspect <name>`.
+/// Call `pelagos inspect <name>` and return the parsed JSON value.
+/// The host `pelagos inspect` delegates to `pelagos container inspect` in the guest.
+/// Returns None if the container is not found or the command fails.
+fn pelagos_container_inspect_json(cfg: &Config, name: &str) -> Option<serde_json::Value> {
+    let out = run_pelagos(cfg, &args(&["inspect", name])).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&out.stdout).ok()
+}
+
+/// Fetch native pelagos labels for a container via `pelagos container inspect`.
 /// Returns an empty map if the container is not found or inspect fails.
 fn pelagos_container_labels(cfg: &Config, name: &str) -> HashMap<String, String> {
-    let out = match run_pelagos(cfg, &args(&["inspect", name])) {
-        Ok(o) if o.status.success() => o,
-        _ => return HashMap::new(),
-    };
-    serde_json::from_slice::<serde_json::Value>(&out.stdout)
-        .ok()
+    pelagos_container_inspect_json(cfg, name)
         .and_then(|v| {
             v.get("labels")?.as_object().map(|obj| {
                 obj.iter()
@@ -752,6 +811,57 @@ fn pelagos_container_labels(cfg: &Config, name: &str) -> HashMap<String, String>
             })
         })
         .unwrap_or_default()
+}
+
+/// Read the virtiofs share map from vm.mounts so we can translate VM-internal
+/// paths (e.g. /mnt/share0/Projects/foo) back to host paths (/Users/cb/Projects/foo).
+fn read_vm_share_map() -> Vec<(String, String)> {
+    let path = match dirs_home() {
+        Some(h) => h.join(".local/share/pelagos/vm.mounts"),
+        None => return vec![],
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return vec![],
+    };
+    let entries: Vec<serde_json::Value> = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    entries
+        .into_iter()
+        .filter_map(|e| {
+            let tag = e.get("tag")?.as_str()?.to_string();
+            let host = e.get("host_path")?.as_str()?.to_string();
+            Some((tag, host))
+        })
+        .collect()
+}
+
+fn dirs_home() -> Option<std::path::PathBuf> {
+    std::env::var("HOME").ok().map(std::path::PathBuf::from)
+}
+
+/// Translate a VM-internal volume spec like "/mnt/share0/Projects/foo:/workspace"
+/// to a host-path spec like "/Users/cb/Projects/foo:/workspace".
+fn translate_volume_spec(spec: &str, share_map: &[(String, String)]) -> String {
+    let (vm_src, rest) = match spec.split_once(':') {
+        Some(p) => p,
+        None => return spec.to_string(),
+    };
+    // Try to match /mnt/<tag>/... → <host_path>/...
+    for (tag, host_path) in share_map {
+        let prefix = format!("/mnt/{}", tag);
+        if let Some(suffix) = vm_src.strip_prefix(&prefix) {
+            let host_src = if suffix.is_empty() {
+                host_path.clone()
+            } else {
+                format!("{}{}", host_path.trim_end_matches('/'), suffix)
+            };
+            return format!("{}:{}", host_src, rest);
+        }
+    }
+    spec.to_string()
 }
 
 fn cmd_ps(cfg: &Config, all: bool, quiet: bool, filters: &[String], format: Option<&str>) -> i32 {
@@ -892,20 +1002,86 @@ fn cmd_inspect_container(cfg: &Config, names: &[String]) -> i32 {
 
     // Load port forwards from state file.
     let port_map = load_port_map();
+    // Load virtiofs share map for VM path → host path translation.
+    let share_map = read_vm_share_map();
 
     let mut results: Vec<ContainerInspect> = Vec::new();
     let mut missing = false;
 
     for name in names {
         if let Some(entry) = entries.iter().find(|e| &e.name == name) {
-            let container_labels = pelagos_container_labels(cfg, name);
+            // `pelagos container inspect` gives us labels AND volume/bind specs.
+            let native = pelagos_container_inspect_json(cfg, name);
+            let container_labels = native
+                .as_ref()
+                .and_then(|v| {
+                    v.get("labels")?.as_object().map(|obj| {
+                        obj.iter()
+                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                            .collect()
+                    })
+                })
+                .unwrap_or_default();
+
+            // Collect volume specs from spawn_config, translate VM paths to host paths.
+            let vol_specs: Vec<String> = native
+                .as_ref()
+                .and_then(|v| v.get("spawn_config")?.get("volume")?.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| translate_volume_spec(s, &share_map))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let bind_specs: Vec<String> = native
+                .as_ref()
+                .and_then(|v| v.get("spawn_config")?.get("bind")?.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| translate_volume_spec(s, &share_map))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Build Docker-format Mounts list and HostConfig.Binds from all specs.
+            let all_specs: Vec<&str> = vol_specs
+                .iter()
+                .chain(bind_specs.iter())
+                .map(|s| s.as_str())
+                .collect();
+            let mounts: Vec<MountEntry> = all_specs
+                .iter()
+                .filter_map(|spec| {
+                    let (src, dst) = spec.split_once(':')?;
+                    Some(MountEntry {
+                        mount_type: "bind".into(),
+                        source: src.to_string(),
+                        destination: dst.to_string(),
+                        mode: String::new(),
+                        rw: true,
+                        propagation: "rprivate".into(),
+                    })
+                })
+                .collect();
+            let binds: Vec<String> = all_specs.iter().map(|s| s.to_string()).collect();
+
             let ports = build_ports_map(name, &port_map);
+            // Extract started_at from pelagos inspect for lifecycle marker idempotency.
+            let started_at = native
+                .as_ref()
+                .and_then(|v| v.get("started_at")?.as_str())
+                .unwrap_or("")
+                .to_string();
             results.push(ContainerInspect {
                 id: entry.name.clone(),
                 name: format!("/{}", entry.name),
+                created: started_at.clone(),
                 state: ContainerState {
                     running: entry.status == "running",
                     status: entry.status.clone(),
+                    started_at,
                 },
                 config: ContainerConfig {
                     image: entry.image.clone(),
@@ -916,7 +1092,8 @@ fn cmd_inspect_container(cfg: &Config, names: &[String]) -> i32 {
                     working_dir: String::new(),
                     entrypoint: None,
                 },
-                mounts: vec![],
+                host_config: HostConfig { binds },
+                mounts,
                 network_settings: NetworkSettings { ports },
             });
         } else {
@@ -925,7 +1102,8 @@ fn cmd_inspect_container(cfg: &Config, names: &[String]) -> i32 {
         }
     }
 
-    println!("{}", serde_json::to_string_pretty(&results).unwrap());
+    let json = serde_json::to_string_pretty(&results).unwrap();
+    println!("{}", json);
     if missing {
         1
     } else {

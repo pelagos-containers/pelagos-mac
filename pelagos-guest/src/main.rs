@@ -454,7 +454,39 @@ fn pelagos_bin() -> String {
 
 /// Pull the image, streaming stderr lines back via the provided writer.
 /// Returns Ok(true) on success, Ok(false) on failure (error response sent).
+/// Return true if the image is already present in the local pelagos image store.
+///
+/// pelagos stores images at `<data_dir>/images/<dirname>/manifest.json` where
+/// dirname is the reference with ':', '/', '@' replaced by '_'.  If that file
+/// exists the image is fully cached and no network pull is needed.
+fn image_cached_locally(image: &str) -> bool {
+    // Normalize the reference the same way pelagos does before storing:
+    // add ":latest" if no tag or digest, so the dirname matches what pelagos
+    // wrote (e.g. "public.ecr.aws/docker/library/alpine" →
+    // "public.ecr.aws_docker_library_alpine_latest").
+    let normalized = if !image.contains(':') && !image.contains('@') {
+        format!("{}:latest", image)
+    } else {
+        image.to_string()
+    };
+    let dirname: String = normalized
+        .chars()
+        .map(|c| if matches!(c, ':' | '/' | '@') { '_' } else { c })
+        .collect();
+    std::path::Path::new("/var/lib/pelagos/images")
+        .join(&dirname)
+        .join("manifest.json")
+        .exists()
+}
+
 fn pull_image(writer: &mut impl Write, image: &str) -> std::io::Result<bool> {
+    // Skip the registry round-trip entirely when the image is already cached.
+    // pelagos image pull always checks the remote manifest even for cached
+    // images, which burns through ECR unauthenticated rate limits quickly.
+    if image_cached_locally(image) {
+        return Ok(true);
+    }
+
     let pelagos = pelagos_bin();
 
     const PULL_ATTEMPTS: u32 = 10;
@@ -516,6 +548,7 @@ fn pull_image(writer: &mut impl Write, image: &str) -> std::io::Result<bool> {
     Ok(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_container(
     writer: &mut impl Write,
     image: &str,
@@ -918,6 +951,21 @@ fn handle_cp_from(writer: &mut impl Write, container: &str, src: &str) -> std::i
             return Ok(());
         }
     };
+    let root_fd = match open_root_fd(pid) {
+        Ok(f) => f,
+        Err(e) => {
+            for &nfd in &ns_fds {
+                unsafe { libc::close(nfd) };
+            }
+            send_response(
+                writer,
+                &GuestResponse::Error {
+                    error: format!("cp: open root fd: {}", e),
+                },
+            )?;
+            return Ok(());
+        }
+    };
 
     let src_path = Path::new(src);
     let parent = src_path
@@ -929,7 +977,7 @@ fn handle_cp_from(writer: &mut impl Write, container: &str, src: &str) -> std::i
 
     let mut cmd = Command::new("tar");
     cmd.arg("-cC").arg(parent).arg(name);
-    // Enter container namespaces in the child after fork, before exec.
+    // Enter container namespaces and anchor root dentry to container rootfs.
     unsafe {
         cmd.pre_exec(move || {
             for &ns_fd in &ns_fds {
@@ -938,15 +986,26 @@ fn handle_cp_from(writer: &mut impl Write, container: &str, src: &str) -> std::i
                 }
                 libc::close(ns_fd);
             }
+            if libc::fchdir(root_fd) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::chroot(b".\0".as_ptr() as *const libc::c_char) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::chdir(b"/\0".as_ptr() as *const libc::c_char) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::close(root_fd);
             Ok(())
         });
     }
 
     let output = cmd.output();
-    // Close parent's copies of ns_fds.
+    // Close parent's copies of ns_fds and root_fd.
     for &ns_fd in &ns_fds {
         unsafe { libc::close(ns_fd) };
     }
+    unsafe { libc::close(root_fd) };
 
     let output = match output {
         Ok(o) => o,
@@ -1017,13 +1076,28 @@ fn handle_cp_to(
             return Ok(());
         }
     };
+    let root_fd = match open_root_fd(pid) {
+        Ok(f) => f,
+        Err(e) => {
+            for &nfd in &ns_fds {
+                unsafe { libc::close(nfd) };
+            }
+            send_response(
+                writer,
+                &GuestResponse::Error {
+                    error: format!("cp: open root fd: {}", e),
+                },
+            )?;
+            return Ok(());
+        }
+    };
 
     let mut cmd = Command::new("tar");
     cmd.arg("-xC")
         .arg(dst)
         .stdin(Stdio::piped())
         .stderr(Stdio::piped());
-    // Enter container namespaces in the child after fork, before exec.
+    // Enter container namespaces and anchor root dentry to container rootfs.
     unsafe {
         cmd.pre_exec(move || {
             for &ns_fd in &ns_fds {
@@ -1032,6 +1106,16 @@ fn handle_cp_to(
                 }
                 libc::close(ns_fd);
             }
+            if libc::fchdir(root_fd) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::chroot(b".\0".as_ptr() as *const libc::c_char) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::chdir(b"/\0".as_ptr() as *const libc::c_char) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::close(root_fd);
             Ok(())
         });
     }
@@ -1042,6 +1126,7 @@ fn handle_cp_to(
             for &ns_fd in &ns_fds {
                 unsafe { libc::close(ns_fd) };
             }
+            unsafe { libc::close(root_fd) };
             send_response(
                 writer,
                 &GuestResponse::Error {
@@ -1051,10 +1136,11 @@ fn handle_cp_to(
             return Ok(());
         }
     };
-    // Close parent's copies of ns_fds.
+    // Close parent's copies of ns_fds and root_fd.
     for &ns_fd in &ns_fds {
         unsafe { libc::close(ns_fd) };
     }
+    unsafe { libc::close(root_fd) };
 
     let mut tar_stdin = child.stdin.take().unwrap();
     let copy_result = {
@@ -1190,6 +1276,24 @@ fn handle_exec_into(
         e
     })?;
 
+    // Open /proc/<pid>/root so we can chroot into the container's rootfs after
+    // setns(CLONE_NEWNS). setns changes the mount namespace but does NOT update
+    // the calling process's root dentry — without fchdir+chroot the process
+    // would still resolve absolute paths through the guest (Alpine) root.
+    let root_fd = open_root_fd(pid).map_err(|e| {
+        for &nfd in &ns_fds {
+            unsafe { libc::close(nfd) };
+        }
+        let mut w = FdWriter(fd);
+        let _ = send_response(
+            &mut w,
+            &GuestResponse::Error {
+                error: format!("exec-into: open root fd: {}", e),
+            },
+        );
+        e
+    })?;
+
     // Send ready — both sides switch to framed binary protocol.
     {
         let mut w = FdWriter(fd);
@@ -1199,10 +1303,11 @@ fn handle_exec_into(
     let (prog, rest) = match args.split_first() {
         Some(p) => p,
         None => {
-            // Close ns fds before returning.
-            for fd in ns_fds {
-                unsafe { libc::close(fd) };
+            // Close ns fds and root_fd before returning.
+            for nfd in ns_fds {
+                unsafe { libc::close(nfd) };
             }
+            unsafe { libc::close(root_fd) };
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "exec-into: no command",
@@ -1217,8 +1322,10 @@ fn handle_exec_into(
     }
 
     // Enter namespaces in the child after fork, before exec.
-    // Only async-signal-safe operations (setns, close) are used here.
+    // Only async-signal-safe operations (setns, close, fchdir, chroot) are used.
     // Order: net/uts/ipc first, pid before mnt (so /proc stays readable).
+    // After all setns calls, fchdir+chroot into the container's rootfs so that
+    // absolute paths resolve through the container filesystem, not the guest root.
     unsafe {
         cmd.pre_exec(move || {
             for &ns_fd in &ns_fds {
@@ -1227,27 +1334,42 @@ fn handle_exec_into(
                 }
                 libc::close(ns_fd);
             }
+            // Anchor root dentry to the container rootfs.
+            if libc::fchdir(root_fd) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::chroot(b".\0".as_ptr() as *const libc::c_char) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::chdir(b"/\0".as_ptr() as *const libc::c_char) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::close(root_fd);
             Ok(())
         });
     }
 
-    // Spawn and run; parent closes its copies of ns_fds after spawn returns.
+    // Spawn and run; parent closes its copies of ns_fds and root_fd after spawn.
     let result = if tty {
         handle_exec_tty(fd, cmd)
     } else {
         handle_exec_piped(fd, cmd)
     };
 
-    // Close parent copies of ns_fds (child already closed its copies in pre_exec,
-    // but the parent's copies are duplicates inherited at fork time).
+    // Close parent copies (child already closed its copies in pre_exec).
     for &ns_fd in &ns_fds {
         unsafe { libc::close(ns_fd) };
     }
+    unsafe { libc::close(root_fd) };
 
     result
 }
 
 /// Parse `pelagos ps --all` output and return the PID of the named container.
+///
+/// The PID column can be `-` when the container was created but the process has
+/// not yet started (or failed to start).  Treat `-` as "not running" rather
+/// than returning a parse error.
 fn get_container_pid(container: &str) -> std::io::Result<u32> {
     let out = Command::new(pelagos_bin()).args(["ps", "--all"]).output()?;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1255,7 +1377,17 @@ fn get_container_pid(container: &str) -> std::io::Result<u32> {
     for line in stdout.lines() {
         let cols: Vec<&str> = line.split_whitespace().collect();
         if cols.len() >= 3 && cols[0] == container {
-            return cols[2]
+            let pid_str = cols[2];
+            if pid_str == "-" {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "container '{}' has no running process (PID is '-')",
+                        container
+                    ),
+                ));
+            }
+            return pid_str
                 .parse::<u32>()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e));
         }
@@ -1277,6 +1409,58 @@ unsafe fn call_setns(fd: libc::c_int) -> libc::c_int {
 #[cfg(not(target_os = "linux"))]
 unsafe fn call_setns(_fd: libc::c_int) -> libc::c_int {
     panic!("setns is Linux-only; pelagos-guest only runs inside the Linux VM")
+}
+
+/// Resolve the PID that actually called `pivot_root` for the container.
+///
+/// `pelagos ps` returns `state.pid = P`, the intermediate process spawned by
+/// pelagos.  When a PID namespace is active, P never calls `pivot_root` — that
+/// is done by C, P's only child (PID 1 inside the container).  P's
+/// `/proc/P/root` therefore points to the Alpine (host) root, not the
+/// container's overlay.
+///
+/// If P has exactly one child, that child is C.  Otherwise (no PID namespace,
+/// or the container has forked additional children) P itself is the container
+/// process and its `/proc/P/root` is correct.  Same logic as pelagos's own
+/// `find_root_pid()` in `src/cli/exec.rs`.
+fn find_root_pid(pid: u32) -> u32 {
+    let path = format!("/proc/{}/task/{}/children", pid, pid);
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        let children: Vec<u32> = content
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        if children.len() == 1 {
+            return children[0];
+        }
+    }
+    pid
+}
+
+/// Open the container's root directory as an fd via `/proc/<root_pid>/root`.
+///
+/// `setns(CLONE_NEWNS)` changes the mount namespace but does NOT update the
+/// calling process's root dentry — absolute paths still resolve through the
+/// old (Alpine) root.  Opening this fd BEFORE fork and then doing
+/// `fchdir(root_fd); chroot(".")` AFTER all setns calls in pre_exec is the
+/// correct pattern for entering the container's rootfs (same approach as
+/// pelagos's own exec.rs / nsenter(1)).
+///
+/// Uses `find_root_pid` to resolve P → C when a PID namespace is active, so
+/// that we open the root of the process that actually called `pivot_root`.
+///
+/// Must be opened in the parent (before fork) while `/proc/<pid>/root` is
+/// still accessible.  No O_CLOEXEC: fd must survive into pre_exec.
+fn open_root_fd(pid: u32) -> std::io::Result<libc::c_int> {
+    let root_pid = find_root_pid(pid);
+    let path = format!("/proc/{}/root", root_pid);
+    let cpath = std::ffi::CString::new(path.as_str())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(fd)
 }
 
 /// Open namespace file descriptors for the given PID.

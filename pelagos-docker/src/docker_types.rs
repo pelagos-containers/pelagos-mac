@@ -16,10 +16,35 @@ use serde::Serialize;
 pub struct ContainerInspect {
     pub id: String,
     pub name: String,
+    /// ISO-8601 creation timestamp. Used by devcontainer CLI for lifecycle command markers.
+    pub created: String,
     pub state: ContainerState,
     pub config: ContainerConfig,
-    pub mounts: Vec<serde_json::Value>,
+    pub host_config: HostConfig,
+    pub mounts: Vec<MountEntry>,
     pub network_settings: NetworkSettings,
+}
+
+/// Docker HostConfig — only the fields devcontainer CLI reads.
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct HostConfig {
+    /// Bind mounts in "host:container[:options]" format.
+    pub binds: Vec<String>,
+}
+
+/// One entry in the container's Mounts list.
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MountEntry {
+    #[serde(rename = "Type")]
+    pub mount_type: String,
+    pub source: String,
+    pub destination: String,
+    pub mode: String,
+    #[serde(rename = "RW")]
+    pub rw: bool,
+    pub propagation: String,
 }
 
 #[derive(Serialize)]
@@ -27,6 +52,9 @@ pub struct ContainerInspect {
 pub struct ContainerState {
     pub status: String,
     pub running: bool,
+    /// ISO-8601 timestamp when the container process started.
+    /// Used by devcontainer CLI for lifecycle command idempotency markers.
+    pub started_at: String,
 }
 
 #[derive(Serialize)]
