@@ -557,7 +557,7 @@ fn main() {
                         let share = daemon_args
                             .virtiofs_shares
                             .iter()
-                            .find(|s| s.host_path == PathBuf::from(host_path))?;
+                            .find(|s| s.host_path == std::path::Path::new(host_path))?;
                         Some(GuestMount {
                             tag: share.tag.clone(),
                             subpath: String::new(),
@@ -967,7 +967,7 @@ fn build_virtiofs_shares(volumes: &[String]) -> Vec<daemon::VirtiofsShare> {
         effective.push(volumes[0].clone());
         // Only add paths outside $HOME from the remaining volumes.
         for v in &volumes[1..] {
-            let host = v.splitn(2, ':').next().unwrap_or("");
+            let host = v.split(':').next().unwrap_or("");
             let under_home = home
                 .as_deref()
                 .map(|h| host == h || host.starts_with(&format!("{}/", h)))
@@ -983,7 +983,7 @@ fn build_virtiofs_shares(volumes: &[String]) -> Vec<daemon::VirtiofsShare> {
         }
         // Add user volumes that are outside $HOME as per-path shares.
         for v in volumes {
-            let host = v.splitn(2, ':').next().unwrap_or("");
+            let host = v.split(':').next().unwrap_or("");
             let under_home = home
                 .as_deref()
                 .map(|h| host == h || host.starts_with(&format!("{}/", h)))
@@ -1985,6 +1985,7 @@ mod tests {
             name: None,
             detach: false,
             env: std::collections::HashMap::new(),
+            labels: vec![],
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2005,6 +2006,7 @@ mod tests {
             name: Some("mybox".into()),
             detach: true,
             env: std::collections::HashMap::new(),
+            labels: vec![],
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2026,6 +2028,7 @@ mod tests {
             name: None,
             detach: false,
             env: std::collections::HashMap::new(),
+            labels: vec![],
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
