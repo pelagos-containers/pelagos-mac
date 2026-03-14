@@ -426,6 +426,17 @@ if [ ! -f "$INITRAMFS_OUT" ] \
         echo "  overlay.ko not in modloop — assuming CONFIG_OVERLAY_FS=y (built-in)"
     fi
 
+    # Replace the Alpine initramfs's modules.dep with the one from the modloop.
+    # The Alpine initramfs modules.dep only covers its bundled subset; ours
+    # covers all linux-lts modules so modprobe can resolve full dependency chains.
+    for meta in modules.dep modules.dep.bin modules.alias modules.alias.bin \
+                modules.builtin modules.builtin.bin modules.builtin.modinfo \
+                modules.builtin.alias.bin modules.symbols.bin modules.devname; do
+        src="$MODLOOP_DIR/modules/$KVER/$meta"
+        [ -f "$src" ] && cp "$src" "$INITRD_TMP/lib/modules/$KVER/$meta"
+    done
+    echo "  updated modules.dep from modloop"
+
     mkdir -p "$INITRD_TMP/proc" "$INITRD_TMP/sys" "$INITRD_TMP/dev"
 
     # Add guest daemon and pelagos runtime.
@@ -481,59 +492,30 @@ UDHCPC
     cat > "$INITRD_TMP/init" <<INIT_EOF
 #!/bin/sh
 
-# Bootstrap /dev FIRST.  On linux-lts, virtio_console is a module so the
-# kernel cannot write to hvc0 before init runs.  We must ensure /dev/null
-# exists before any 2>/dev/null redirection, otherwise the redirect fails
-# and prevents the redirected command from executing at all.
-#
-# Strategy (belt+suspenders):
-#   1. mknod /dev/null without any redirect (always works on Linux with root)
-#   2. Try devtmpfs — if supported, overlays /dev with a full set of devices
-# IMPORTANT: do NOT use 2>/dev/null before step 1 succeeds.
-busybox mkdir -p /dev
-busybox mknod /dev/null    c 1 3
-busybox mknod /dev/console c 5 1
-busybox mknod /dev/zero    c 1 5
-busybox mount -t devtmpfs devtmpfs /dev || true
+# Alpine linux-lts has CONFIG_DEVTMPFS_MOUNT=y: the kernel auto-mounts
+# devtmpfs at /dev before executing init, so /dev/null etc. always exist.
+# The explicit mount below is a no-op on a running kernel but keeps the
+# script self-contained if that config were ever absent.
+busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 
 # Mount /proc — needed for the rootfs detection check below.
-busybox mount -t proc proc /proc || true
+busybox mount -t proc proc /proc 2>/dev/null || true
 
 # Pass 1: if we are still on the initramfs rootfs, load kernel modules and
 # switch_root to a tmpfs so that pivot_root(2) works for container spawns.
 if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
     echo "[pelagos-init] pass 1: loading modules"
 
-    # virtio core + PCI transport.
-    # In linux-lts all of these are modules (built-in in linux-virt).
-    # virtio_pci MUST be loaded before any device driver — AVF presents
-    # virtio devices via PCIe; without virtio_pci, no device is probed.
-    busybox insmod /lib/modules/$KVER/kernel/drivers/virtio/virtio_ring.ko
-    busybox insmod /lib/modules/$KVER/kernel/drivers/virtio/virtio.ko
-    busybox insmod /lib/modules/$KVER/kernel/drivers/virtio/virtio_pci_legacy_dev.ko || true
-    busybox insmod /lib/modules/$KVER/kernel/drivers/virtio/virtio_pci_modern_dev.ko || true
-    busybox insmod /lib/modules/$KVER/kernel/drivers/virtio/virtio_pci.ko
-
-    # virtio-console: provides /dev/hvc0 as a character device.
-    # Must be loaded after virtio_pci so the device can be probed.
-    busybox insmod /lib/modules/$KVER/kernel/drivers/char/virtio_console.ko
-
-    # virtio-rng: seed the CSPRNG early so TLS works after switch_root.
-    busybox insmod /lib/modules/$KVER/kernel/drivers/char/hw_random/rng-core.ko || true
-    busybox insmod /lib/modules/$KVER/kernel/drivers/char/hw_random/virtio-rng.ko || true
-
-    # vsock: host↔guest communication channel.
-    busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vsock.ko
-    busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko
-    busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko
-
-    # overlay: required by pelagos for container rootfs overlay mounts.
-    busybox insmod /lib/modules/$KVER/kernel/fs/overlayfs/overlay.ko || true
-
-    # virtio-net: load order: failover → net_failover → virtio_net.
-    busybox insmod /lib/modules/$KVER/kernel/net/core/failover.ko || true
-    busybox insmod /lib/modules/$KVER/kernel/drivers/net/net_failover.ko || true
-    busybox insmod /lib/modules/$KVER/kernel/drivers/net/virtio_net.ko || true
+    # modprobe reads modules.dep and resolves the full dependency chain
+    # automatically — no manual ordering needed.  virtio_pci is listed
+    # first because AVF presents virtio devices over PCIe; it must be
+    # probed before any device driver (console, net, vsock) can attach.
+    modprobe virtio_pci          2>/dev/null || true
+    modprobe virtio_console      2>/dev/null || true
+    modprobe virtio-rng          2>/dev/null || true
+    modprobe vmw_vsock_virtio_transport 2>/dev/null || true
+    modprobe overlay             2>/dev/null || true
+    modprobe virtio_net          2>/dev/null || true
 
     echo "[pelagos-init] pass 1: modules loaded"
 
@@ -590,7 +572,7 @@ done
 
 # Sync clock via NTP.  The VM starts at epoch; TLS cert validation will fail
 # until the clock is correct.  Run ntpd in one-shot (-q) mode; timeout 10s.
-busybox ntpd -n -q -p pool.ntp.org >/dev/null 2>&1 || true
+busybox timeout 10 busybox ntpd -n -q -p pool.ntp.org 2>/dev/null || true
 echo "[pelagos-init] clock: \$(busybox date -u)"
 
 # Mount virtiofs shares from the kernel cmdline (virtiofs.tags=tag0,tag1,...).
