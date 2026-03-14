@@ -151,19 +151,42 @@ for f in "$KERNEL" "$INITRD" "$DISK" "$BINARY" "$SHIM"; do
 done
 [ "$MISSING" -eq 1 ] && echo "Build and sign first. See ONGOING_TASKS.md Build Reference." && exit 1
 
-# VM must be running.
-if ! pelagos ping 2>&1 | grep -q pong; then
-    echo "  [FAIL] VM not responding to ping."
-    echo "         Run: target/aarch64-apple-darwin/release/pelagos ping"
-    echo "         (the VM starts automatically on first pelagos command)"
+# Wait for the VM to respond.
+# pelagos ping calls ensure_running() which boots the VM if needed (up to 60s).
+# Run it in the background and print dots so the user knows it's working.
+PING_TMP=$(mktemp /tmp/pelagos-ping-XXXXXX)
+pelagos ping >"$PING_TMP" 2>&1 &
+PING_PID=$!
+printf "  Waiting for VM (first boot ~20s)"
+while kill -0 "$PING_PID" 2>/dev/null; do
+    printf "."
+    sleep 1
+done
+printf "\n"
+wait "$PING_PID"; PING_RC=$?
+if [ "$PING_RC" -eq 0 ] && grep -q pong "$PING_TMP" 2>/dev/null; then
+    echo "  [OK]   VM responding"
+else
+    echo "  [FAIL] VM did not respond (exit $PING_RC). Output: $(cat "$PING_TMP")"
+    echo "         Check: sudo brew services list | grep socket_vmnet"
+    rm -f "$PING_TMP"
     exit 1
 fi
-echo "  [OK]   VM responding"
+rm -f "$PING_TMP"
 
 # Clean up any leftover test containers from a previous aborted run.
-shim rm -f "dc-shimtest" >/dev/null 2>&1 || true
-shim rm -f "dc-timertest" >/dev/null 2>&1 || true
+shim stop "dc-shimtest"   >/dev/null 2>&1 || true
+shim rm   "dc-shimtest"   >/dev/null 2>&1 || true
+shim stop "dc-timertest"  >/dev/null 2>&1 || true
+shim rm   "dc-timertest"  >/dev/null 2>&1 || true
+shim stop "dc-multilabel" >/dev/null 2>&1 || true
+shim rm   "dc-multilabel" >/dev/null 2>&1 || true
+shim stop "dc-pathlabel"  >/dev/null 2>&1 || true
+shim rm   "dc-pathlabel"  >/dev/null 2>&1 || true
+shim stop "dc-nolabel"    >/dev/null 2>&1 || true
+shim rm   "dc-nolabel"    >/dev/null 2>&1 || true
 shim volume rm "vsc-shimtest" >/dev/null 2>&1 || true
+echo "  [OK]   cleaned up any leftovers"
 
 # ---------------------------------------------------------------------------
 # Phase 1 — pre-flight commands (R-SH-01)
