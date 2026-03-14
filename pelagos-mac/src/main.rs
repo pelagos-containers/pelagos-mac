@@ -557,7 +557,7 @@ fn main() {
                         let share = daemon_args
                             .virtiofs_shares
                             .iter()
-                            .find(|s| s.host_path.as_os_str() == host_path)?;
+                            .find(|s| s.host_path == std::path::Path::new(host_path))?;
                         Some(GuestMount {
                             tag: share.tag.clone(),
                             subpath: String::new(),
@@ -1985,6 +1985,7 @@ mod tests {
             name: None,
             detach: false,
             env: std::collections::HashMap::new(),
+            labels: vec![],
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2005,6 +2006,7 @@ mod tests {
             name: Some("mybox".into()),
             detach: true,
             env: std::collections::HashMap::new(),
+            labels: vec![],
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2026,6 +2028,7 @@ mod tests {
             name: None,
             detach: false,
             env: std::collections::HashMap::new(),
+            labels: vec![],
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

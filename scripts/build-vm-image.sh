@@ -3,23 +3,27 @@
 #
 # Strategy: appended cpio initramfs — no QEMU, no ext4, no interactive install.
 #
-#   1. Download Alpine virt ISO for aarch64 (3.21).
-#   2. Extract vmlinuz-virt and initramfs-virt via hdiutil (macOS).
+#   1. Download Alpine LTS netboot artifacts for aarch64 (3.21):
+#      vmlinuz-lts, initramfs-lts, modloop-lts (no ISO extraction needed).
+#   2. Decompress vmlinuz-lts to a raw arm64 Image (handles zboot/gzip formats).
 #   3. Build pelagos-guest if the binary is missing.
-#   4. Create an "additions" cpio archive containing our custom init and guest binary.
-#   5. Concatenate Alpine's initramfs + our additions cpio.
-#      The Linux kernel processes concatenated cpio archives sequentially; our
-#      files are overlaid on top of Alpine's busybox environment.
-#   6. Create a 64 MiB placeholder raw disk image (AVF requires a block device).
+#   4. Extract vsock/virtio modules from the modloop squashfs.
+#   5. Overlay our custom init + binaries on top of Alpine's initramfs.
+#   6. Repack as a single gzip'd cpio archive.
+#   7. Create a 512 MiB placeholder raw disk image (AVF requires a block device).
+#
+# Kernel flavor detection: if the kernel flavor (lts vs virt) has changed since
+# the last build, stale kernel + initramfs artifacts are deleted automatically
+# before rebuilding, so you never need to manually rm out/ after a flavor switch.
 #
 # Requirements:
-#   - macOS with hdiutil (Xcode CLT) and bsdtar (libarchive, ships with macOS)
-#   - cargo + cargo-zigbuild for the guest cross-compilation step
+#   - macOS with bsdtar (libarchive, ships with macOS) and unsquashfs (squashfs-tools)
+#   - cargo for the guest cross-compilation step
 #
 # Output (all idempotent — re-running skips completed steps):
-#   out/vmlinuz               — Alpine aarch64 kernel
+#   out/vmlinuz               — Alpine aarch64 LTS kernel (raw arm64 Image)
 #   out/initramfs-custom.gz   — Alpine initramfs + pelagos additions
-#   out/root.img              — 64 MiB placeholder disk
+#   out/root.img              — 512 MiB placeholder disk
 #
 # Kernel cmdline to use:  console=hvc0
 # (the kernel's default rdinit=/init picks up our /init from the initramfs)
@@ -33,16 +37,20 @@ WORK="$OUT/work"
 
 ALPINE_VERSION="3.21"
 ALPINE_ARCH="aarch64"
-ALPINE_ISO="alpine-virt-${ALPINE_VERSION}.0-${ALPINE_ARCH}.iso"
-ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/releases/${ALPINE_ARCH}/${ALPINE_ISO}"
+ALPINE_FLAVOR="lts"   # "lts" | "virt" — drives all flavor-specific paths
+ALPINE_NETBOOT="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/releases/${ALPINE_ARCH}/netboot"
+
+VMLINUZ_DL="$WORK/vmlinuz-${ALPINE_FLAVOR}"
+INITRAMFS_DL="$WORK/initramfs-${ALPINE_FLAVOR}"
+MODLOOP_DL="$WORK/modloop-${ALPINE_FLAVOR}"
 
 GUEST_BIN="$REPO_ROOT/target/aarch64-unknown-linux-musl/release/pelagos-guest"
 DISK_IMG="$OUT/root.img"
 INITRAMFS_OUT="$OUT/initramfs-custom.gz"
 KERNEL_OUT="$OUT/vmlinuz"
 
-PELAGOS_VERSION="0.28.0"
-PELAGOS_BIN="$WORK/pelagos-aarch64-linux"
+PELAGOS_VERSION="0.29.0"
+PELAGOS_BIN="$WORK/pelagos-${PELAGOS_VERSION}-aarch64-linux"
 PELAGOS_URL="https://github.com/skeptomai/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-aarch64-linux"
 
 PASST_PKG="passt-2025.01.21-r0"
@@ -81,32 +89,57 @@ echo "[1/8] Setting up output directories"
 mkdir -p "$OUT" "$WORK"
 
 # ---------------------------------------------------------------------------
-echo "[2/8] Downloading Alpine virt ISO ($ALPINE_VERSION $ALPINE_ARCH)"
+# Kernel flavor change detection: if the previously built kernel used a
+# different flavor (e.g. "virt"), delete stale kernel + initramfs artifacts
+# so they are rebuilt with the current flavor.  The disk image is NOT deleted
+# (it holds the persistent OCI image cache and is flavor-independent).
 # ---------------------------------------------------------------------------
-if [ ! -f "$WORK/$ALPINE_ISO" ]; then
-    curl -L --progress-bar -o "$WORK/$ALPINE_ISO" "$ALPINE_URL"
-else
-    echo "  (cached: $WORK/$ALPINE_ISO)"
+FLAVOR_STAMP="$OUT/.kernel-flavor"
+if [ -f "$FLAVOR_STAMP" ]; then
+    OLD_FLAVOR="$(cat "$FLAVOR_STAMP")"
+    if [ "$OLD_FLAVOR" != "$ALPINE_FLAVOR" ]; then
+        echo "  [!] Kernel flavor changed: $OLD_FLAVOR → $ALPINE_FLAVOR"
+        echo "      Removing stale kernel, initramfs, and module cache..."
+        rm -f "$KERNEL_OUT" "$INITRAMFS_OUT"
+        rm -rf "$WORK/modloop_extracted"
+        # Remove old flavor's downloaded netboot artifacts if present.
+        rm -f "$WORK/vmlinuz-${OLD_FLAVOR}" \
+              "$WORK/initramfs-${OLD_FLAVOR}" \
+              "$WORK/modloop-${OLD_FLAVOR}"
+        # Remove old virt ISO artifacts (legacy; no-ops if already gone).
+        rm -f "$WORK"/alpine-virt-*.iso "$WORK/initramfs-virt" "$WORK/modloop-virt"
+        rm -rf "$WORK/iso_boot" "$WORK/boot"
+        # Remove old unversioned pelagos binary (legacy naming without version).
+        rm -f "$WORK/pelagos-aarch64-linux"
+        rm -f "$FLAVOR_STAMP"
+        echo "      Done. Rebuilding with $ALPINE_FLAVOR kernel."
+    fi
 fi
 
 # ---------------------------------------------------------------------------
-echo "[3/8] Extracting kernel and initramfs from ISO"
+echo "[2/8] Downloading Alpine ${ALPINE_FLAVOR} netboot artifacts"
 # ---------------------------------------------------------------------------
-if [ ! -f "$KERNEL_OUT" ] || [ ! -f "$WORK/initramfs-virt" ]; then
-    # bsdtar (libarchive, ships with macOS) reads ISO 9660 natively — no mount needed.
-    ISO_BOOT="$WORK/iso_boot"
-    rm -rf "$ISO_BOOT"
-    mkdir -p "$ISO_BOOT"
-    bsdtar -xf "$WORK/$ALPINE_ISO" -C "$ISO_BOOT" boot/vmlinuz-virt boot/initramfs-virt
+# Download the three netboot files directly — no ISO extraction needed.
+# These are cached in out/work/ after the first download.
+for artifact in vmlinuz initramfs modloop; do
+    dest="$WORK/${artifact}-${ALPINE_FLAVOR}"
+    if [ ! -f "$dest" ]; then
+        echo "  Downloading ${artifact}-${ALPINE_FLAVOR}..."
+        curl -L --progress-bar -o "$dest" "${ALPINE_NETBOOT}/${artifact}-${ALPINE_FLAVOR}"
+    else
+        echo "  (cached: $dest)"
+    fi
+done
 
-    rm -f "$WORK/initramfs-virt"
-    cp "$ISO_BOOT/boot/initramfs-virt" "$WORK/initramfs-virt"
-    RAW_VZ="$ISO_BOOT/boot/vmlinuz-virt"
+# ---------------------------------------------------------------------------
+echo "[3/8] Decompressing/staging kernel"
+# ---------------------------------------------------------------------------
+if [ ! -f "$KERNEL_OUT" ]; then
+    RAW_VZ="$VMLINUZ_DL"
 
-    # Alpine 6.x kernels use arm64 zboot format: an EFI/PE stub ("MZ"+"zimg" magic)
-    # that wraps a gzip-compressed arm64 Image. VZLinuxBootLoader on macOS 26+ does not
-    # accept gzip-compressed kernels; extract the zboot payload and decompress to a raw
-    # arm64 Image (starts with MZ magic + ARMd at 0x38).
+    # Alpine kernels use arm64 zboot format (EFI/PE stub wrapping gzip-compressed
+    # arm64 Image) or plain gzip.  VZLinuxBootLoader on macOS 26+ requires a raw
+    # arm64 Image.  Decompress as needed.
     if python3 - "$RAW_VZ" "$KERNEL_OUT" <<'PY'
 import struct, sys, shutil, gzip
 src, dst = sys.argv[1], sys.argv[2]
@@ -140,24 +173,20 @@ PY
     then
         : # python3 handled the copy/extraction
     else
-        echo "ERROR: kernel extraction failed" >&2; exit 1
+        echo "ERROR: kernel decompression failed" >&2; exit 1
     fi
-
     echo "  kernel:  $KERNEL_OUT"
-    echo "  initrd:  $WORK/initramfs-virt"
 else
-    echo "  (cached)"
+    echo "  (cached: $KERNEL_OUT)"
 fi
 
 # ---------------------------------------------------------------------------
 echo "[4/8] Building pelagos-guest (cross-compile)"
 # ---------------------------------------------------------------------------
 if [ ! -f "$GUEST_BIN" ]; then
-    echo "  Cross-compiling pelagos-guest for aarch64-unknown-linux-gnu..."
-    # Use the rustup-managed cargo so the Linux sysroot is available.
+    echo "  Cross-compiling pelagos-guest for aarch64-unknown-linux-musl..."
     RUSTUP_CARGO="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo"
     if [ ! -x "$RUSTUP_CARGO" ]; then
-        # Fall back to whatever cargo is on PATH — user may have a working setup.
         RUSTUP_CARGO="cargo"
     fi
     PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/opt/homebrew/bin:/usr/bin:$PATH" \
@@ -196,7 +225,6 @@ fi
 # ---------------------------------------------------------------------------
 echo "[5c/8] Downloading dropbear SSH server (${DROPBEAR_PKG})"
 # ---------------------------------------------------------------------------
-# Helper to extract a single .so from an APK (gzip'd tar).
 extract_so() {
     local apk="$1" soname="$2" dest="$3"
     local tmpdir
@@ -217,7 +245,6 @@ if [ ! -f "$DROPBEAR_BIN" ]; then
     if [ ! -f "$DROPBEAR_APK" ]; then
         curl -L --progress-bar -o "$DROPBEAR_APK" "$DROPBEAR_URL"
     fi
-    # APK is a gzip'd tar; extract usr/sbin/dropbear from it.
     DROPBEAR_EXTRACT="$WORK/dropbear-extract"
     rm -rf "$DROPBEAR_EXTRACT"
     mkdir -p "$DROPBEAR_EXTRACT"
@@ -234,7 +261,6 @@ else
     echo "  (cached: $DROPBEAR_BIN)"
 fi
 
-# dropbear runtime deps: libutmps (from utmps-libs), libskarnet (from skalibs-libs), libz (from zlib).
 LIBUTMPS="$WORK/libutmps.so.0.1"
 LIBSKARNET="$WORK/libskarnet.so.2.14"
 LIBZ="$WORK/libz.so.1"
@@ -261,8 +287,6 @@ fi
 # ---------------------------------------------------------------------------
 echo "[5d/8] Downloading pasta (userspace networking for pelagos build)"
 # ---------------------------------------------------------------------------
-# pasta is the userspace-networking binary from the passt package (Alpine community).
-# It enables network access in `pelagos build` RUN steps without bridge/veth modules.
 if [ ! -f "$PASTA_BIN" ]; then
     if [ ! -f "$PASST_APK" ]; then
         curl -L --progress-bar -o "$PASST_APK" "$PASST_URL"
@@ -295,39 +319,39 @@ echo "  (using repo bundle: $CA_BUNDLE)"
 # ---------------------------------------------------------------------------
 echo "[7/8] Building custom initramfs"
 # ---------------------------------------------------------------------------
+
+# --- Extract modloop squashfs and detect kernel version (cached after first run) ---
+MODLOOP_DIR="$WORK/modloop_extracted"
+if [ ! -d "$MODLOOP_DIR/modules" ]; then
+    echo "  Extracting modloop-${ALPINE_FLAVOR} (this takes a moment)..."
+    rm -rf "$MODLOOP_DIR"
+    unsquashfs -force -d "$MODLOOP_DIR" "$MODLOOP_DL" 2>/dev/null || true
+fi
+
+# Detect the kernel version string from the extracted module tree.
+# e.g. "6.6.71-0-lts" — baked into /init insmod paths at image build time.
+KVER=$(ls "$MODLOOP_DIR/modules/" 2>/dev/null | grep -- "-${ALPINE_FLAVOR}$" | head -1)
+if [ -z "$KVER" ]; then
+    echo "ERROR: could not detect kernel version from modloop (looked for *-${ALPINE_FLAVOR} in $MODLOOP_DIR/modules/)" >&2
+    exit 1
+fi
+echo "  kernel version: $KVER"
+
 if [ ! -f "$INITRAMFS_OUT" ] \
     || [ "$GUEST_BIN"   -nt "$INITRAMFS_OUT" ] \
     || [ "$PELAGOS_BIN" -nt "$INITRAMFS_OUT" ] \
     || [ "$0"           -nt "$INITRAMFS_OUT" ]; then
-    KVER="6.12.1-3-virt"
 
-    # --- Extract vsock modules from the modloop squashfs ---
-    MODLOOP="$WORK/modloop-virt"
-    if [ ! -f "$MODLOOP" ]; then
-        bsdtar -xf "$WORK/$ALPINE_ISO" -C "$WORK" boot/modloop-virt
-        mv "$WORK/boot/modloop-virt" "$MODLOOP"
-        rmdir "$WORK/boot" 2>/dev/null || true
-    fi
-    MODLOOP_DIR="$WORK/modloop_extracted"
-    if [ ! -d "$MODLOOP_DIR/modules" ]; then
-        rm -rf "$MODLOOP_DIR"
-        unsquashfs -force -d "$MODLOOP_DIR" "$MODLOOP" 2>/dev/null || true
-    fi
-    VSOCK_SRC="$MODLOOP_DIR/modules/$KVER/kernel/net/vmw_vsock"
+    NETMOD_BASE="$MODLOOP_DIR/modules/$KVER/kernel"
+    VSOCK_SRC="$NETMOD_BASE/net/vmw_vsock"
 
     # --- Extract the Alpine initramfs and patch it in-place ---
-    # bsdtar handles all Alpine's special files (symlinks, device nodes, etc.)
-    # macOS can't create /dev device nodes without root; that's fine — our init
-    # mounts devtmpfs which recreates them from the kernel at boot.
     INITRD_TMP="$WORK/initramfs_tmp"
     rm -rf "$INITRD_TMP"
     mkdir -p "$INITRD_TMP"
-    bsdtar -xpf "$WORK/initramfs-virt" -C "$INITRD_TMP" 2>/dev/null || true
+    bsdtar -xpf "$INITRAMFS_DL" -C "$INITRD_TMP" 2>/dev/null || true
 
     # Create busybox applet symlinks in /bin.
-    # Alpine's virt initramfs only ships /bin/sh → busybox; all other applets
-    # must be symlinked explicitly.  busybox --install is not compiled in.
-    # Only create a symlink if one does not already exist (preserves real binaries).
     echo "  creating busybox applet symlinks"
     for applet in \
         [ awk basename cat chgrp chmod chown chroot clear cmp cp cut date dd \
@@ -338,7 +362,7 @@ if [ ! -f "$INITRAMFS_OUT" ] \
         realpath renice reset rm rmdir route sed seq sha256sum sleep sort \
         split stat strings stty su sync tail tar tee test timeout top touch \
         tr true tty umount uname uniq uptime vi watch wc wget which xargs \
-        yes zcat free blkid
+        yes zcat free blkid mknod ntpd
     do
         target="$INITRD_TMP/bin/$applet"
         [ -e "$target" ] || ln -sf busybox "$target"
@@ -350,14 +374,13 @@ if [ ! -f "$INITRAMFS_OUT" ] \
         if [ -f "$VSOCK_SRC/$ko" ]; then
             cp "$VSOCK_SRC/$ko" "$INITRD_TMP/lib/modules/$KVER/kernel/net/vmw_vsock/$ko"
         else
-            echo "  WARNING: $ko not found — vsock may not work" >&2
+            echo "  WARNING: $ko not found in modloop — vsock may not work" >&2
         fi
     done
 
-    # Add virtio-net and virtio-rng modules (not built into the Alpine virt kernel).
+    # Add virtio-net and virtio-rng modules.
     # virtio-net load order: failover → net_failover → virtio_net
     # virtio-rng load order: rng-core → virtio-rng
-    NETMOD_BASE="$MODLOOP_DIR/modules/$KVER/kernel"
     for src_path in \
         "$NETMOD_BASE/net/core/failover.ko" \
         "$NETMOD_BASE/drivers/net/net_failover.ko" \
@@ -370,11 +393,50 @@ if [ ! -f "$INITRAMFS_OUT" ] \
         if [ -f "$src_path" ]; then
             cp "$src_path" "$dst_dir/"
         else
-            echo "  WARNING: $(basename $src_path) not found" >&2
+            echo "  WARNING: $(basename $src_path) not found in modloop" >&2
         fi
     done
 
-    # Ensure kernel vfs mountpoints exist (Alpine initramfs may already have them).
+    # virtio core modules: depended upon by vsock, virtio-net, virtio-console.
+    # In linux-lts these are modules (built-in in linux-virt).  Stage from the
+    # base Alpine initramfs (which already includes them); also copy from the
+    # modloop to ensure we always have the version that matches this kernel.
+    for ko in virtio_ring.ko virtio.ko; do
+        src="$NETMOD_BASE/drivers/virtio/$ko"
+        if [ -f "$src" ]; then
+            mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/virtio"
+            cp "$src" "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/virtio/$ko"
+        fi
+    done
+    # virtio_console.ko provides /dev/hvc0 as a char device.
+    VC_KO="$NETMOD_BASE/drivers/char/virtio_console.ko"
+    if [ -f "$VC_KO" ]; then
+        mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/char"
+        cp "$VC_KO" "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/char/virtio_console.ko"
+        echo "  staged virtio_console.ko"
+    fi
+
+    # overlayfs: add overlay.ko if present as a module.
+    OVERLAY_KO="$NETMOD_BASE/fs/overlayfs/overlay.ko"
+    if [ -f "$OVERLAY_KO" ]; then
+        mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/fs/overlayfs"
+        cp "$OVERLAY_KO" "$INITRD_TMP/lib/modules/$KVER/kernel/fs/overlayfs/overlay.ko"
+        echo "  staged overlay.ko (module)"
+    else
+        echo "  overlay.ko not in modloop — assuming CONFIG_OVERLAY_FS=y (built-in)"
+    fi
+
+    # Replace the Alpine initramfs's modules.dep with the one from the modloop.
+    # The Alpine initramfs modules.dep only covers its bundled subset; ours
+    # covers all linux-lts modules so modprobe can resolve full dependency chains.
+    for meta in modules.dep modules.dep.bin modules.alias modules.alias.bin \
+                modules.builtin modules.builtin.bin modules.builtin.modinfo \
+                modules.builtin.alias.bin modules.symbols.bin modules.devname; do
+        src="$MODLOOP_DIR/modules/$KVER/$meta"
+        [ -f "$src" ] && cp "$src" "$INITRD_TMP/lib/modules/$KVER/$meta"
+    done
+    echo "  updated modules.dep from modloop"
+
     mkdir -p "$INITRD_TMP/proc" "$INITRD_TMP/sys" "$INITRD_TMP/dev"
 
     # Add guest daemon and pelagos runtime.
@@ -393,22 +455,17 @@ if [ ! -f "$INITRAMFS_OUT" ] \
     cp "$LIBZ"       "$INITRD_TMP/lib/libz.so.1"
 
     # Add pasta — userspace networking for `pelagos build` RUN steps.
-    # pasta proxies TCP/UDP through the host (VM) network without needing
-    # bridge/veth kernel modules.
     mkdir -p "$INITRD_TMP/usr/bin"
     cp "$PASTA_BIN" "$INITRD_TMP/usr/bin/pasta"
     chmod 755 "$INITRD_TMP/usr/bin/pasta"
 
-    # Stage the host's public key as the VM's authorized_keys so 'pelagos vm ssh'
-    # can log in without a password.  The corresponding private key is at
-    # ~/.local/share/pelagos/vm_key on the host.
+    # Stage the host's public key as the VM's authorized_keys.
     mkdir -p "$INITRD_TMP/root/.ssh"
     cp "${SSH_KEY_FILE}.pub" "$INITRD_TMP/root/.ssh/authorized_keys"
     chmod 700 "$INITRD_TMP/root/.ssh"
     chmod 600 "$INITRD_TMP/root/.ssh/authorized_keys"
 
-    # Write a udhcpc default script so DHCP can configure the interface and default route.
-    # Without this script, udhcpc obtains a lease but never applies it (no ip addr, no route).
+    # udhcpc default script so DHCP can configure the interface and default route.
     mkdir -p "$INITRD_TMP/usr/share/udhcpc"
     cat > "$INITRD_TMP/usr/share/udhcpc/default.script" << 'UDHCPC'
 #!/bin/sh
@@ -425,56 +482,43 @@ esac
 UDHCPC
     chmod 755 "$INITRD_TMP/usr/share/udhcpc/default.script"
 
-    # Install Mozilla CA bundle so the statically-linked musl pelagos binary
-    # can verify TLS certificates when pulling OCI images from Docker Hub.
+    # Mozilla CA bundle for TLS inside the VM.
     mkdir -p "$INITRD_TMP/etc/ssl/certs"
     cp "$CA_BUNDLE" "$INITRD_TMP/etc/ssl/certs/ca-certificates.crt"
 
-    # Replace /init: mounts vfs, loads vsock modules, execs pelagos-guest.
-    # Without root= in cmdline the kernel uses the initramfs as root and runs /init.
-    #
-    # This init runs in two passes:
-    #   Pass 1  root = rootfs (initramfs)  →  load modules, copy tree to tmpfs, switch_root
-    #   Pass 2  root = tmpfs               →  mount vfs, network, run pelagos-guest
-    #
-    # pivot_root(2) returns EINVAL when the calling process root is the "rootfs"
-    # pseudo-filesystem (documented in pivot_root(2) §ERRORS). pelagos v0.27+
-    # uses pivot_root for container root isolation, so all container spawns failed
-    # with EINVAL. Escaping to a tmpfs via switch_root fixes this permanently.
+    # Replace /init.
+    # $KVER is expanded here (build-time variable); \$ inside the heredoc are
+    # runtime shell variables that must NOT be expanded at build time.
     cat > "$INITRD_TMP/init" <<INIT_EOF
 #!/bin/sh
 
-# Mount /proc first — needed for the rootfs detection check below.
+# Alpine linux-lts has CONFIG_DEVTMPFS_MOUNT=y: the kernel auto-mounts
+# devtmpfs at /dev before executing init, so /dev/null etc. always exist.
+# The explicit mount below is a no-op on a running kernel but keeps the
+# script self-contained if that config were ever absent.
+busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+
+# Mount /proc — needed for the rootfs detection check below.
 busybox mount -t proc proc /proc 2>/dev/null || true
 
 # Pass 1: if we are still on the initramfs rootfs, load kernel modules and
 # switch_root to a tmpfs so that pivot_root(2) works for container spawns.
 if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
-    echo "[pelagos-init] pass 1: escaping initramfs rootfs via switch_root"
+    echo "[pelagos-init] pass 1: loading modules"
 
-    # Load all kernel modules now; they remain in kernel memory across
-    # switch_root and do not need to be loaded again in pass 2.
+    # modprobe reads modules.dep and resolves the full dependency chain
+    # automatically — no manual ordering needed.  virtio_pci is listed
+    # first because AVF presents virtio devices over PCIe; it must be
+    # probed before any device driver (console, net, vsock) can attach.
+    modprobe virtio_pci          2>/dev/null || true
+    modprobe virtio_console      2>/dev/null || true
+    modprobe virtio-rng          2>/dev/null || true
+    modprobe vmw_vsock_virtio_transport 2>/dev/null || true
+    modprobe overlay             2>/dev/null || true
+    modprobe virtio_net          2>/dev/null || true
 
-    # virtio-rng: seed the CSPRNG early so TLS works after switch_root.
-    busybox insmod /lib/modules/$KVER/kernel/drivers/char/hw_random/rng-core.ko 2>/dev/null || true
-    busybox insmod /lib/modules/$KVER/kernel/drivers/char/hw_random/virtio-rng.ko 2>/dev/null || true
+    echo "[pelagos-init] pass 1: modules loaded"
 
-    # vsock: host↔guest communication channel.
-    busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vsock.ko 2>/dev/null || true
-    busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko 2>/dev/null || true
-    busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko 2>/dev/null || true
-
-    # overlay: required by pelagos for container rootfs overlay mounts.
-    busybox insmod /lib/modules/$KVER/kernel/fs/overlayfs/overlay.ko 2>/dev/null || true
-
-    # virtio-net: not built into the Alpine virt kernel.
-    busybox insmod /lib/modules/$KVER/kernel/net/core/failover.ko 2>/dev/null || true
-    busybox insmod /lib/modules/$KVER/kernel/drivers/net/net_failover.ko 2>/dev/null || true
-    busybox insmod /lib/modules/$KVER/kernel/drivers/net/virtio_net.ko 2>/dev/null || true
-
-    # Build tmpfs root and copy the initramfs tree into it.
-    # The initramfs is already in RAM; copying to tmpfs consumes no additional
-    # memory because the kernel frees the initramfs after switch_root.
     busybox mkdir -p /newroot
     busybox mount -t tmpfs -o size=512m tmpfs /newroot
     for d in bin sbin usr lib etc root mnt var; do
@@ -485,42 +529,33 @@ if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
                      /newroot/tmp /newroot/run /newroot/run/pelagos \
                      /newroot/sys/fs/cgroup /newroot/newroot
 
-    # Pivot into the tmpfs. The kernel frees the initramfs memory after this.
-    # /init re-execs from the new root and falls through to pass 2 below.
     exec busybox switch_root /newroot /init
 
-    # Not reached unless switch_root fails.
     echo "[pelagos-init] FATAL: switch_root failed" >/dev/console 2>&1
     exec busybox sh
 fi
 
-# Pass 2: root is tmpfs. Kernel modules are already loaded (done in pass 1).
-# Mount the remaining virtual filesystems.
-busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+# Pass 2: root is tmpfs. Kernel modules already loaded.
+# Mount devtmpfs WITHOUT 2>/dev/null — /dev is empty here, so the redirect
+# would fail and skip the mount entirely.
+busybox mkdir -p /dev
+busybox mount -t devtmpfs devtmpfs /dev || true
 busybox mkdir -p /dev/pts
 busybox mount -t devpts   devpts   /dev/pts 2>/dev/null || true
-# /proc is already mounted (from the check above); re-mount is a no-op.
 busybox mount -t sysfs    sysfs    /sys 2>/dev/null || true
 busybox mkdir -p /sys/fs/cgroup
 busybox mount -t cgroup2  cgroup2  /sys/fs/cgroup 2>/dev/null || true
 
-# Configure networking via DHCP (socket_vmnet provides a DHCP server through
-# vmnet.framework shared mode).
-#
-# NOTE: udhcpc requires AF_PACKET (CONFIG_PACKET) for initial DHCP discovery.
-# If this kernel lacks CONFIG_PACKET, udhcpc fails and we fall back to a static
-# IP on vmnet's default shared subnet (192.168.64.0/24, gateway 192.168.64.1).
 busybox ip link set lo up
 busybox ip link set eth0 up
 if busybox udhcpc -i eth0 -s /usr/share/udhcpc/default.script -q -t 5 -T 3 >/dev/null 2>&1; then
     echo "[pelagos-init] network: DHCP OK"
 else
-    echo "[pelagos-init] network: DHCP failed (CONFIG_PACKET=n?), using static 192.168.105.2/24"
+    echo "[pelagos-init] network: DHCP failed, using static 192.168.105.2/24"
     busybox ip addr add 192.168.105.2/24 dev eth0
     busybox ip route add default via 192.168.105.1
 fi
 echo "[pelagos-init] network ready"
-# Write a minimal resolv.conf so DNS resolution works inside the VM.
 busybox mkdir -p /etc
 echo 'nameserver 8.8.8.8' > /etc/resolv.conf
 echo 'nameserver 8.8.4.4' >> /etc/resolv.conf
@@ -528,21 +563,19 @@ echo 'nameserver 8.8.4.4' >> /etc/resolv.conf
 busybox mkdir -p /tmp /run /run/pelagos
 busybox mount -t tmpfs tmpfs /tmp
 
-# Gate on network readiness: loop until the first ping to 8.8.8.8 succeeds,
-# then exit immediately. Exits in ~1-2s when the AVF NAT is ready on first
-# attempt; waits up to 30s if it takes longer. Without this gate, pelagos's
-# first outbound TCP connection races with NAT initialization and fails.
+# Gate on network readiness before pelagos-guest starts pulling images.
 i=0
 while [ \$i -lt 15 ]; do
     busybox ping -c 1 -W 3 -q 8.8.8.8 >/dev/null 2>&1 && break
     i=\$((i+1))
 done
 
-# Mount virtiofs shares requested by the host.
-# The host appends "virtiofs.tags=tag0,tag1,..." to the kernel cmdline.
-# User shares (share0, share1, ...) are mounted at /mnt/<tag>.
-# The built-in "pelagos-volumes" share is mounted at /var/lib/pelagos/volumes
-# AFTER the ext2 disk is mounted below — track it with a flag.
+# Sync clock via NTP.  The VM starts at epoch; TLS cert validation will fail
+# until the clock is correct.  Run ntpd in one-shot (-q) mode; timeout 10s.
+busybox timeout 10 busybox ntpd -n -q -p pool.ntp.org 2>/dev/null || true
+echo "[pelagos-init] clock: \$(busybox date -u)"
+
+# Mount virtiofs shares from the kernel cmdline (virtiofs.tags=tag0,tag1,...).
 CMDLINE=\$(busybox cat /proc/cmdline)
 PELAGOS_VOLUMES_PRESENT=0
 for kv in \$CMDLINE; do
@@ -568,9 +601,6 @@ for kv in \$CMDLINE; do
     esac
 done
 
-# Mount the virtio block device (/dev/vda) as the persistent OCI image cache.
-# On first boot the disk is blank; format it as ext2 then mount.
-# On subsequent boots mount directly (format check via blkid).
 busybox mkdir -p /var/lib/pelagos
 if busybox blkid /dev/vda 2>/dev/null | busybox grep -q ext2; then
     busybox mount -t ext2 /dev/vda /var/lib/pelagos 2>/dev/null || true
@@ -580,9 +610,6 @@ else
         busybox mount -t ext2 /dev/vda /var/lib/pelagos 2>/dev/null || true
 fi
 
-# Mount the always-on pelagos-volumes virtiofs share at /var/lib/pelagos/volumes.
-# This makes named volumes (e.g. for VS Code server, persistent data) survive VM restarts
-# by backing them on the macOS host at ~/.local/share/pelagos/volumes/.
 if [ "\$PELAGOS_VOLUMES_PRESENT" = "1" ]; then
     busybox mkdir -p /var/lib/pelagos/volumes
     busybox mount -t virtiofs pelagos-volumes /var/lib/pelagos/volumes && \
@@ -592,41 +619,31 @@ fi
 
 export PELAGOS_IMAGE_STORE=/var/lib/pelagos
 
-# Start dropbear SSH server for 'pelagos vm ssh'.
-# Fix ownership: files were staged by the macOS build user (UID != 0).
-# Dropbear enforces that authorized_keys is owned by the connecting user.
 busybox chown -R 0:0 /root 2>/dev/null || true
-# -s: disable password auth (key-only)
-# -R: generate host keys on demand (ephemeral; new keys each boot — acceptable
-#     because the client uses StrictHostKeyChecking=no)
-# -p 22: listen on port 22
 mkdir -p /etc/dropbear
 dropbear -s -R -p 22 2>/dev/null || true
 
-# Start a root shell on hvc0 for 'pelagos vm console' access.
-# Opens /dev/hvc0 as a bidirectional fd and execs /bin/sh with all I/O wired
-# to it.  Loops so that reconnecting after 'Ctrl-]' detach spawns a fresh shell.
 (while true; do /bin/sh </dev/hvc0 >/dev/hvc0 2>/dev/hvc0; sleep 1; done) &
 
 exec /usr/local/bin/pelagos-guest
 INIT_EOF
     chmod 755 "$INITRD_TMP/init"
 
-    # Repack as a single gzip'd newc cpio (no concatenation needed).
     (cd "$INITRD_TMP" && bsdtar --format=newc -cf - .) | gzip -9 > "$INITRAMFS_OUT"
-
     echo "  initramfs: $INITRAMFS_OUT"
+
+    # Record the flavor so future runs can detect if it changes.
+    echo "$ALPINE_FLAVOR" > "$FLAVOR_STAMP"
 else
     echo "  (cached: $INITRAMFS_OUT)"
+    # Ensure stamp is present even on cache-hit rebuilds.
+    echo "$ALPINE_FLAVOR" > "$FLAVOR_STAMP"
 fi
 
 # ---------------------------------------------------------------------------
 echo "[8/8] Creating placeholder disk image"
 # ---------------------------------------------------------------------------
 if [ ! -f "$DISK_IMG" ]; then
-    # 512 MiB sparse file — formatted as ext2 by the VM on first boot and
-    # mounted at /var/lib/pelagos for the persistent OCI image cache.
-    # Using a sparse file keeps the on-disk footprint near zero until data is written.
     dd if=/dev/zero of="$DISK_IMG" bs=1m count=0 seek=512 2>/dev/null
     echo "  disk: $DISK_IMG (512 MiB sparse, formatted on first boot)"
 else
@@ -636,7 +653,7 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "Done. VM image artifacts:"
-echo "  kernel:   $KERNEL_OUT"
+echo "  kernel:    $KERNEL_OUT  (linux-${ALPINE_FLAVOR} $KVER)"
 echo "  initramfs: $INITRAMFS_OUT"
 echo "  disk:      $DISK_IMG"
 echo ""
