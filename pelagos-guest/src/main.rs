@@ -483,6 +483,50 @@ fn image_cached_locally(image: &str) -> bool {
         .exists()
 }
 
+/// Substitute `$VAR` and `${VAR}` in `text` using the provided map.
+/// Unknown variables are left as empty string (matches Docker behaviour).
+fn substitute_build_args(text: &str, vars: &std::collections::HashMap<String, String>) -> String {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+    while i < len {
+        if bytes[i] == b'$' {
+            if i + 1 < len && bytes[i + 1] == b'{' {
+                if let Some(close) = text[i + 2..].find('}') {
+                    let name = &text[i + 2..i + 2 + close];
+                    if let Some(val) = vars.get(name) {
+                        out.push_str(val);
+                    }
+                    i = i + 2 + close + 1;
+                } else {
+                    out.push('$');
+                    i += 1;
+                }
+            } else if i + 1 < len && (bytes[i + 1].is_ascii_alphanumeric() || bytes[i + 1] == b'_')
+            {
+                let start = i + 1;
+                let mut end = start;
+                while end < len && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                    end += 1;
+                }
+                let name = &text[start..end];
+                if let Some(val) = vars.get(name) {
+                    out.push_str(val);
+                }
+                i = end;
+            } else {
+                out.push('$');
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
 fn pull_image(writer: &mut impl Write, image: &str) -> std::io::Result<bool> {
     // Skip the registry round-trip entirely when the image is already cached.
     // pelagos image pull always checks the remote manifest even for cached
@@ -864,8 +908,40 @@ fn handle_build(
     // registry image (must be pulled) or references an earlier stage by alias
     // (already in the local store — no pull needed).  We track stage aliases as
     // we scan so we can skip them.
+    //
+    // Build-args (--build-arg KEY=VALUE) are substituted into image references
+    // before pulling, since devcontainer and other tooling use patterns like
+    // `FROM $_DEV_CONTAINERS_BASE_IMAGE` with the actual image passed via
+    // --build-arg.
     let dockerfile_path = format!("{}/{}", ctx_dir, dockerfile);
     if let Ok(content) = std::fs::read_to_string(&dockerfile_path) {
+        // Parse --build-arg KEY=VALUE pairs and ARG KEY=DEFAULT declarations
+        // into a substitution map, with build-args taking precedence.
+        let mut arg_defaults: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut build_arg_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for a in build_args {
+            if let Some((k, v)) = a.split_once('=') {
+                build_arg_map.insert(k.to_string(), v.to_string());
+            }
+        }
+        // First pass: collect ARG defaults from the Dockerfile.
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.to_ascii_uppercase().starts_with("ARG") {
+                let rest = trimmed[3..].trim();
+                if let Some((k, v)) = rest.split_once('=') {
+                    arg_defaults
+                        .entry(k.trim().to_string())
+                        .or_insert_with(|| v.trim().to_string());
+                }
+            }
+        }
+        // Merge: build-args override defaults.
+        let mut sub_vars = arg_defaults;
+        sub_vars.extend(build_arg_map);
+
         let mut stage_aliases: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut pulled: std::collections::HashSet<String> = std::collections::HashSet::new();
         for line in content.lines() {
@@ -874,15 +950,21 @@ fn handle_build(
                 continue;
             }
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            let base = parts.get(1).copied().unwrap_or("").to_string();
+            let raw_base = parts.get(1).copied().unwrap_or("");
             // Record "FROM <image> AS <alias>" aliases so subsequent stages that
             // reference them are not mistaken for registry images.
             if parts.len() >= 4 && parts[2].to_ascii_uppercase() == "AS" {
                 stage_aliases.insert(parts[3].to_ascii_lowercase());
             }
-            // Skip scratch, already-pulled images, and stage alias references.
+            // Apply $VAR / ${VAR} substitution using build-args and ARG defaults.
+            let base = substitute_build_args(raw_base, &sub_vars);
+            // Skip scratch, already-pulled images, stage alias references, and
+            // any reference that still contains an unresolved variable (starts
+            // with '$' after substitution — indicates a missing build-arg that
+            // pelagos build itself will handle or fail on clearly).
             if base.is_empty()
                 || base.eq_ignore_ascii_case("scratch")
+                || base.starts_with('$')
                 || pulled.contains(&base.to_ascii_lowercase())
                 || stage_aliases.contains(&base.to_ascii_lowercase())
             {
