@@ -503,7 +503,6 @@ fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
         detach = true;
     }
 
-
     let (image, cmd_args) = match image_and_args.split_first() {
         Some((img, rest)) => (img.clone(), rest.to_vec()),
         None => {
@@ -1378,8 +1377,7 @@ fn preprocess_dockerfile_args(dockerfile_path: &str, build_args: &[String]) -> O
     let content = std::fs::read_to_string(dockerfile_path).ok()?;
 
     // Collect --build-arg values (highest priority).
-    let mut arg_map: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut arg_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for kv in build_args {
         if let Some((k, v)) = kv.split_once('=') {
             arg_map.insert(k.to_string(), v.to_string());

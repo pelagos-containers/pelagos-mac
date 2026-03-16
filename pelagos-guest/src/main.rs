@@ -953,7 +953,7 @@ fn handle_build(
             let raw_base = parts.get(1).copied().unwrap_or("");
             // Record "FROM <image> AS <alias>" aliases so subsequent stages that
             // reference them are not mistaken for registry images.
-            if parts.len() >= 4 && parts[2].to_ascii_uppercase() == "AS" {
+            if parts.len() >= 4 && parts[2].eq_ignore_ascii_case("AS") {
                 stage_aliases.insert(parts[3].to_ascii_lowercase());
             }
             // Apply $VAR / ${VAR} substitution using build-args and ARG defaults.
@@ -1095,10 +1095,10 @@ fn handle_cp_from(writer: &mut impl Write, container: &str, src: &str) -> std::i
             if libc::fchdir(root_fd) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::chroot(b".\0".as_ptr() as *const libc::c_char) < 0 {
+            if libc::chroot(c".".as_ptr()) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::chdir(b"/\0".as_ptr() as *const libc::c_char) < 0 {
+            if libc::chdir(c"/".as_ptr()) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             libc::close(root_fd);
@@ -1215,10 +1215,10 @@ fn handle_cp_to(
             if libc::fchdir(root_fd) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::chroot(b".\0".as_ptr() as *const libc::c_char) < 0 {
+            if libc::chroot(c".".as_ptr()) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::chdir(b"/\0".as_ptr() as *const libc::c_char) < 0 {
+            if libc::chdir(c"/".as_ptr()) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             libc::close(root_fd);
@@ -1472,13 +1472,13 @@ fn handle_exec_into(
             if libc::fchdir(root_fd) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::chroot(b".\0".as_ptr() as *const libc::c_char) < 0 {
+            if libc::chroot(c".".as_ptr()) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             // chdir to the requested working directory (Docker exec -w), or / by default.
             let dir_ptr = match workdir_owned.as_ref() {
                 Some(cstr) => cstr.as_ptr(),
-                None => b"/\0".as_ptr() as *const libc::c_char,
+                None => c"/".as_ptr(),
             };
             if libc::chdir(dir_ptr) < 0 {
                 return Err(std::io::Error::last_os_error());
