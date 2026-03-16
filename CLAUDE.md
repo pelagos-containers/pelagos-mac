@@ -25,6 +25,33 @@ pelagos-mac/      macOS CLI binary: boots VM via pelagos-vz, proxies commands ov
 
 ## ⚠️ CRITICAL DESIGN DECISIONS — READ BEFORE WRITING CODE ⚠️
 
+### No Shim Workarounds for pelagos Bugs
+
+**The `pelagos-docker` shim is a Docker CLI compatibility layer, not a bug-fix
+layer for pelagos.**
+
+When a pelagos capability is missing or broken, the correct response is:
+
+1. File a GitHub issue at `https://github.com/skeptomai/pelagos` with a clear
+   reproduction case.
+2. Fix the bug in pelagos (the right place) — not in the shim.
+3. Update `ONGOING_TASKS.md` to note the pelagos issue number blocking further
+   progress.
+
+**Never add workarounds to the shim** to compensate for pelagos behaviour that
+should be fixed in pelagos itself. Shim workarounds:
+- Mask the real bug from the pelagos maintainer
+- Accumulate as technical debt in the shim
+- Break when pelagos fixes the underlying bug
+
+Legitimate shim responsibilities:
+- Translating Docker CLI flags/subcommands to pelagos equivalents
+- Accepting (and ignoring with a comment) Docker flags that pelagos does not
+  yet support (e.g., `--platform`, `--target`)
+- Docker API format translation (e.g., JSON output shape differences)
+
+---
+
 ### No Subsystem Dependencies
 
 **pelagos-mac has no subsystem-sized external dependencies.**
@@ -113,10 +140,27 @@ macOS-only). This is intentional and expected.
 
 ---
 
-## Testing with VS Code Dev Containers
+## Testing devcontainer Support — No VS Code in the Test Loop
 
-To point VS Code at `pelagos-docker` instead of the system Docker, add this to
-your VS Code **settings.json** (not devcontainer.json):
+**Rule: every devcontainer requirement must be verifiable outside VS Code.**
+
+VS Code is the ultimate consumer, not a test tool. Do not iterate on devcontainer
+bugs inside VS Code — its failure messages are opaque and it cannot be scripted.
+
+**The test tools:**
+
+| What to test | How |
+|---|---|
+| Individual shim commands | `bash scripts/test-devcontainer-shim.sh [--debug]` |
+| Full `devcontainer up` + exec flows | `bash scripts/test-devcontainer-e2e.sh [--debug] [--suite A\|B\|C\|D]` |
+| Manual IDE attach (last resort) | VS Code "Reopen in Container" |
+
+The e2e script drives `devcontainer` CLI directly with `DOCKER_PATH=pelagos-docker`.
+Fixture projects live in `test/fixtures/` (prebuilt, custom Dockerfile, features,
+postCreateCommand). Run the appropriate suite, fix the failure, re-run. Only open
+VS Code after both T1 and T2 scripts pass.
+
+**VS Code config (for final manual verification only):**
 
 ```json
 "dev.containers.dockerPath": "/Users/cb/Projects/pelagos-mac/target/aarch64-apple-darwin/release/pelagos-docker"

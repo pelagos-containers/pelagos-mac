@@ -554,14 +554,13 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 7r: docker build (Dockerfile → OCI image via pelagos build)
+# Test 7r: docker build — single-stage (Dockerfile → OCI image via pelagos build)
 #
-# Creates a minimal Dockerfile (FROM alpine + RUN echo), tars the context,
-# sends it to the guest, and verifies the build succeeds.
+# Creates a minimal single-stage Dockerfile and verifies the build succeeds.
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== test 7r: docker build ==="
+echo "=== test 7r: docker build (single-stage) ==="
 # Stop daemon so build test gets a fresh one (no conflicting mounts).
 "$BINARY" vm stop > /dev/null 2>&1 || true
 sleep 1
@@ -576,9 +575,39 @@ OUT=$(shim build -t "$BUILD_TAG" "$BUILD_CTX" 2>&1)
 BUILD_EXIT=$?
 rm -rf "$BUILD_CTX"
 if [ "$BUILD_EXIT" -eq 0 ]; then
-    pass "docker build: exited 0"
+    pass "docker build single-stage: exited 0"
 else
-    fail "docker build: exit $BUILD_EXIT; output: $OUT"
+    fail "docker build single-stage: exit $BUILD_EXIT; output: $OUT"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 7r2: docker build — multi-stage (simulates devcontainer features pattern)
+#
+# Verifies COPY --from=<stage> works and that all required base images are
+# pulled automatically.  Uses alpine for both stages to keep the test fast.
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== test 7r2: docker build (multi-stage) ==="
+BUILD_CTX2=$(mktemp -d)
+printf 'hello from feature\n' > "$BUILD_CTX2/feature.txt"
+cat > "$BUILD_CTX2/Dockerfile" <<'DOCKERFILE'
+FROM public.ecr.aws/docker/library/alpine:latest AS feature_source
+COPY feature.txt /tmp/feature.txt
+
+FROM public.ecr.aws/docker/library/alpine:latest AS final_stage
+COPY --from=feature_source /tmp/feature.txt /feature.txt
+RUN grep -q "hello from feature" /feature.txt
+CMD ["/bin/sh"]
+DOCKERFILE
+BUILD_TAG2="pelagos-e2e-multistage-$$:latest"
+OUT2=$(shim build -t "$BUILD_TAG2" "$BUILD_CTX2" 2>&1)
+BUILD_EXIT2=$?
+rm -rf "$BUILD_CTX2"
+if [ "$BUILD_EXIT2" -eq 0 ]; then
+    pass "docker build multi-stage: exited 0"
+else
+    fail "docker build multi-stage: exit $BUILD_EXIT2; output: $OUT2"
 fi
 
 # ---------------------------------------------------------------------------

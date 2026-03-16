@@ -1,14 +1,17 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-03-16, branch chore/nat-diagnostics*
+
+*Last updated: 2026-03-16*
 
 ---
 
 ## Current State
 
-**Phase 4 (VS Code devcontainer support) COMPLETE.** All 36 e2e tests pass
-(`bash scripts/test-e2e.sh`). The Docker CLI shim covers the full devcontainer
-lifecycle including `docker build`, `docker cp`, volumes, and networks.
+**Phase 4 (VS Code devcontainer support) largely complete.** The Docker CLI shim
+covers the full devcontainer lifecycle including `docker build` (native via
+`pelagos build` — no Docker Desktop or buildah), `docker cp`, volumes, and
+networks. Multi-stage build support and end-to-end devcontainer features testing
+remain (issues #91, #92).
 
 ### What works today
 
@@ -38,9 +41,7 @@ lifecycle including `docker build`, `docker cp`, volumes, and networks.
 
 ---
 
-## Phase 4 — VS Code Dev Container support (Epic #67) ✅ COMPLETE
-
-All sub-issues resolved:
+## Phase 4 — VS Code Dev Container support (Epic #67)
 
 | Subtask | Issue | Status |
 |---|---|---|
@@ -49,42 +50,26 @@ All sub-issues resolved:
 | glibc/Ubuntu compat | #58 | ✅ PR #61 |
 | docker exec, version, info, inspect | #64 | ✅ PR #65 |
 | devcontainer up smoke test | #66 | ✅ PR #66 |
-| docker build, volume, network | #68 | ✅ PR #70 |
+| docker build (native via pelagos) | #68 | ✅ PR #70 |
 | docker cp | #69 | ✅ PR #71 |
 | overlayfs / linux-lts kernel | #89 | ✅ PR #90 |
-| docker build multi-stage + features test | #92 | 🔶 blocked on pelagos#114 (image ENV not applied) |
+
+| docker build multi-stage + features test | #92 | ✅ PR #94+#100 |
 | VS Code full extension integration test | #91 | 🔲 |
 
 ---
 
 ## Remaining Work
 
+
 ### VS Code devcontainer — current state
 
 T2 integration harness (`scripts/test-devcontainer-e2e.sh`) is built and running.
-Current result: **Suite A (7/7), B (3/3), C (1/3), D (3/3) pass.**
+Current result: **Suite A/B/C/D: 16/16 PASS.**
 
-Suite C TC-T2-10 (`devcontainer up` with node feature) now passes with pelagos v0.52.0
-and the host-clock-sync fix (VM clock injected via `clock.utc=` in kernel cmdline).
-
-Suite C TC-T2-10b/10c (`node --version`, `npm --version`) fail with
-`exec spawn failed: No such file or directory` because `pelagos exec-into` does not
-apply the image's Dockerfile `ENV` layer to the exec'd process environment.
-Node is installed but `PATH` does not include `/usr/local/share/nvm/current/bin`.
-
-**Blocked on pelagos#115** — filed 2026-03-16.
-No workaround in the shim (CLAUDE.md: fix belongs in pelagos).
-(pelagos#114 fixed `run` PATH; #115 is the same fix needed for `exec-into`.)
-
-Changes in this branch (chore/nat-diagnostics):
-- `exec-into` `-w`/`--workdir` support (container working directory)
-- `devcontainer up` probe detection fix for CLI 0.84+ built-in keepalive
-- `RUST_LOG=debug` removed from VM init script (was causing output noise)
-- Default VM memory increased to 2048 MiB (OOM fix for Node.js nvm install)
-- Persistent disk increased to 8192 MiB
-- pelagos v0.52.0 integrated
-- VM clock synced from host at boot via `clock.utc=` kernel cmdline parameter
-  (removes NTP from the critical startup path)
+All Suite C tests now pass (node v24.14.0, npm 11.9.0) with pelagos v0.53.0
+(fixes exec-into ENV/PATH, issue #115) and the host-clock-sync fix
+(VM clock injected via `clock.utc=` in kernel cmdline, no NTP on startup path).
 
 ### VS Code full extension integration test (#91)
 
@@ -95,6 +80,8 @@ and verify: IDE attaches, extensions install, terminal opens inside container.
 
 - **`docker volume inspect`** — `create/ls/rm` works; `inspect` not implemented.
   Bind mounts cover most real use cases so this is low priority.
+- **Dynamic virtiofs shares** (#74) — current per-path shares require knowing all
+  paths at VM start time; proper dynamic sharing needed for general-purpose use.
 - **Signed installer** — `.pkg` for distribution. Requires Developer ID + notarization
   + `com.apple.security.virtualization` entitlement. Not yet scoped.
 
@@ -108,8 +95,9 @@ and verify: IDE attaches, extensions install, terminal opens inside container.
   `setns(2)` via `pre_exec`. See `docs/GUEST_CONTAINER_EXEC.md`.
 - **VM networking:** socket_vmnet, subnet `192.168.105.x`, gateway `192.168.105.1`.
   Homebrew socket path: `/opt/homebrew/var/run/socket_vmnet` (no `.shared` suffix).
-- **`pelagos build` requires `--network none`** in the VM (no bridge/veth kernel
-  modules). Build steps that need network access require a kernel extension.
+- **`pelagos build` uses `--network pasta`** inside the VM. `pasta` (userspace
+  TCP/UDP proxy) is staged into the initramfs. Bridge/veth kernel modules are not
+  required. RUN steps that need network access work via pasta.
 - **`pelagos network create` requires `--subnet <CIDR>`** explicitly; the shim
   auto-generates `10.88.<hash>.0/24` from the network name.
 - **Network names max 12 chars** — bridge device name is `rm-<name>`, IFNAMSIZ=15.

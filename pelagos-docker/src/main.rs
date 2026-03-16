@@ -33,6 +33,7 @@ struct Cli {
     command: DockerCmd,
 }
 
+#[allow(clippy::large_enum_variant)] // Run variant is large by necessity (many CLI flags); instantiated once per process.
 #[derive(Subcommand)]
 enum DockerCmd {
     /// Pull an image.
@@ -74,9 +75,24 @@ enum DockerCmd {
         /// Attach to stdout/stderr (ignored: output is always streamed).
         #[arg(short = 'a', long = "attach")]
         attach: Vec<String>,
-        /// Proxy signals to container process (ignored).
+        /// Proxy signals to container process (accepted and ignored).
         #[arg(long = "sig-proxy")]
         sig_proxy: Option<String>,
+        /// Working directory inside the container (accepted and ignored).
+        #[arg(short = 'w', long = "workdir")]
+        workdir: Option<String>,
+        /// Username or UID (accepted and ignored; exec-into handles user).
+        #[arg(short = 'u', long = "user")]
+        user: Option<String>,
+        /// Network mode (accepted and ignored).
+        #[arg(long = "network")]
+        network: Option<String>,
+        /// Use init process (accepted and ignored).
+        #[arg(long = "init")]
+        init: bool,
+        /// Additional labels as key=value (accept repeated --label-file; ignored).
+        #[arg(long = "label-file")]
+        label_file: Vec<String>,
         /// Image and optional command+args.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         image_and_args: Vec<String>,
@@ -233,6 +249,14 @@ enum DockerCmd {
         /// Destination: `container:path` or local path.
         dst: String,
     },
+    /// Manage Docker contexts (stub — always returns a single default context).
+    Context {
+        /// Subcommand: ls, inspect, use, create, rm, show, update, export, import.
+        sub: String,
+        /// Optional arguments (context name, flags, etc.).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +293,11 @@ fn main() {
             rm: _,
             attach: _,
             sig_proxy,
+            workdir: _,
+            user: _,
+            network: _,
+            init: _,
+            label_file: _,
             image_and_args,
         } => cmd_run(
             &cfg,
@@ -343,6 +372,7 @@ fn main() {
         DockerCmd::Volume { sub, name, quiet } => cmd_volume(&cfg, &sub, name.as_deref(), quiet),
         DockerCmd::Network { sub, name, quiet } => cmd_network(&cfg, &sub, name.as_deref(), quiet),
         DockerCmd::Cp { src, dst } => cmd_cp(&cfg, &src, &dst),
+        DockerCmd::Context { sub, args: _ } => cmd_context(&sub),
     };
 
     process::exit(exit_code);
@@ -537,26 +567,6 @@ fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
         sub.push(image.as_str().into());
         for a in &cmd_args {
             sub.push(a.into());
-        }
-    }
-
-    if is_probe {
-        // Capture output so we can suppress pelagos's "container name" stdout
-        // and instead emit the "Container started" line VS Code expects.
-        let out = match run_pelagos(cfg, &sub) {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("pelagos-docker run: {}", e);
-                return 1;
-            }
-        };
-        if out.status.success() {
-            println!("Container started");
-            return 0;
-        } else {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            eprint!("{}", stderr);
-            return out.status.code().unwrap_or(1);
         }
     }
 
@@ -1028,7 +1038,7 @@ fn cmd_inspect_container(cfg: &Config, names: &[String]) -> i32 {
         if let Some(entry) = entries.iter().find(|e| &e.name == name) {
             // `pelagos container inspect` gives us labels AND volume/bind specs.
             let native = pelagos_container_inspect_json(cfg, name);
-            let container_labels = native
+            let container_labels: HashMap<String, String> = native
                 .as_ref()
                 .and_then(|v| {
                     v.get("labels")?.as_object().map(|obj| {
@@ -1350,6 +1360,86 @@ fn pull_base_images(cfg: &Config, dockerfile_path: &str, build_args: &[String]) 
     0
 }
 
+/// Substitute `--build-arg` values into `FROM` lines in a Dockerfile.
+///
+/// The devcontainer CLI generates Dockerfiles like:
+///   ARG _DEV_CONTAINERS_BASE_IMAGE=some_stage_alias
+///   FROM ${_DEV_CONTAINERS_BASE_IMAGE} AS dev_containers_target_stage
+/// and passes `--build-arg _DEV_CONTAINERS_BASE_IMAGE=some_stage_alias`.
+///
+/// pelagos build does not substitute ARG values in FROM lines, so it tries to
+/// pull `$_DEV_CONTAINERS_BASE_IMAGE` literally and fails. We preprocess the
+/// Dockerfile here so pelagos receives fully-resolved FROM lines.
+///
+/// Returns the path of a temp file if substitution was needed, or None if the
+/// Dockerfile needed no changes (caller uses the original path).
+fn preprocess_dockerfile_args(dockerfile_path: &str, build_args: &[String]) -> Option<String> {
+    let content = std::fs::read_to_string(dockerfile_path).ok()?;
+
+    // Collect --build-arg values (highest priority).
+    let mut arg_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for kv in build_args {
+        if let Some((k, v)) = kv.split_once('=') {
+            arg_map.insert(k.to_string(), v.to_string());
+        }
+    }
+
+    // Parse global ARG defaults (before the first FROM) as fallback.
+    let mut in_global = true;
+    for line in content.lines() {
+        let t = line.trim();
+        if in_global && t.to_ascii_uppercase().starts_with("FROM") {
+            in_global = false;
+        }
+        if in_global && t.to_ascii_uppercase().starts_with("ARG ") {
+            let rest = t[4..].trim();
+            if let Some((k, v)) = rest.split_once('=') {
+                arg_map
+                    .entry(k.trim().to_string())
+                    .or_insert_with(|| v.trim().to_string());
+            }
+        }
+    }
+
+    // Skip preprocessing if no FROM line contains a variable reference.
+    let needs_subst = content
+        .lines()
+        .any(|l| l.trim().to_ascii_uppercase().starts_with("FROM") && l.contains('$'));
+    if !needs_subst {
+        return None;
+    }
+
+    // Substitute $VAR and ${VAR} in FROM lines.
+    let resolved: String = content
+        .lines()
+        .map(|line| {
+            let mut out = line.to_string();
+            if line.trim().to_ascii_uppercase().starts_with("FROM") {
+                for (k, v) in &arg_map {
+                    out = out.replace(&format!("${{{}}}", k), v);
+                    out = out.replace(&format!("${}", k), v);
+                }
+            }
+            out + "\n"
+        })
+        .collect();
+
+    // Write to a temp file alongside the original Dockerfile.
+    let tmp_path = format!("{}.pelagos-resolved", dockerfile_path);
+    if std::fs::write(&tmp_path, &resolved).is_err() {
+        let tmp_path2 = format!(
+            "/tmp/pelagos-dockerfile-{}.resolved",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_millis()
+        );
+        std::fs::write(&tmp_path2, &resolved).ok()?;
+        return Some(tmp_path2);
+    }
+    Some(tmp_path)
+}
+
 fn cmd_build(
     cfg: &Config,
     tag: &str,
@@ -1359,14 +1449,22 @@ fn cmd_build(
     target: Option<&str>,
     context: &str,
 ) -> i32 {
+    // Preprocess: substitute --build-arg values into FROM lines so pelagos
+    // receives fully-resolved image/stage references.
+    let resolved = preprocess_dockerfile_args(file, build_args);
+    let dockerfile = resolved.as_deref().unwrap_or(file);
+
     // Pull all FROM base images first — pelagos build requires them locally,
     // Docker does this transparently as part of build.
-    let rc = pull_base_images(cfg, file, build_args);
+    let rc = pull_base_images(cfg, dockerfile, build_args);
     if rc != 0 {
+        if let Some(ref p) = resolved {
+            let _ = std::fs::remove_file(p);
+        }
         return rc;
     }
 
-    let mut sub: Vec<OsString> = args(&["build", "-t", tag, "-f", file]);
+    let mut sub: Vec<OsString> = args(&["build", "-t", tag, "-f", dockerfile]);
     for arg in build_args {
         sub.push("--build-arg".into());
         sub.push(arg.into());
@@ -1377,7 +1475,7 @@ fn cmd_build(
     // --target is accepted but not forwarded: pelagos build does not yet support
     // multi-stage target selection. The devcontainer CLI always makes
     // dev_containers_target_stage the final stage, so omitting --target produces
-    // the same image. Re-wire once pelagos build gains --target support.
+    // the same image. Track as pelagos issue #TBD.
     let _ = target;
     sub.push(context.into());
     match run_pelagos_inherited(cfg, &sub) {
@@ -1431,6 +1529,37 @@ fn cmd_cp(cfg: &Config, src: &str, dst: &str) -> i32 {
             eprintln!("pelagos-docker cp: {}", e);
             1
         }
+    }
+}
+
+/// `docker context` — devcontainer pre-flight check.
+///
+/// devcontainer CLI calls `docker context ls --format {{json .}}` to find which
+/// context to use.  We always have exactly one context (the pelagos VM), so
+/// return a single-entry list describing it.  All other subcommands are no-ops.
+fn cmd_context(sub: &str) -> i32 {
+    match sub {
+        "ls" => {
+            // One JSON object per line, matching Docker's --format {{json .}} output.
+            println!(
+                "{}",
+                serde_json::json!({
+                    "Current": true,
+                    "Description": "pelagos VM",
+                    "DockerEndpoint": "",
+                    "Error": "",
+                    "Name": "default",
+                    "StackOrchestrator": ""
+                })
+            );
+            0
+        }
+        "show" => {
+            println!("default");
+            0
+        }
+        // inspect / use / create / rm / update / export / import — accept silently.
+        _ => 0,
     }
 }
 
