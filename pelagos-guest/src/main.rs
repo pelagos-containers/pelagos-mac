@@ -1356,8 +1356,8 @@ fn handle_exec_into(
     // Order: net/uts/ipc first, pid before mnt (so /proc stays readable).
     // After all setns calls, fchdir+chroot into the container's rootfs so that
     // absolute paths resolve through the container filesystem, not the guest root.
-    let workdir_owned: Option<std::ffi::CString> = workdir
-        .and_then(|w| std::ffi::CString::new(w.as_bytes()).ok());
+    let workdir_owned: Option<std::ffi::CString> =
+        workdir.and_then(|w| std::ffi::CString::new(w.as_bytes()).ok());
     unsafe {
         cmd.pre_exec(move || {
             for &ns_fd in &ns_fds {

@@ -1,6 +1,6 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-03-16, branch fix/exec-into-container-env*
+*Last updated: 2026-03-16, branch chore/nat-diagnostics*
 
 ---
 
@@ -59,25 +59,32 @@ All sub-issues resolved:
 
 ## Remaining Work
 
-### VS Code devcontainer — ready to re-test
+### VS Code devcontainer — current state
 
 T2 integration harness (`scripts/test-devcontainer-e2e.sh`) is built and running.
-Current result: **Suites A (7/7), B (3/3), D (3/3) pass. Suite C: 1/3 pass.**
+Current result: **Suite A (7/7), B (3/3), C (1/3), D (3/3) pass.**
+
+Suite C TC-T2-10 (`devcontainer up` with node feature) now passes with pelagos v0.52.0
+and the host-clock-sync fix (VM clock injected via `clock.utc=` in kernel cmdline).
 
 Suite C TC-T2-10b/10c (`node --version`, `npm --version`) fail with
-`exec spawn failed: No such file or directory` because `pelagos run` does not
-apply the image's Dockerfile `ENV` layer to the container process environment.
+`exec spawn failed: No such file or directory` because `pelagos exec-into` does not
+apply the image's Dockerfile `ENV` layer to the exec'd process environment.
 Node is installed but `PATH` does not include `/usr/local/share/nvm/current/bin`.
 
-**Blocked on pelagos#114** — filed 2026-03-16.
+**Blocked on pelagos#115** — filed 2026-03-16.
 No workaround in the shim (CLAUDE.md: fix belongs in pelagos).
+(pelagos#114 fixed `run` PATH; #115 is the same fix needed for `exec-into`.)
 
-This branch (fix/exec-into-container-env) also contains:
+Changes in this branch (chore/nat-diagnostics):
 - `exec-into` `-w`/`--workdir` support (container working directory)
 - `devcontainer up` probe detection fix for CLI 0.84+ built-in keepalive
 - `RUST_LOG=debug` removed from VM init script (was causing output noise)
 - Default VM memory increased to 2048 MiB (OOM fix for Node.js nvm install)
 - Persistent disk increased to 8192 MiB
+- pelagos v0.52.0 integrated
+- VM clock synced from host at boot via `clock.utc=` kernel cmdline parameter
+  (removes NTP from the critical startup path)
 
 ### VS Code full extension integration test (#91)
 
