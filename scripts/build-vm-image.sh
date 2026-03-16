@@ -49,7 +49,7 @@ DISK_IMG="$OUT/root.img"
 INITRAMFS_OUT="$OUT/initramfs-custom.gz"
 KERNEL_OUT="$OUT/vmlinuz"
 
-PELAGOS_VERSION="0.51.0"
+PELAGOS_VERSION="0.53.0"
 PELAGOS_BIN="$WORK/pelagos-${PELAGOS_VERSION}-aarch64-linux"
 PELAGOS_URL="https://github.com/skeptomai/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-aarch64-linux"
 # If a local build exists (from /Users/cb/Projects/pelagos), use it instead of downloading.
@@ -697,10 +697,17 @@ while [ \$i -lt 15 ]; do
     i=\$((i+1))
 done
 
-# Sync clock via NTP.  The VM starts at epoch; TLS cert validation will fail
-# until the clock is correct.  Run ntpd in one-shot (-q) mode; timeout 10s.
-busybox timeout 10 busybox ntpd -n -q -p pool.ntp.org 2>/dev/null || true
-echo "[pelagos-init] clock: \$(busybox date -u)"
+# Sync clock from the host UTC time embedded in the kernel cmdline by pelagos-mac.
+# Format: clock.utc=YYYY-MM-DDTHH:MM:SS — busybox date -s accepts "YYYY-MM-DD HH:MM:SS".
+_utc=\$(busybox cat /proc/cmdline | busybox tr ' ' '\n' | busybox grep '^clock\.utc=' | busybox head -1 | busybox cut -d= -f2)
+if [ -n "\$_utc" ]; then
+    _utc_space=\$(echo "\$_utc" | busybox tr 'T' ' ')
+    busybox date -s "\$_utc_space" >/dev/null 2>&1 && \
+        echo "[pelagos-init] clock set from host: \$(busybox date -u)" || \
+        echo "[pelagos-init] WARNING: date -s failed (utc=\$_utc)" >&2
+else
+    echo "[pelagos-init] WARNING: clock.utc not in cmdline, clock may be wrong" >&2
+fi
 
 # Mount virtiofs shares from the kernel cmdline (virtiofs.tags=tag0,tag1,...).
 CMDLINE=\$(busybox cat /proc/cmdline)

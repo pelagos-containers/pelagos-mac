@@ -173,7 +173,7 @@ fi
 echo "  [OK]   devcontainer $(devcontainer --version 2>/dev/null)"
 
 # Check VM is up.
-PING_OUT=$(pelagos ping 2>&1)
+PING_OUT=$("$BINARY" --kernel "$KERNEL" --initrd "$INITRD" --disk "$DISK" ping 2>&1)
 if echo "$PING_OUT" | grep -q pong; then
     echo "  [OK]   VM responsive"
 else
