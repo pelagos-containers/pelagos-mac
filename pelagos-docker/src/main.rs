@@ -265,7 +265,9 @@ enum DockerCmd {
 
 fn main() {
     // `docker -v` prints version info; intercept before clap since it's not a subcommand.
-    if std::env::args().any(|a| a == "-v") {
+    // Check args()[1] specifically: `-v` is only the version flag when it is the *first*
+    // and only argument. Any other position means it is a volume-mount flag (-v host:ctr).
+    if std::env::args().nth(1).as_deref() == Some("-v") && std::env::args().count() == 2 {
         println!("Docker version 20.10.0, build pelagos");
         process::exit(0);
     }

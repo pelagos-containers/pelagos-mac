@@ -1775,8 +1775,12 @@ fn exec_command(stream: UnixStream, cmd: GuestCommand, tty: bool) -> i32 {
                     }
                 }
             }
-            // If stdin got HUP, stop.
-            if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            // POLLERR means an unrecoverable error on the fd — send EOF and stop.
+            // Do NOT break on POLLHUP: POLLHUP on a pipe only signals that the write
+            // end was closed; there may still be unread bytes in the pipe buffer.
+            // Let libc::read returning 0 be the definitive EOF signal after all
+            // remaining data has been drained (fixes large-pipe data loss).
+            if fds[0].revents & libc::POLLERR != 0 {
                 let mut w = writer_stdin.lock().unwrap();
                 let _ = send_frame(&mut *w, FRAME_STDIN, &[]);
                 break;
