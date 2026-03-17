@@ -292,7 +292,7 @@ fn main() {
             entrypoint,
             rm: _,
             attach: _,
-            sig_proxy,
+            sig_proxy: _,
             workdir: _,
             user: _,
             network: _,
@@ -311,7 +311,6 @@ fn main() {
                 label_args: labels,
                 entrypoint,
                 image_and_args,
-                sig_proxy,
             },
         ),
         DockerCmd::Exec {
@@ -425,7 +424,6 @@ struct RunOpts {
     label_args: Vec<String>,
     entrypoint: Option<String>,
     image_and_args: Vec<String>,
-    sig_proxy: Option<String>,
 }
 
 /// Parse `--mount type=bind,source=X,target=Y[,...]` into a `-v X:Y` string.
@@ -463,45 +461,20 @@ fn parse_mount_as_volume(mount_spec: &str) -> Option<String> {
 fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
     let RunOpts {
         name,
-        mut detach,
+        detach,
         volumes,
         mounts,
         env,
         ports,
         label_args,
         entrypoint,
-        mut image_and_args,
-        sig_proxy,
+        image_and_args,
     } = opts;
 
-    // Detect the devcontainer probe pattern:
-    //   docker run --sig-proxy=false ... /bin/sh -c "echo Container started"
-    // Older devcontainer CLI versions send just `echo Container started` with no
-    // keepalive — the container exits immediately and exec-into would fail. We
-    // intercept this case: run detached with a keepalive appended, suppress
-    // pelagos's output, and synthesize the expected "Container started" line.
-    //
-    // devcontainer CLI 0.84+ sends a command that ALREADY includes a keepalive
-    // loop (`while sleep 1 & wait $!; do :; done`). In that case the run must
-    // BLOCK for the container's lifetime — do NOT intercept it.
-    let has_builtin_keepalive = image_and_args
-        .iter()
-        .any(|a| a.contains("while sleep") || (a.contains("while ") && a.contains("wait $!")));
-    let is_probe = !has_builtin_keepalive
-        && sig_proxy.as_deref() == Some("false")
-        && image_and_args
-            .iter()
-            .any(|a| a.contains("echo Container started"));
-    if is_probe {
-        // Append keepalive to the shell command so the container stays alive.
-        for a in &mut image_and_args {
-            if a.contains("echo Container started") {
-                *a = format!("{}; while sleep 1000; do :; done", a);
-                break;
-            }
-        }
-        detach = true;
-    }
+    // devcontainer CLI sends `docker run --sig-proxy=false -a STDOUT -a STDERR` and
+    // expects to read "Container started" from the container's own echo via the
+    // attached stdout stream. pelagos does not yet support `-a stdout` with --detach
+    // (pelagos#117). The `-a` and `--sig-proxy` flags are accepted and ignored.
 
     let (image, cmd_args) = match image_and_args.split_first() {
         Some((img, rest)) => (img.clone(), rest.to_vec()),
@@ -720,14 +693,18 @@ fn cmd_events() -> i32 {
         }
     };
 
+    // Do NOT seed known from existing containers at startup.
+    //
+    // Seeding races with `docker run`: if the container starts between the
+    // `docker events` spawn and the first `pelagos ps --all` poll, it lands
+    // in `known` before we see it as new, so no start event is ever emitted
+    // and devcontainer CLI hangs forever waiting for it.
+    //
+    // Starting with an empty set means pre-existing containers from previous
+    // suites also emit start events on the first poll — but devcontainer CLI
+    // filters by `devcontainer.local_folder` label and ignores events for
+    // containers it didn't launch, so spurious events are harmless.
     let mut known: HashSet<String> = HashSet::new();
-    // Seed with existing containers so we only emit events for NEW ones.
-    if let Ok(out) = run_pelagos(&cfg, &args(&["ps", "--all"])) {
-        let s = String::from_utf8_lossy(&out.stdout);
-        for e in parse_pelagos_ps(&s) {
-            known.insert(e.name);
-        }
-    }
 
     let stdout = std::io::stdout();
     loop {
