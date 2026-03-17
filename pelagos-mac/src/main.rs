@@ -1701,8 +1701,21 @@ fn exec_command(stream: UnixStream, cmd: GuestCommand, tty: bool) -> i32 {
     let writer_resize = std::sync::Arc::clone(&writer_arc);
 
     // Stdin thread: read raw bytes from stdin, send as FRAME_STDIN.
+    //
+    // IMPORTANT: do NOT use io::stdin() here.  Rust's Stdin holds a global
+    // Mutex<BufReader<StdinRaw>> with an 8192-byte internal buffer.  When
+    // buf.len() (4096) < buffer capacity (8192), BufReader::read pre-fills the
+    // entire 8192-byte internal buffer from the kernel fd before returning only
+    // 4096 bytes.  The extra bytes are consumed from the kernel fd but not
+    // returned — so poll(STDIN_FILENO) no longer fires for them and they sit in
+    // the BufReader forever.  This causes the hang described in issue #119:
+    // the last ≤4096 bytes before a pause (e.g. VS Code's server start command
+    // appended right after the 74 MB tarball) get stuck in the internal buffer.
+    //
+    // Fix: bypass io::stdin() and call libc::read(STDIN_FILENO) directly.  A
+    // direct read only consumes exactly what poll saw in the kernel fd buffer,
+    // so there is no hidden buffer between poll and the framed relay.
     std::thread::spawn(move || {
-        let mut stdin = io::stdin();
         let mut buf = [0u8; 4096];
         loop {
             // Use poll so we can interleave resize pipe reads with stdin.
@@ -1735,21 +1748,31 @@ fn exec_command(stream: UnixStream, cmd: GuestCommand, tty: bool) -> i32 {
                     let _ = send_frame(&mut *w, FRAME_RESIZE, &resize_data);
                 }
             }
-            // Handle stdin.
+            // Handle stdin — raw libc::read bypasses Rust's buffered Stdin.
             if fds[0].revents & libc::POLLIN != 0 {
-                match stdin.read(&mut buf) {
-                    Ok(0) | Err(_) => {
-                        // EOF — send a zero-length Stdin frame so the guest
-                        // knows to close the child's stdin pipe.
+                let n = unsafe {
+                    libc::read(
+                        libc::STDIN_FILENO,
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                    )
+                };
+                if n < 0 {
+                    // EINTR is harmless: re-poll.
+                    if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
                         let mut w = writer_stdin.lock().unwrap();
                         let _ = send_frame(&mut *w, FRAME_STDIN, &[]);
                         break;
                     }
-                    Ok(n) => {
-                        let mut w = writer_stdin.lock().unwrap();
-                        if send_frame(&mut *w, FRAME_STDIN, &buf[..n]).is_err() {
-                            break;
-                        }
+                } else if n == 0 {
+                    // EOF — tell the guest to close the child's stdin pipe.
+                    let mut w = writer_stdin.lock().unwrap();
+                    let _ = send_frame(&mut *w, FRAME_STDIN, &[]);
+                    break;
+                } else {
+                    let mut w = writer_stdin.lock().unwrap();
+                    if send_frame(&mut *w, FRAME_STDIN, &buf[..n as usize]).is_err() {
+                        break;
                     }
                 }
             }
@@ -2433,5 +2456,67 @@ mod tests {
     #[test]
     fn parse_container_path_rejects_dash() {
         assert!(super::parse_container_path("-").is_none());
+    }
+
+    /// Regression test for issue #119: the stdin relay in exec_command must use
+    /// unbuffered reads (libc::read) rather than io::stdin() to avoid the
+    /// BufReader pre-fetch problem.
+    ///
+    /// io::Stdin holds a Mutex<BufReader<StdinRaw>> with 8192-byte capacity.
+    /// When buf.len()=4096 < capacity=8192, BufReader::read pre-fills the full
+    /// 8192-byte internal buffer from the kernel fd before returning only 4096
+    /// bytes.  This consumes more bytes from the fd than poll(STDIN_FILENO)
+    /// "knows about", so the leftover bytes sit in the BufReader forever once
+    /// the producer pauses.
+    ///
+    /// This test verifies the property that a single libc::read(4096) on a
+    /// pipe with 8000 bytes leaves the remaining 3904 bytes in the kernel pipe
+    /// buffer (i.e. poll fires again for the second read).
+    #[test]
+    fn stdin_relay_uses_unbuffered_read_issue_119() {
+        // Create an anonymous pipe to simulate the stdin fd.
+        let mut pipe_fds = [-1i32; 2];
+        let ret = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
+        assert_eq!(ret, 0, "pipe() failed");
+        let read_fd = pipe_fds[0];
+        let write_fd = pipe_fds[1];
+
+        // Write 8000 bytes to the write end.
+        let data = vec![0xABu8; 8000];
+        let written =
+            unsafe { libc::write(write_fd, data.as_ptr() as *const libc::c_void, data.len()) };
+        assert_eq!(written, 8000, "write to pipe failed");
+
+        // First libc::read with 4096-byte buffer — should return exactly 4096.
+        let mut buf = [0u8; 4096];
+        let n1 = unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        assert_eq!(n1, 4096, "first read should return exactly 4096 bytes");
+
+        // poll must still fire for read_fd because 3904 bytes remain in the
+        // kernel pipe buffer (not consumed by a BufReader into user-space).
+        let mut pfd = libc::pollfd {
+            fd: read_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let poll_ret = unsafe { libc::poll(&mut pfd as *mut _, 1, 0) }; // timeout=0 (non-blocking)
+        assert_eq!(poll_ret, 1, "poll should return 1 fd ready");
+        assert!(
+            pfd.revents & libc::POLLIN != 0,
+            "POLLIN must be set — remaining bytes must be visible to poll (issue #119 regression)"
+        );
+
+        // Second read consumes the rest.
+        let mut buf2 = [0u8; 4096];
+        let n2 = unsafe { libc::read(read_fd, buf2.as_mut_ptr() as *mut libc::c_void, buf2.len()) };
+        assert_eq!(
+            n2, 3904,
+            "second read should return the remaining 3904 bytes"
+        );
+
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
     }
 }

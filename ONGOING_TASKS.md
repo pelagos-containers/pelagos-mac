@@ -1,7 +1,6 @@
 # pelagos-mac — Ongoing Tasks
 
-
-*Last updated: 2026-03-16*
+*Last updated: 2026-03-17 — fix(exec-into): unbuffered stdin relay (issue pelagos#119)*
 
 ---
 
