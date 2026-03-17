@@ -1702,7 +1702,6 @@ fn exec_command(stream: UnixStream, cmd: GuestCommand, tty: bool) -> i32 {
 
     // Stdin thread: read raw bytes from stdin, send as FRAME_STDIN.
     std::thread::spawn(move || {
-        let mut stdin = io::stdin();
         let mut buf = [0u8; 4096];
         loop {
             // Use poll so we can interleave resize pipe reads with stdin.
@@ -1736,18 +1735,41 @@ fn exec_command(stream: UnixStream, cmd: GuestCommand, tty: bool) -> i32 {
                 }
             }
             // Handle stdin.
+            // Use libc::read directly — NOT io::stdin() which wraps a BufReader<StdinRaw>
+            // with an 8192-byte internal buffer. When the caller buf is 4096 bytes,
+            // BufReader pre-fills 8192 bytes from the kernel fd but only returns 4096,
+            // leaving up to 4096 bytes stranded in its internal buffer. poll() then
+            // sees no POLLIN (kernel fd is empty) and those bytes are never forwarded.
+            // Direct libc::read reads exactly what poll() knows about — no over-read.
+            // (Fixes pelagos#119 / pelagos-mac#103)
             if fds[0].revents & libc::POLLIN != 0 {
-                match stdin.read(&mut buf) {
-                    Ok(0) | Err(_) => {
+                let n = unsafe {
+                    libc::read(
+                        libc::STDIN_FILENO,
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                    )
+                };
+                match n {
+                    -1 => {
+                        if unsafe { *libc::__error() } == libc::EINTR {
+                            continue; // interrupted by signal, retry
+                        }
+                        // Other error — send EOF frame and stop.
+                        let mut w = writer_stdin.lock().unwrap();
+                        let _ = send_frame(&mut *w, FRAME_STDIN, &[]);
+                        break;
+                    }
+                    0 => {
                         // EOF — send a zero-length Stdin frame so the guest
                         // knows to close the child's stdin pipe.
                         let mut w = writer_stdin.lock().unwrap();
                         let _ = send_frame(&mut *w, FRAME_STDIN, &[]);
                         break;
                     }
-                    Ok(n) => {
+                    n => {
                         let mut w = writer_stdin.lock().unwrap();
-                        if send_frame(&mut *w, FRAME_STDIN, &buf[..n]).is_err() {
+                        if send_frame(&mut *w, FRAME_STDIN, &buf[..n as usize]).is_err() {
                             break;
                         }
                     }

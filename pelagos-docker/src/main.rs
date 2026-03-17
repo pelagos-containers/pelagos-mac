@@ -559,7 +559,7 @@ fn cmd_exec(
     tty: bool,
     user: Option<&str>,
     workdir: Option<&str>,
-    _env: &[String],
+    env: &[String],
     name_and_args: &[String],
 ) -> i32 {
     let (name, cmd_args) = match name_and_args.split_first() {
@@ -571,6 +571,8 @@ fn cmd_exec(
     };
 
     // `pelagos exec-into <container> [cmd...]` — enters running container's namespaces.
+    // pelagos exec-into has no --env flag; inject env vars by prepending `env VAR=VAL …`
+    // to the command so the container shell inherits them.
     let mut sub: Vec<OsString> = Vec::new();
     sub.push("exec-into".into());
     if tty {
@@ -585,6 +587,30 @@ fn cmd_exec(
         sub.push(w.into());
     }
     sub.push(name.into());
+    // Inject env vars (and HOME if missing) by prepending `env VAR=VAL …` to the command.
+    // Docker sets HOME from /etc/passwd; pelagos doesn't, so we fill it in here.
+    // (tracked in pelagos#120-followup — HOME not set from passwd)
+    let caller_has_home = env.iter().any(|kv| kv.starts_with("HOME="));
+    let effective_user = user.unwrap_or("root");
+    let home_for_user = if effective_user == "root" || effective_user == "0" {
+        Some("/root")
+    } else {
+        // Non-root: we don't know the home dir without querying /etc/passwd inside
+        // the container.  Leave HOME unset for now; file pelagos issue for proper fix.
+        None
+    };
+    let need_env_prefix = !env.is_empty() || (!caller_has_home && home_for_user.is_some());
+    if need_env_prefix {
+        sub.push("env".into());
+        if !caller_has_home {
+            if let Some(h) = home_for_user {
+                sub.push(format!("HOME={}", h).into());
+            }
+        }
+        for kv in env {
+            sub.push(kv.into());
+        }
+    }
     for a in cmd_args {
         sub.push(a.into());
     }
