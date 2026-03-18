@@ -89,13 +89,6 @@ LIBCOM_ERR_PKG="libcom_err-1.47.1-r1"
 LIBCOM_ERR_APK="$WORK/${LIBCOM_ERR_PKG}.apk"
 LIBCOM_ERR_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${LIBCOM_ERR_PKG}.apk"
 
-# util-linux: provides nsenter, used by pelagos-guest exec-into to join the
-# container's PID namespace via the correct double-fork mechanism.
-UTILLINUX_PKG="util-linux-misc-2.40.4-r1"
-UTILLINUX_APK="$WORK/${UTILLINUX_PKG}.apk"
-UTILLINUX_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${UTILLINUX_PKG}.apk"
-NSENTER_BIN="$WORK/nsenter-bin"
-
 # SSH key for 'pelagos vm ssh': generated once per user, baked into the initramfs.
 PELAGOS_STATE_DIR="$HOME/.local/share/pelagos"
 SSH_KEY_FILE="$PELAGOS_STATE_DIR/vm_key"
@@ -360,21 +353,6 @@ else
     echo "  (cached: e2fsprogs libs)"
 fi
 
-if [ ! -f "$NSENTER_BIN" ]; then
-    [ ! -f "$UTILLINUX_APK" ] && curl -L --progress-bar -o "$UTILLINUX_APK" "$UTILLINUX_URL"
-    ULEXTRACT="$WORK/util-linux-extract"
-    rm -rf "$ULEXTRACT" && mkdir -p "$ULEXTRACT"
-    bsdtar -xf "$UTILLINUX_APK" -C "$ULEXTRACT" 2>/dev/null || true
-    if [ -f "$ULEXTRACT/usr/bin/nsenter" ]; then
-        cp "$ULEXTRACT/usr/bin/nsenter" "$NSENTER_BIN"
-        chmod 755 "$NSENTER_BIN"
-        echo "  Extracted nsenter"
-    else
-        echo "ERROR: nsenter not found in $UTILLINUX_APK" >&2; exit 1
-    fi
-else
-    echo "  (cached: nsenter-bin)"
-fi
 
 # ---------------------------------------------------------------------------
 echo "[6/8] Staging Mozilla CA bundle (for TLS inside VM)"
@@ -585,14 +563,6 @@ if [ ! -f "$INITRAMFS_OUT" ] \
         echo "  staged mke2fs + e2fsprogs libs"
     fi
 
-    # Stage nsenter from util-linux for PID namespace join in exec-into.
-    # busybox in Alpine's initramfs-lts does not include the nsenter applet.
-    if [ -f "$NSENTER_BIN" ]; then
-        mkdir -p "$INITRD_TMP/usr/bin"
-        cp "$NSENTER_BIN" "$INITRD_TMP/usr/bin/nsenter"
-        chmod 755 "$INITRD_TMP/usr/bin/nsenter"
-        echo "  staged nsenter (util-linux)"
-    fi
 
     # Stage the host's public key as the VM's authorized_keys.
     mkdir -p "$INITRD_TMP/root/.ssh"

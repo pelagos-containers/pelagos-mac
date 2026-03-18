@@ -1333,33 +1333,26 @@ fn handle_exec(
     }
 }
 
-/// Exec into an already-running container by entering its Linux namespaces.
+/// Exec into a running container by joining all its Linux namespaces natively.
 ///
-/// Uses a two-step approach to correctly handle the PID namespace:
+/// Uses a double-fork to correctly place the exec'd process inside the container's
+/// PID namespace without depending on the external `nsenter` binary:
 ///
-/// Step 1 (pre_exec, in the forked child): join net/uts/ipc/mnt namespaces,
-/// then fchdir+chroot into the container's rootfs.  After this, the child is
-/// inside the container's mount/network/UTS/IPC namespaces.
+/// - **Parent**: opens namespace fds and root fd, prepares execve arguments, forks.
+/// - **Intermediate** (child): joins net/uts/ipc/mnt namespaces, chroots, calls
+///   `setns(CLONE_NEWPID)` to update `pid_for_children`, then forks again.
+/// - **Grandchild**: born inside the PID namespace (gets a namespace-local PID),
+///   dup2s I/O fds, and execs the target program.
+/// - **Intermediate continues**: waits for grandchild, writes 4-byte exit code to
+///   status pipe, then `_exit(0)`.
+/// - **Parent**: relays I/O via frames, reads exit code from status pipe, sends
+///   `FRAME_EXIT`, then reaps the intermediate.
 ///
-/// Step 2 (nsenter, run as the command): after chroot, `/proc` is the
-/// container's procfs.  `nsenter --target 1 --pid` opens `/proc/1/ns/pid`,
-/// calls `setns(CLONE_NEWPID)` in the single-threaded nsenter process (safe),
-/// and forks — the grandchild is born in the container's PID namespace with a
-/// proper local PID.  Without this step, `/proc/self` is a 0-byte dangling
-/// symlink, causing VS Code `resolveAuthority` to fail.
-///
-/// Why not call `setns(CLONE_NEWPID)` directly in pre_exec?
-/// pre_exec runs after fork, in the child.  The child's PID was already
-/// assigned in the parent's namespace at fork time.  setns only updates
-/// `pid_for_children`; a second fork is required for the child to get a PID
-/// in the new namespace.  nsenter handles this double-fork internally.
-///
-/// Requirement: the container image must have `nsenter` (util-linux) at
-/// `/usr/bin/nsenter`.  Ubuntu ≥ 20.04 and Debian ≥ bullseye ship it by
-/// default.  For images without nsenter, exec-into falls back to the
-/// pre_exec-only path (no PID namespace join; `/proc/self` may dangle).
-///
-/// See docs/GUEST_CONTAINER_EXEC.md for the full namespace join analysis.
+/// Why double-fork: `setns(CLONE_NEWPID)` only updates `pid_for_children`; the
+/// calling process retains its old namespace PID.  Only the immediately subsequent
+/// `fork()` child gets a namespace-local PID.  Without it, `/proc/self` is a
+/// dangling symlink in the container's procfs, which breaks VS Code
+/// `resolveAuthority` and any other tool that reads `/proc/self`.
 fn handle_exec_into(
     fd: libc::c_int,
     container: &str,
@@ -1368,6 +1361,8 @@ fn handle_exec_into(
     tty: bool,
     workdir: Option<&str>,
 ) -> std::io::Result<()> {
+    use std::ffi::CString;
+
     let pid = get_container_pid(container).map_err(|e| {
         let mut w = FdWriter(fd);
         let _ = send_response(
@@ -1379,9 +1374,9 @@ fn handle_exec_into(
         e
     })?;
 
-    // Open namespace fds for non-PID namespaces.  PID namespace is handled by
-    // nsenter (which must fork after setns to give the child a namespace-local PID).
-    let ns_fds = open_ns_fds_no_pid(pid).map_err(|e| {
+    // Open all 5 namespace fds (net/uts/ipc/pid/mnt) + container root.
+    // ns_fds order: [net=0, uts=1, ipc=2, pid=3, mnt=4].
+    let ns_fds = open_ns_fds(pid).map_err(|e| {
         let mut w = FdWriter(fd);
         let _ = send_response(
             &mut w,
@@ -1392,7 +1387,6 @@ fn handle_exec_into(
         e
     })?;
 
-    // Open /proc/<pid>/root for fchdir+chroot in pre_exec.
     let root_fd = open_root_fd(pid).map_err(|e| {
         for &nfd in &ns_fds {
             unsafe { libc::close(nfd) };
@@ -1407,19 +1401,20 @@ fn handle_exec_into(
         e
     })?;
 
-    // Send ready — both sides switch to framed binary protocol.
-    {
-        let mut w = FdWriter(fd);
-        send_response(&mut w, &GuestResponse::Ready { ready: true })?;
-    }
-
     let (prog, rest) = match args.split_first() {
         Some(p) => p,
         None => {
-            for nfd in ns_fds {
+            for &nfd in &ns_fds {
                 unsafe { libc::close(nfd) };
             }
             unsafe { libc::close(root_fd) };
+            let mut w = FdWriter(fd);
+            let _ = send_response(
+                &mut w,
+                &GuestResponse::Error {
+                    error: "exec-into: no command".into(),
+                },
+            );
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "exec-into: no command",
@@ -1427,13 +1422,10 @@ fn handle_exec_into(
         }
     };
 
-    // Build the child environment: start from the container's init process
-    // environment (which carries the OCI image's configured ENV, including PATH),
-    // then overlay caller-supplied overrides.  env_clear() prevents the Alpine
-    // guest environment from leaking through.
+    // Build the container environment before forking (allocation in parent is safe).
     let mut container_env = read_container_environ(pid);
     log::debug!(
-        "exec-into: container={} pid={} root_pid={} container_env_keys={} PATH={:?}",
+        "exec-into: container={} pid={} root_pid={} env_keys={} PATH={:?}",
         container,
         pid,
         find_root_pid(pid),
@@ -1443,73 +1435,299 @@ fn handle_exec_into(
     for (k, v) in env {
         container_env.insert(k.clone(), v.clone());
     }
+    log::debug!("exec-into: prog={:?} args={:?}", prog, rest);
 
-    log::debug!(
-        "exec-into: prog={:?} args={:?} final_env_keys={}",
-        prog,
-        rest,
-        container_env.len()
-    );
+    // Send ready — both sides switch to framed binary protocol.
+    {
+        let mut w = FdWriter(fd);
+        send_response(&mut w, &GuestResponse::Ready { ready: true })?;
+    }
 
-    // nsenter wraps the target command to join the PID namespace via double-fork.
-    // After pre_exec chroots us into the container's rootfs, `/proc` is the
-    // container's procfs, so --target 1 refers to the container's init process.
-    let mut cmd = Command::new("/usr/bin/nsenter");
-    cmd.args(["--target", "1", "--pid", "--"]);
-    cmd.arg(prog);
-    cmd.args(rest);
-    cmd.env_clear();
+    // Prepare execve arguments BEFORE fork.  In the grandchild (post double-fork)
+    // we must call only async-signal-safe functions; all heap allocation happens here.
+    let prog_c = CString::new(prog.as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let mut args_c: Vec<CString> = Vec::with_capacity(rest.len() + 1);
+    args_c.push(prog_c.clone());
+    for a in rest {
+        args_c.push(CString::new(a.as_bytes()).unwrap_or_default());
+    }
+    let mut argv: Vec<*const libc::c_char> = args_c.iter().map(|c| c.as_ptr()).collect();
+    argv.push(std::ptr::null());
+
+    let mut env_strs: Vec<CString> = Vec::with_capacity(container_env.len());
     for (k, v) in &container_env {
-        cmd.env(k, v);
+        env_strs.push(CString::new(format!("{}={}", k, v)).unwrap_or_default());
     }
+    let mut envp: Vec<*const libc::c_char> = env_strs.iter().map(|c| c.as_ptr()).collect();
+    envp.push(std::ptr::null());
 
-    // Enter non-PID namespaces in the child after fork, before exec.
-    // Order: net/uts/ipc first, then mnt (so /proc transitions to container's view).
-    // After setns(mnt), fchdir+chroot into the container's rootfs and chdir to workdir.
-    let workdir_owned: Option<std::ffi::CString> =
-        workdir.and_then(|w| std::ffi::CString::new(w.as_bytes()).ok());
-    unsafe {
-        cmd.pre_exec(move || {
-            for &ns_fd in &ns_fds {
-                if call_setns(ns_fd) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                libc::close(ns_fd);
+    let workdir_c: Option<CString> = workdir.and_then(|w| CString::new(w.as_bytes()).ok());
+
+    // Status pipe: intermediate writes 4-byte big-endian exit code; parent reads.
+    let (status_r, status_w) = pipe2_cloexec().map_err(|e| {
+        for &nfd in &ns_fds {
+            unsafe { libc::close(nfd) };
+        }
+        unsafe { libc::close(root_fd) };
+        e
+    })?;
+
+    // Allocate I/O resources: PTY for TTY mode, pipes for piped mode.
+    let master_fd: libc::c_int;
+    let slave_fd: libc::c_int;
+    let stdin_r: libc::c_int;
+    let stdin_w: libc::c_int;
+    let stdout_r: libc::c_int;
+    let stdout_w: libc::c_int;
+    let stderr_r: libc::c_int;
+    let stderr_w: libc::c_int;
+
+    if tty {
+        let mut mfd = -1i32;
+        let mut sfd = -1i32;
+        if unsafe {
+            libc::openpty(
+                &mut mfd,
+                &mut sfd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } < 0
+        {
+            for &nfd in &ns_fds {
+                unsafe { libc::close(nfd) };
             }
-            // Anchor root dentry to the container rootfs.
-            if libc::fchdir(root_fd) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::chroot(c".".as_ptr()) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // chdir to the requested working directory (Docker exec -w), or / by default.
-            let dir_ptr = match workdir_owned.as_ref() {
-                Some(cstr) => cstr.as_ptr(),
-                None => c"/".as_ptr(),
+            unsafe {
+                libc::close(root_fd);
+                libc::close(status_r);
+                libc::close(status_w)
             };
-            if libc::chdir(dir_ptr) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            libc::close(root_fd);
-            Ok(())
-        });
-    }
-
-    // Spawn and run; parent closes its copies of ns_fds and root_fd after spawn.
-    let result = if tty {
-        handle_exec_tty(fd, cmd)
+            return Err(std::io::Error::last_os_error());
+        }
+        master_fd = mfd;
+        slave_fd = sfd;
+        stdin_r = -1;
+        stdin_w = -1;
+        stdout_r = -1;
+        stdout_w = -1;
+        stderr_r = -1;
+        stderr_w = -1;
     } else {
-        handle_exec_piped(fd, cmd)
-    };
-
-    // Close parent copies (child already closed its copies in pre_exec).
-    for &ns_fd in &ns_fds {
-        unsafe { libc::close(ns_fd) };
+        master_fd = -1;
+        slave_fd = -1;
+        macro_rules! open_pipe {
+            () => {
+                match pipe2_cloexec() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        for &nfd in &ns_fds {
+                            unsafe { libc::close(nfd) };
+                        }
+                        unsafe {
+                            libc::close(root_fd);
+                            libc::close(status_r);
+                            libc::close(status_w)
+                        };
+                        return Err(e);
+                    }
+                }
+            };
+        }
+        let si = open_pipe!();
+        let so = open_pipe!();
+        let se = open_pipe!();
+        stdin_r = si.0;
+        stdin_w = si.1;
+        stdout_r = so.0;
+        stdout_w = so.1;
+        stderr_r = se.0;
+        stderr_w = se.1;
     }
-    unsafe { libc::close(root_fd) };
 
-    result
+    // ── Fork: parent → intermediate ─────────────────────────────────────────
+    let intermediate_pid = unsafe { libc::fork() };
+    match intermediate_pid {
+        -1 => {
+            let err = std::io::Error::last_os_error();
+            for &nfd in &ns_fds {
+                unsafe { libc::close(nfd) };
+            }
+            unsafe {
+                libc::close(root_fd);
+                libc::close(status_r);
+                libc::close(status_w);
+                if tty {
+                    libc::close(master_fd);
+                    libc::close(slave_fd);
+                } else {
+                    libc::close(stdin_r);
+                    libc::close(stdin_w);
+                    libc::close(stdout_r);
+                    libc::close(stdout_w);
+                    libc::close(stderr_r);
+                    libc::close(stderr_w);
+                }
+            }
+            Err(err)
+        }
+        0 => {
+            // ── INTERMEDIATE CHILD ──────────────────────────────────────────
+            // Close the parent's I/O ends — we only need the child ends here.
+            unsafe { libc::close(status_r) };
+            if tty {
+                unsafe { libc::close(master_fd) };
+            } else {
+                unsafe {
+                    libc::close(stdin_w);
+                    libc::close(stdout_r);
+                    libc::close(stderr_r)
+                };
+            }
+
+            // Join net, uts, ipc namespaces (ns_fds: [net=0, uts=1, ipc=2, pid=3, mnt=4]).
+            for i in 0..3usize {
+                if unsafe { call_setns(ns_fds[i]) } < 0 {
+                    unsafe { libc::_exit(126) };
+                }
+                unsafe { libc::close(ns_fds[i]) };
+            }
+            // Join mnt namespace last — pivots /proc to the container's view of the world.
+            if unsafe { call_setns(ns_fds[4]) } < 0 {
+                unsafe { libc::_exit(126) };
+            }
+            unsafe { libc::close(ns_fds[4]) };
+
+            // Anchor root dentry: fchdir into container rootfs, chroot("."), chdir workdir.
+            if unsafe { libc::fchdir(root_fd) } < 0 {
+                unsafe { libc::_exit(126) };
+            }
+            if unsafe { libc::chroot(c".".as_ptr()) } < 0 {
+                unsafe { libc::_exit(126) };
+            }
+            let wdir_ptr = workdir_c
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(c"/".as_ptr());
+            if unsafe { libc::chdir(wdir_ptr) } < 0 {
+                unsafe { libc::_exit(126) };
+            }
+            unsafe { libc::close(root_fd) };
+
+            // Join PID namespace.  setns(CLONE_NEWPID) updates pid_for_children only;
+            // the intermediate itself keeps its old PID.  The next fork() child is
+            // born inside the PID namespace.  Requires single-threaded process —
+            // guaranteed: fork() delivers only the calling thread to the child.
+            if unsafe { setns_pid(ns_fds[3]) } < 0 {
+                unsafe { libc::_exit(126) };
+            }
+            unsafe { libc::close(ns_fds[3]) };
+
+            // ── Fork: intermediate → grandchild ─────────────────────────────
+            let grandchild_pid = unsafe { libc::fork() };
+            match grandchild_pid {
+                -1 => unsafe { libc::_exit(126) },
+                0 => {
+                    // ── GRANDCHILD ───────────────────────────────────────────
+                    // Close fds the exec'd program must not inherit.
+                    // Pipes have O_CLOEXEC (closed at exec), but we close them
+                    // explicitly so fds are dropped before exec, not after.
+                    unsafe {
+                        libc::close(status_w);
+                        libc::close(fd)
+                    };
+                    if tty {
+                        // Become session leader, acquire slave as controlling terminal.
+                        if unsafe { libc::setsid() } < 0 {
+                            unsafe { libc::_exit(127) };
+                        }
+                        if unsafe { libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0i32) } < 0 {
+                            unsafe { libc::_exit(127) };
+                        }
+                        unsafe {
+                            libc::dup2(slave_fd, 0);
+                            libc::dup2(slave_fd, 1);
+                            libc::dup2(slave_fd, 2);
+                            libc::close(slave_fd);
+                        }
+                    } else {
+                        unsafe {
+                            libc::dup2(stdin_r, 0);
+                            libc::close(stdin_r);
+                            libc::dup2(stdout_w, 1);
+                            libc::close(stdout_w);
+                            libc::dup2(stderr_w, 2);
+                            libc::close(stderr_w);
+                        }
+                    }
+                    // argv/envp point into pre-fork allocations (COW dup in child — safe).
+                    // execvpe (not execve) is required: when prog is a bare name (e.g.
+                    // "uname") without a leading '/', execve fails with ENOENT because
+                    // it does not search PATH.  execvpe searches PATH entries from envp,
+                    // so bare names are resolved the same way a shell would resolve them.
+                    unsafe { exec_with_path(prog_c.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+                    unsafe { libc::_exit(127) }; // exec failed
+                }
+                grandchild_pid => {
+                    // ── INTERMEDIATE continues ───────────────────────────────
+                    // Close child I/O ends — grandchild owns them now.
+                    if tty {
+                        unsafe { libc::close(slave_fd) };
+                    } else {
+                        unsafe {
+                            libc::close(stdin_r);
+                            libc::close(stdout_w);
+                            libc::close(stderr_w)
+                        };
+                    }
+                    // Wait for grandchild, relay exit code to parent via status pipe.
+                    let mut wstatus: libc::c_int = 0;
+                    unsafe { libc::waitpid(grandchild_pid, &mut wstatus, 0) };
+                    let code: i32 = if libc::WIFEXITED(wstatus) {
+                        libc::WEXITSTATUS(wstatus)
+                    } else if libc::WIFSIGNALED(wstatus) {
+                        128 + libc::WTERMSIG(wstatus)
+                    } else {
+                        -1
+                    };
+                    let bytes = code.to_be_bytes();
+                    unsafe { libc::write(status_w, bytes.as_ptr() as *const libc::c_void, 4) };
+                    unsafe { libc::close(status_w) };
+                    unsafe { libc::_exit(0) };
+                }
+            }
+        }
+        intermediate_pid => {
+            // ── PARENT ────────────────────────────────────────────────────
+            // Close child-side fds — intermediate owns them now.
+            unsafe { libc::close(status_w) };
+            for &nfd in &ns_fds {
+                unsafe { libc::close(nfd) };
+            }
+            unsafe { libc::close(root_fd) };
+            if tty {
+                unsafe { libc::close(slave_fd) };
+            } else {
+                unsafe {
+                    libc::close(stdin_r);
+                    libc::close(stdout_w);
+                    libc::close(stderr_w)
+                };
+            }
+
+            // Relay I/O until the process exits, then collect exit code.
+            let result = if tty {
+                relay_exec_into_tty(fd, master_fd, status_r)
+            } else {
+                relay_exec_into_piped(fd, stdin_w, stdout_r, stderr_r, status_r)
+            };
+
+            // Reap intermediate (it exits after writing exit code to status pipe).
+            unsafe { libc::waitpid(intermediate_pid, std::ptr::null_mut(), 0) };
+            result
+        }
+    }
 }
 
 /// Parse `pelagos ps --all` output and return the PID of the named container.
@@ -1556,6 +1774,52 @@ unsafe fn call_setns(fd: libc::c_int) -> libc::c_int {
 #[cfg(not(target_os = "linux"))]
 unsafe fn call_setns(_fd: libc::c_int) -> libc::c_int {
     panic!("setns is Linux-only; pelagos-guest only runs inside the Linux VM")
+}
+
+/// `setns(2)` with `CLONE_NEWPID`: join a PID namespace.
+/// Sets `pid_for_children`; the calling process retains its current PID.
+/// Requires single-threaded process — guaranteed immediately after `fork()`.
+#[cfg(target_os = "linux")]
+unsafe fn setns_pid(fd: libc::c_int) -> libc::c_int {
+    libc::setns(fd, libc::CLONE_NEWPID)
+}
+#[cfg(not(target_os = "linux"))]
+unsafe fn setns_pid(_fd: libc::c_int) -> libc::c_int {
+    panic!("setns is Linux-only; pelagos-guest only runs inside the Linux VM")
+}
+
+/// `execvpe(2)`: exec with explicit envp, searching PATH for bare filenames.
+/// Unlike `execve`, this resolves bare names (e.g. `uname`) via PATH entries
+/// in the provided `envp`, matching shell resolution semantics.
+#[cfg(target_os = "linux")]
+unsafe fn exec_with_path(
+    prog: *const libc::c_char,
+    argv: *const *const libc::c_char,
+    envp: *const *const libc::c_char,
+) {
+    libc::execvpe(prog, argv, envp);
+}
+#[cfg(not(target_os = "linux"))]
+unsafe fn exec_with_path(
+    _prog: *const libc::c_char,
+    _argv: *const *const libc::c_char,
+    _envp: *const *const libc::c_char,
+) {
+    panic!("execvpe is Linux-only; pelagos-guest only runs inside the Linux VM")
+}
+
+/// Create a pipe with `O_CLOEXEC` set atomically via `pipe2(2)`.
+#[cfg(target_os = "linux")]
+fn pipe2_cloexec() -> std::io::Result<(libc::c_int, libc::c_int)> {
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((fds[0], fds[1]))
+}
+#[cfg(not(target_os = "linux"))]
+fn pipe2_cloexec() -> std::io::Result<(libc::c_int, libc::c_int)> {
+    panic!("pipe2 is Linux-only; pelagos-guest only runs inside the Linux VM")
 }
 
 /// Read the environment of the container's root process from `/proc/<pid>/environ`.
@@ -1660,30 +1924,6 @@ fn open_root_fd(pid: u32) -> std::io::Result<libc::c_int> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(fd)
-}
-
-/// Open namespace file descriptors for the given PID.
-/// Returns fds in order: [net, uts, ipc, pid, mnt].
-/// Caller must close all returned fds.
-/// Open namespace fds for exec-into: net/uts/ipc/mnt only (no pid).
-/// The PID namespace is handled by nsenter (double-fork in nsenter process).
-fn open_ns_fds_no_pid(pid: u32) -> std::io::Result<[libc::c_int; 4]> {
-    let ns_names = ["net", "uts", "ipc", "mnt"];
-    let mut fds = [-1i32; 4];
-    for (i, ns) in ns_names.iter().enumerate() {
-        let path = format!("/proc/{}/ns/{}", pid, ns);
-        let cpath = std::ffi::CString::new(path.as_str())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-        if fd < 0 {
-            for fd in fds.iter().take(i) {
-                unsafe { libc::close(*fd) };
-            }
-            return Err(std::io::Error::last_os_error());
-        }
-        fds[i] = fd;
-    }
-    Ok(fds)
 }
 
 fn open_ns_fds(pid: u32) -> std::io::Result<[libc::c_int; 5]> {
@@ -1967,6 +2207,211 @@ fn handle_exec_tty(fd: libc::c_int, mut cmd: Command) -> std::io::Result<()> {
     let mut w = writer.lock().unwrap();
     let _ = send_frame(&mut *w, FRAME_EXIT, &code.to_be_bytes());
 
+    Ok(())
+}
+
+/// Relay framed I/O between the vsock `fd` and a piped child process.
+///
+/// `stdin_w` / `stdout_r` / `stderr_r` are the parent-side pipe ends (owned by
+/// this function).  `status_r` receives the 4-byte big-endian exit code written
+/// by the intermediate process after it reaps the grandchild.
+fn relay_exec_into_piped(
+    fd: libc::c_int,
+    stdin_w: libc::c_int,
+    stdout_r: libc::c_int,
+    stderr_r: libc::c_int,
+    status_r: libc::c_int,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::io::FromRawFd;
+    use std::sync::{Arc, Mutex};
+
+    let writer = Arc::new(Mutex::new(FdWriter(fd)));
+
+    // Stdin thread: read FRAME_STDIN from vsock, write to child's stdin pipe.
+    let w_stdin = Arc::clone(&writer);
+    let stdin_thread = std::thread::spawn(move || {
+        let mut child_stdin = unsafe { std::fs::File::from_raw_fd(stdin_w) };
+        let mut reader = FdReader(fd);
+        loop {
+            match recv_frame(&mut reader) {
+                Ok((FRAME_STDIN, data)) => {
+                    if data.is_empty() {
+                        break; // zero-length = EOF signal
+                    }
+                    if child_stdin.write_all(&data).is_err() {
+                        break;
+                    }
+                }
+                Ok((FRAME_RESIZE, _)) => {} // no PTY in piped mode; ignore
+                Ok(_) | Err(_) => break,
+            }
+        }
+        drop(child_stdin); // EOF to child
+        drop(w_stdin);
+    });
+
+    // Stdout thread: read from stdout_r, send FRAME_STDOUT.
+    let w_out = Arc::clone(&writer);
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n =
+                unsafe { libc::read(stdout_r, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            let mut w = w_out.lock().unwrap();
+            if send_frame(&mut *w, FRAME_STDOUT, &buf[..n as usize]).is_err() {
+                break;
+            }
+        }
+        unsafe { libc::close(stdout_r) };
+    });
+
+    // Stderr thread: read from stderr_r, send FRAME_STDERR.
+    let w_err = Arc::clone(&writer);
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n =
+                unsafe { libc::read(stderr_r, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            let mut w = w_err.lock().unwrap();
+            if send_frame(&mut *w, FRAME_STDERR, &buf[..n as usize]).is_err() {
+                break;
+            }
+        }
+        unsafe { libc::close(stderr_r) };
+    });
+
+    // Drain stdout/stderr, then read exit code from status pipe.
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
+
+    let mut code_buf = [0u8; 4];
+    let code: i32 =
+        if unsafe { libc::read(status_r, code_buf.as_mut_ptr() as *mut libc::c_void, 4) } == 4 {
+            i32::from_be_bytes(code_buf)
+        } else {
+            -1
+        };
+    unsafe { libc::close(status_r) };
+
+    let mut w = writer.lock().unwrap();
+    let _ = send_frame(&mut *w, FRAME_EXIT, &code.to_be_bytes());
+    drop(w);
+    drop(stdin_thread); // detach; fd close will unblock it
+    Ok(())
+}
+
+/// Relay framed I/O between the vsock `fd` and a TTY child process via PTY master.
+///
+/// `master_fd` is the PTY master (owned by this function).  `status_r` receives
+/// the 4-byte exit code from the intermediate after the grandchild exits.
+fn relay_exec_into_tty(
+    fd: libc::c_int,
+    master_fd: libc::c_int,
+    status_r: libc::c_int,
+) -> std::io::Result<()> {
+    use std::sync::{Arc, Mutex};
+
+    // Dup master so stdin and stdout threads each hold an independent fd.
+    let master_read_fd = unsafe { libc::dup(master_fd) };
+    if master_read_fd < 0 {
+        unsafe {
+            libc::close(master_fd);
+            libc::close(status_r)
+        };
+        let mut w = FdWriter(fd);
+        let _ = send_frame(&mut w, FRAME_EXIT, &(-1i32).to_be_bytes());
+        return Ok(());
+    }
+
+    let master_write = Arc::new(Mutex::new(master_fd));
+    let master_write2 = Arc::clone(&master_write);
+
+    // Stdin/resize thread: read frames from vsock, write to PTY master.
+    let stdin_thread = std::thread::spawn(move || {
+        let mut reader = FdReader(fd);
+        loop {
+            match recv_frame(&mut reader) {
+                Ok((FRAME_STDIN, data)) => {
+                    let mfd = master_write2.lock().unwrap();
+                    let ret = unsafe {
+                        libc::write(*mfd, data.as_ptr() as *const libc::c_void, data.len())
+                    };
+                    if ret < 0 {
+                        break;
+                    }
+                }
+                Ok((FRAME_RESIZE, data)) if data.len() == 4 => {
+                    let rows = u16::from_be_bytes([data[0], data[1]]);
+                    let cols = u16::from_be_bytes([data[2], data[3]]);
+                    let ws = libc::winsize {
+                        ws_row: rows,
+                        ws_col: cols,
+                        ws_xpixel: 0,
+                        ws_ypixel: 0,
+                    };
+                    let mfd = master_write2.lock().unwrap();
+                    unsafe { libc::ioctl(*mfd, libc::TIOCSWINSZ, &ws) };
+                }
+                Ok(_) | Err(_) => break,
+            }
+        }
+    });
+
+    // Stdout thread: read from master, send FRAME_STDOUT.
+    let writer = Arc::new(Mutex::new(FdWriter(fd)));
+    let w_out = Arc::clone(&writer);
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = unsafe {
+                libc::read(
+                    master_read_fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+            if n <= 0 {
+                break; // EIO when slave side fully closes (grandchild exited)
+            }
+            let mut w = w_out.lock().unwrap();
+            if send_frame(&mut *w, FRAME_STDOUT, &buf[..n as usize]).is_err() {
+                break;
+            }
+        }
+        unsafe { libc::close(master_read_fd) };
+    });
+
+    // Wait for PTY output to drain (grandchild exit closes slave → EIO on master).
+    let _ = stdout_thread.join();
+
+    // Close master write fd — unblocks the stdin thread if it is waiting on recv_frame.
+    {
+        let mfd = master_write.lock().unwrap();
+        unsafe { libc::close(*mfd) };
+    }
+
+    // Read exit code.  By the time stdout drains the intermediate has completed
+    // waitpid and written to status_r, so this read returns promptly.
+    let mut code_buf = [0u8; 4];
+    let code: i32 =
+        if unsafe { libc::read(status_r, code_buf.as_mut_ptr() as *mut libc::c_void, 4) } == 4 {
+            i32::from_be_bytes(code_buf)
+        } else {
+            -1
+        };
+    unsafe { libc::close(status_r) };
+
+    let mut w = writer.lock().unwrap();
+    let _ = send_frame(&mut *w, FRAME_EXIT, &code.to_be_bytes());
+    drop(w);
+    drop(stdin_thread); // detach
     Ok(())
 }
 
