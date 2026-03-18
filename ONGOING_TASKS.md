@@ -1,7 +1,7 @@
 # pelagos-mac — Ongoing Tasks
 
 
-*Last updated: 2026-03-18*
+*Last updated: 2026-03-18 (commit cd7ac42)*
 
 ---
 
@@ -9,9 +9,11 @@
 
 **Phase 4 (VS Code devcontainer support) complete.** The Docker CLI shim covers
 the full devcontainer lifecycle. The exec-into PID namespace blocker
-(pelagos#121) is now fixed in pelagos-guest using a hybrid nsenter approach.
+(pelagos#121) is fixed in pelagos-guest using a hybrid nsenter approach.
+The "Dev container not found" blocker (shim inspect after exit) is fixed via
+a local container state cache in pelagos-docker.
 All 22 devcontainer e2e tests (Suites A–E) pass. VS Code "Reopen in Container"
-is ready for manual verification.
+is ready for manual verification (PR #106).
 
 ### What works today
 
@@ -79,7 +81,7 @@ and verify: IDE attaches, extensions install, terminal opens inside container.
 2. **exec-into stdin BufReader fix** (pelagos-mac#103) — CLOSED. Applied in
    `pelagos-mac/src/main.rs`: replaced `io::stdin().read()` with `libc::read(STDIN_FILENO,...)`.
 
-3. **pelagos#121 — exec-into PID namespace join.** **FIXED in this branch.**
+3. **pelagos#121 — exec-into PID namespace join.** **FIXED in PR #106.**
    Root cause: `setns(CLONE_NEWPID)` in `pre_exec` (after fork) only sets
    `pid_for_children`; a second fork is required for the process to acquire a
    namespace-local PID. Without it, `/proc/self` is a dangling symlink, causing
@@ -94,6 +96,19 @@ and verify: IDE attaches, extensions install, terminal opens inside container.
      `util-linux-misc-2.40.4-r1.apk`.
 
    **Verified:** `mypid=2`, `readlink /proc/self/ns/mnt` → `mnt:[4026532138]`, exit 0.
+
+4. **"Dev container not found" after docker run exits** — **FIXED in PR #106.**
+   Root cause: pelagos removes exited containers from in-memory state immediately.
+   VS Code calls `docker inspect <container>` after `docker run` exits and expects
+   `State.Status="exited"`.
+
+   **Fix (pelagos-docker/src/main.rs):**
+   - `cmd_run` writes container metadata to `~/.local/share/pelagos/shim-containers.json`.
+   - `cmd_inspect_container` falls back to the cache when pelagos ps --all doesn't
+     list the container, returning a synthetic exited-state response.
+   - `cmd_rm` removes the cache entry.
+
+   **Verified:** `docker run exits` → `docker inspect` returns exit 0, `State.Status="exited"`.
 
 ### pelagos-mac — Lower priority
 
