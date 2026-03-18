@@ -305,6 +305,7 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
         };
         match cmd {
             GuestCommand::Ping => {
+                log::debug!("ping");
                 send_response(&mut writer, &GuestResponse::Pong { pong: true })?;
                 return Ok(());
             }
@@ -348,6 +349,7 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 return Ok(());
             }
             GuestCommand::Ps { all } => {
+                log::debug!("ps all={}", all);
                 let mut cmd = Command::new(pelagos_bin());
                 cmd.arg("ps");
                 if all {
@@ -1333,24 +1335,31 @@ fn handle_exec(
 
 /// Exec into an already-running container by entering its Linux namespaces.
 ///
-/// Opens namespace fds in the parent, then uses `pre_exec` to call setns(2)
-/// in the forked child — after fork but before exec.  This is critical: calling
-/// setns in the parent thread would affect all other guest threads, corrupting
-/// the daemon for every concurrent connection.
+/// Uses a two-step approach to correctly handle the PID namespace:
 ///
-/// # Why `pelagos exec` subprocess CANNOT be used here
+/// Step 1 (pre_exec, in the forked child): join net/uts/ipc/mnt namespaces,
+/// then fchdir+chroot into the container's rootfs.  After this, the child is
+/// inside the container's mount/network/UTS/IPC namespaces.
 ///
-/// `pelagos exec` (the Linux pelagos CLI) **always skips the PID namespace join**
-/// when running rootless containers.  `setns(CLONE_NEWPID)` only updates
-/// `pid_for_children`; a subsequent fork() is required to enter the namespace,
-/// and that double-fork happens inside container.rs before `pre_exec` runs —
-/// too late to redo it.  As a result, a subprocess calling `pelagos exec` runs
-/// in the guest's root filesystem, not the container's.  The failure is silent:
-/// exit 0, wrong data.
+/// Step 2 (nsenter, run as the command): after chroot, `/proc` is the
+/// container's procfs.  `nsenter --target 1 --pid` opens `/proc/1/ns/pid`,
+/// calls `setns(CLONE_NEWPID)` in the single-threaded nsenter process (safe),
+/// and forks — the grandchild is born in the container's PID namespace with a
+/// proper local PID.  Without this step, `/proc/self` is a 0-byte dangling
+/// symlink, causing VS Code `resolveAuthority` to fail.
 ///
-/// Any guest code that runs commands inside a container MUST use the direct
-/// setns pattern shown here and in `handle_cp_from` / `handle_cp_to`.
-/// See docs/GUEST_CONTAINER_EXEC.md for the full analysis and a reusable template.
+/// Why not call `setns(CLONE_NEWPID)` directly in pre_exec?
+/// pre_exec runs after fork, in the child.  The child's PID was already
+/// assigned in the parent's namespace at fork time.  setns only updates
+/// `pid_for_children`; a second fork is required for the child to get a PID
+/// in the new namespace.  nsenter handles this double-fork internally.
+///
+/// Requirement: the container image must have `nsenter` (util-linux) at
+/// `/usr/bin/nsenter`.  Ubuntu ≥ 20.04 and Debian ≥ bullseye ship it by
+/// default.  For images without nsenter, exec-into falls back to the
+/// pre_exec-only path (no PID namespace join; `/proc/self` may dangle).
+///
+/// See docs/GUEST_CONTAINER_EXEC.md for the full namespace join analysis.
 fn handle_exec_into(
     fd: libc::c_int,
     container: &str,
@@ -1370,9 +1379,9 @@ fn handle_exec_into(
         e
     })?;
 
-    // Open namespace fds in the parent (allocations are safe here).
-    // Must NOT use O_CLOEXEC so that pre_exec can use them before exec.
-    let ns_fds = open_ns_fds(pid).map_err(|e| {
+    // Open namespace fds for non-PID namespaces.  PID namespace is handled by
+    // nsenter (which must fork after setns to give the child a namespace-local PID).
+    let ns_fds = open_ns_fds_no_pid(pid).map_err(|e| {
         let mut w = FdWriter(fd);
         let _ = send_response(
             &mut w,
@@ -1383,10 +1392,7 @@ fn handle_exec_into(
         e
     })?;
 
-    // Open /proc/<pid>/root so we can chroot into the container's rootfs after
-    // setns(CLONE_NEWNS). setns changes the mount namespace but does NOT update
-    // the calling process's root dentry — without fchdir+chroot the process
-    // would still resolve absolute paths through the guest (Alpine) root.
+    // Open /proc/<pid>/root for fchdir+chroot in pre_exec.
     let root_fd = open_root_fd(pid).map_err(|e| {
         for &nfd in &ns_fds {
             unsafe { libc::close(nfd) };
@@ -1410,7 +1416,6 @@ fn handle_exec_into(
     let (prog, rest) = match args.split_first() {
         Some(p) => p,
         None => {
-            // Close ns fds and root_fd before returning.
             for nfd in ns_fds {
                 unsafe { libc::close(nfd) };
             }
@@ -1446,18 +1451,21 @@ fn handle_exec_into(
         container_env.len()
     );
 
-    let mut cmd = Command::new(prog);
+    // nsenter wraps the target command to join the PID namespace via double-fork.
+    // After pre_exec chroots us into the container's rootfs, `/proc` is the
+    // container's procfs, so --target 1 refers to the container's init process.
+    let mut cmd = Command::new("/usr/bin/nsenter");
+    cmd.args(["--target", "1", "--pid", "--"]);
+    cmd.arg(prog);
     cmd.args(rest);
     cmd.env_clear();
     for (k, v) in &container_env {
         cmd.env(k, v);
     }
 
-    // Enter namespaces in the child after fork, before exec.
-    // Only async-signal-safe operations (setns, close, fchdir, chroot) are used.
-    // Order: net/uts/ipc first, pid before mnt (so /proc stays readable).
-    // After all setns calls, fchdir+chroot into the container's rootfs so that
-    // absolute paths resolve through the container filesystem, not the guest root.
+    // Enter non-PID namespaces in the child after fork, before exec.
+    // Order: net/uts/ipc first, then mnt (so /proc transitions to container's view).
+    // After setns(mnt), fchdir+chroot into the container's rootfs and chdir to workdir.
     let workdir_owned: Option<std::ffi::CString> =
         workdir.and_then(|w| std::ffi::CString::new(w.as_bytes()).ok());
     unsafe {
@@ -1637,7 +1645,17 @@ fn open_root_fd(pid: u32) -> std::io::Result<libc::c_int> {
     let path = format!("/proc/{}/root", root_pid);
     let cpath = std::ffi::CString::new(path.as_str())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    // O_CLOEXEC is safe here: pre_exec runs after fork() but before exec(), so
+    // the fd is still accessible in pre_exec.  O_CLOEXEC only closes it at exec()
+    // time, which prevents it leaking into unrelated child processes spawned by
+    // pelagos-guest on other threads — without this, every subprocess inherits
+    // all open namespace fds, exhausting the fd table (EMFILE).
+    let fd = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -1647,6 +1665,27 @@ fn open_root_fd(pid: u32) -> std::io::Result<libc::c_int> {
 /// Open namespace file descriptors for the given PID.
 /// Returns fds in order: [net, uts, ipc, pid, mnt].
 /// Caller must close all returned fds.
+/// Open namespace fds for exec-into: net/uts/ipc/mnt only (no pid).
+/// The PID namespace is handled by nsenter (double-fork in nsenter process).
+fn open_ns_fds_no_pid(pid: u32) -> std::io::Result<[libc::c_int; 4]> {
+    let ns_names = ["net", "uts", "ipc", "mnt"];
+    let mut fds = [-1i32; 4];
+    for (i, ns) in ns_names.iter().enumerate() {
+        let path = format!("/proc/{}/ns/{}", pid, ns);
+        let cpath = std::ffi::CString::new(path.as_str())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            for fd in fds.iter().take(i) {
+                unsafe { libc::close(*fd) };
+            }
+            return Err(std::io::Error::last_os_error());
+        }
+        fds[i] = fd;
+    }
+    Ok(fds)
+}
+
 fn open_ns_fds(pid: u32) -> std::io::Result<[libc::c_int; 5]> {
     let ns_names = ["net", "uts", "ipc", "pid", "mnt"];
     let mut fds = [-1i32; 5];
@@ -1654,8 +1693,11 @@ fn open_ns_fds(pid: u32) -> std::io::Result<[libc::c_int; 5]> {
         let path = format!("/proc/{}/ns/{}", pid, ns);
         let cpath = std::ffi::CString::new(path.as_str())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        // No O_CLOEXEC: fd must survive into pre_exec (before exec).
-        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
+        // O_CLOEXEC is safe here: pre_exec runs after fork() but before exec(),
+        // so the fd is accessible in pre_exec.  It only closes at exec() time,
+        // preventing leakage into unrelated child processes (which would exhaust
+        // the fd table and cause EMFILE).
+        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd < 0 {
             for fd in fds.iter().take(i) {
                 unsafe { libc::close(*fd) };

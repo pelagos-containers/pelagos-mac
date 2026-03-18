@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # build-vm-image.sh — Build a minimal Alpine Linux ARM64 initramfs image for pelagos-mac.
 #
-# Strategy: appended cpio initramfs — no QEMU, no ext4, no interactive install.
+# Strategy: appended cpio initramfs — no QEMU, no interactive install.
 #
 #   1. Download Alpine LTS netboot artifacts for aarch64 (3.21):
 #      vmlinuz-lts, initramfs-lts, modloop-lts (no ISO extraction needed).
@@ -49,7 +49,7 @@ DISK_IMG="$OUT/root.img"
 INITRAMFS_OUT="$OUT/initramfs-custom.gz"
 KERNEL_OUT="$OUT/vmlinuz"
 
-PELAGOS_VERSION="0.56.0"
+PELAGOS_VERSION="0.58.0"
 PELAGOS_BIN="$WORK/pelagos-${PELAGOS_VERSION}-aarch64-linux"
 PELAGOS_URL="https://github.com/skeptomai/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-aarch64-linux"
 # If a local build exists (from /Users/cb/Projects/pelagos), use it instead of downloading.
@@ -89,6 +89,12 @@ LIBCOM_ERR_PKG="libcom_err-1.47.1-r1"
 LIBCOM_ERR_APK="$WORK/${LIBCOM_ERR_PKG}.apk"
 LIBCOM_ERR_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${LIBCOM_ERR_PKG}.apk"
 
+# util-linux: provides nsenter, used by pelagos-guest exec-into to join the
+# container's PID namespace via the correct double-fork mechanism.
+UTILLINUX_PKG="util-linux-misc-2.40.4-r1"
+UTILLINUX_APK="$WORK/${UTILLINUX_PKG}.apk"
+UTILLINUX_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${UTILLINUX_PKG}.apk"
+NSENTER_BIN="$WORK/nsenter-bin"
 
 # SSH key for 'pelagos vm ssh': generated once per user, baked into the initramfs.
 PELAGOS_STATE_DIR="$HOME/.local/share/pelagos"
@@ -198,22 +204,17 @@ fi
 # ---------------------------------------------------------------------------
 echo "[4/8] Building pelagos-guest (cross-compile)"
 # ---------------------------------------------------------------------------
-if [ ! -f "$GUEST_BIN" ]; then
-    echo "  Cross-compiling pelagos-guest for aarch64-unknown-linux-musl..."
-    RUSTUP_CARGO="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo"
-    if [ ! -x "$RUSTUP_CARGO" ]; then
-        RUSTUP_CARGO="cargo"
-    fi
-    PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/opt/homebrew/bin:/usr/bin:$PATH" \
-        "$RUSTUP_CARGO" zigbuild \
-            --manifest-path "$REPO_ROOT/Cargo.toml" \
-            -p pelagos-guest \
-            --target aarch64-unknown-linux-musl \
-            --release
-    echo "  Built: $GUEST_BIN"
-else
-    echo "  (cached: $GUEST_BIN)"
+RUSTUP_CARGO="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo"
+if [ ! -x "$RUSTUP_CARGO" ]; then
+    RUSTUP_CARGO="cargo"
 fi
+PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/opt/homebrew/bin:/usr/bin:$PATH" \
+    "$RUSTUP_CARGO" zigbuild \
+        --manifest-path "$REPO_ROOT/Cargo.toml" \
+        -p pelagos-guest \
+        --target aarch64-unknown-linux-musl \
+        --release
+echo "  Built: $GUEST_BIN"
 
 # ---------------------------------------------------------------------------
 echo "[5/8] Downloading pelagos runtime binary (v${PELAGOS_VERSION})"
@@ -359,6 +360,22 @@ else
     echo "  (cached: e2fsprogs libs)"
 fi
 
+if [ ! -f "$NSENTER_BIN" ]; then
+    [ ! -f "$UTILLINUX_APK" ] && curl -L --progress-bar -o "$UTILLINUX_APK" "$UTILLINUX_URL"
+    ULEXTRACT="$WORK/util-linux-extract"
+    rm -rf "$ULEXTRACT" && mkdir -p "$ULEXTRACT"
+    bsdtar -xf "$UTILLINUX_APK" -C "$ULEXTRACT" 2>/dev/null || true
+    if [ -f "$ULEXTRACT/usr/bin/nsenter" ]; then
+        cp "$ULEXTRACT/usr/bin/nsenter" "$NSENTER_BIN"
+        chmod 755 "$NSENTER_BIN"
+        echo "  Extracted nsenter"
+    else
+        echo "ERROR: nsenter not found in $UTILLINUX_APK" >&2; exit 1
+    fi
+else
+    echo "  (cached: nsenter-bin)"
+fi
+
 # ---------------------------------------------------------------------------
 echo "[6/8] Staging Mozilla CA bundle (for TLS inside VM)"
 # ---------------------------------------------------------------------------
@@ -490,7 +507,7 @@ if [ ! -f "$INITRAMFS_OUT" ] \
     fi
 
     # virtio_blk.ko: provides /dev/vda (the persistent OCI image cache disk).
-    # Without this, /dev/vda does not exist and the ext2 mount fails — all OCI
+    # Without this, /dev/vda does not exist and the ext4 mount fails — all OCI
     # layer data goes to the root tmpfs and fills it up during large builds.
     VBK_KO="$NETMOD_BASE/drivers/block/virtio_blk.ko"
     if [ -f "$VBK_KO" ]; then
@@ -501,9 +518,11 @@ if [ ! -f "$INITRAMFS_OUT" ] \
         echo "  WARNING: virtio_blk.ko not found in modloop — /dev/vda will be unavailable" >&2
     fi
 
-    # ext2 filesystem module (+ mbcache dep): needed to mount /dev/vda.
-    # ext2 is a module in linux-lts (not built-in).
-    for ko_rel in fs/mbcache.ko fs/ext2/ext2.ko; do
+    # ext4 filesystem module (+ jbd2 journal + mbcache deps): needed to mount /dev/vda.
+    # ext4 is a module in linux-lts (not built-in).  ext4 replaces ext2 because its
+    # journal makes the filesystem self-healing after unclean VM shutdowns — no more
+    # "deleted inode referenced" corruption when the daemon is killed mid-write.
+    for ko_rel in fs/mbcache.ko fs/jbd2/jbd2.ko fs/ext4/ext4.ko; do
         src="$MODLOOP_DIR/modules/$KVER/kernel/$ko_rel"
         dst="$INITRD_TMP/lib/modules/$KVER/kernel/$ko_rel"
         if [ -f "$src" ]; then
@@ -513,7 +532,7 @@ if [ ! -f "$INITRAMFS_OUT" ] \
             echo "  WARNING: $ko_rel not found in modloop" >&2
         fi
     done
-    echo "  staged ext2 + mbcache modules"
+    echo "  staged ext4 + jbd2 + mbcache modules"
 
     # Replace the Alpine initramfs's modules.dep with the one from the modloop.
     # The Alpine initramfs modules.dep only covers its bundled subset; ours
@@ -566,6 +585,14 @@ if [ ! -f "$INITRAMFS_OUT" ] \
         echo "  staged mke2fs + e2fsprogs libs"
     fi
 
+    # Stage nsenter from util-linux for PID namespace join in exec-into.
+    # busybox in Alpine's initramfs-lts does not include the nsenter applet.
+    if [ -f "$NSENTER_BIN" ]; then
+        mkdir -p "$INITRD_TMP/usr/bin"
+        cp "$NSENTER_BIN" "$INITRD_TMP/usr/bin/nsenter"
+        chmod 755 "$INITRD_TMP/usr/bin/nsenter"
+        echo "  staged nsenter (util-linux)"
+    fi
 
     # Stage the host's public key as the VM's authorized_keys.
     mkdir -p "$INITRD_TMP/root/.ssh"
@@ -626,7 +653,8 @@ if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
     modprobe virtio_net          2>/dev/null || true
     modprobe virtio_blk          2>/dev/null || true
     modprobe tun                 2>/dev/null || true
-    modprobe ext2                2>/dev/null || true
+    modprobe jbd2                2>/dev/null || true
+    modprobe ext4                2>/dev/null || true
     # Create /dev/net/tun device node.  The tun kernel module registers
     # the device (char major 10, minor 200) but does not create the node
     # automatically without udevd/mdev.  pasta requires /dev/net/tun to
@@ -737,16 +765,20 @@ done
 
 busybox mkdir -p /var/lib/pelagos
 if busybox test -b /dev/vda; then
-    if busybox blkid /dev/vda 2>/dev/null | busybox grep -q ext2; then
-        busybox mount -t ext2 /dev/vda /var/lib/pelagos 2>/dev/null && \
-            echo "[pelagos-init] mounted /dev/vda (ext2) at /var/lib/pelagos" || \
-            echo "[pelagos-init] WARNING: ext2 mount of /dev/vda failed" >&2
+    if busybox blkid /dev/vda 2>/dev/null | busybox grep -q 'TYPE="ext4"'; then
+        busybox mount -t ext4 /dev/vda /var/lib/pelagos 2>/dev/null && \
+            echo "[pelagos-init] mounted /dev/vda (ext4) at /var/lib/pelagos" || \
+            echo "[pelagos-init] WARNING: ext4 mount of /dev/vda failed" >&2
     elif busybox test -x /sbin/mke2fs; then
-        echo "[pelagos-init] formatting /dev/vda as ext2 for OCI image cache..."
-        /sbin/mke2fs -F -t ext2 /dev/vda 2>/dev/null && \
-            busybox mount -t ext2 /dev/vda /var/lib/pelagos 2>/dev/null && \
-            echo "[pelagos-init] formatted and mounted /dev/vda at /var/lib/pelagos" || \
-            echo "[pelagos-init] WARNING: ext2 format/mount failed — OCI cache in RAM" >&2
+        if busybox blkid /dev/vda 2>/dev/null | busybox grep -q 'TYPE="ext2"'; then
+            echo "[pelagos-init] ext2 detected — reformatting as ext4 (OCI cache will be repopulated)..."
+        else
+            echo "[pelagos-init] formatting /dev/vda as ext4 for OCI image cache..."
+        fi
+        /sbin/mke2fs -F -t ext4 /dev/vda 2>/dev/null && \
+            busybox mount -t ext4 /dev/vda /var/lib/pelagos 2>/dev/null && \
+            echo "[pelagos-init] formatted and mounted /dev/vda (ext4) at /var/lib/pelagos" || \
+            echo "[pelagos-init] WARNING: ext4 format/mount failed — OCI cache in RAM" >&2
     else
         echo "[pelagos-init] WARNING: mke2fs missing — OCI cache will be in RAM" >&2
     fi
@@ -769,7 +801,8 @@ dropbear -s -R -p 22 2>/dev/null || true
 
 (while true; do /bin/sh </dev/hvc0 >/dev/hvc0 2>/dev/hvc0; sleep 1; done) &
 
-exec /usr/local/bin/pelagos-guest
+export RUST_LOG=debug
+exec /usr/local/bin/pelagos-guest </dev/null >/tmp/guest.log 2>&1
 INIT_EOF
     chmod 755 "$INITRD_TMP/init"
 

@@ -265,7 +265,9 @@ enum DockerCmd {
 
 fn main() {
     // `docker -v` prints version info; intercept before clap since it's not a subcommand.
-    if std::env::args().any(|a| a == "-v") {
+    // Check args()[1] specifically: `-v` is only the version flag when it is the *first*
+    // and only argument. Any other position means it is a volume-mount flag (-v host:ctr).
+    if std::env::args().nth(1).as_deref() == Some("-v") && std::env::args().count() == 2 {
         println!("Docker version 20.10.0, build pelagos");
         process::exit(0);
     }
@@ -543,6 +545,20 @@ fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
         }
     }
 
+    // Collect bind/volume specs for the cache before we move sub.
+    let bind_specs_for_cache: Vec<String> = mounts
+        .iter()
+        .filter_map(|m| parse_mount_as_volume(m))
+        .collect();
+    let vol_specs_for_cache: Vec<String> = volumes.clone();
+    let labels_for_cache: HashMap<String, String> = label_args
+        .iter()
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            Some((k.to_string(), v.to_string()))
+        })
+        .collect();
+
     let exit_code = match run_pelagos_inherited(cfg, &sub) {
         Ok(status) => status.code().unwrap_or(1),
         Err(e) => {
@@ -550,6 +566,30 @@ fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
             1
         }
     };
+
+    // Cache the container metadata so that `docker inspect` can return valid
+    // data even after pelagos removes the exited container from its state.
+    // Only cache if the run succeeded (exit 0) or the container was actually
+    // created (exit 0 for foreground runs that exited cleanly).
+    if exit_code == 0 {
+        cache_container(
+            &effective_name,
+            CachedContainer {
+                image: image.clone(),
+                labels: labels_for_cache,
+                vol_specs: vol_specs_for_cache,
+                bind_specs: bind_specs_for_cache,
+                started_at: {
+                    let secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    format!("{}", secs)
+                },
+            },
+        );
+    }
+
     exit_code
 }
 
@@ -559,7 +599,7 @@ fn cmd_exec(
     tty: bool,
     user: Option<&str>,
     workdir: Option<&str>,
-    _env: &[String],
+    env: &[String],
     name_and_args: &[String],
 ) -> i32 {
     let (name, cmd_args) = match name_and_args.split_first() {
@@ -571,6 +611,8 @@ fn cmd_exec(
     };
 
     // `pelagos exec-into <container> [cmd...]` — enters running container's namespaces.
+    // pelagos exec-into has no --env flag; inject env vars by prepending `env VAR=VAL …`
+    // to the command so the container shell inherits them.
     let mut sub: Vec<OsString> = Vec::new();
     sub.push("exec-into".into());
     if tty {
@@ -585,6 +627,30 @@ fn cmd_exec(
         sub.push(w.into());
     }
     sub.push(name.into());
+    // Inject env vars (and HOME if missing) by prepending `env VAR=VAL …` to the command.
+    // Docker sets HOME from /etc/passwd; pelagos doesn't, so we fill it in here.
+    // (tracked in pelagos#120-followup — HOME not set from passwd)
+    let caller_has_home = env.iter().any(|kv| kv.starts_with("HOME="));
+    let effective_user = user.unwrap_or("root");
+    let home_for_user = if effective_user == "root" || effective_user == "0" {
+        Some("/root")
+    } else {
+        // Non-root: we don't know the home dir without querying /etc/passwd inside
+        // the container.  Leave HOME unset for now; file pelagos issue for proper fix.
+        None
+    };
+    let need_env_prefix = !env.is_empty() || (!caller_has_home && home_for_user.is_some());
+    if need_env_prefix {
+        sub.push("env".into());
+        if !caller_has_home {
+            if let Some(h) = home_for_user {
+                sub.push(format!("HOME={}", h).into());
+            }
+        }
+        for kv in env {
+            sub.push(kv.into());
+        }
+    }
     for a in cmd_args {
         sub.push(a.into());
     }
@@ -782,13 +848,18 @@ fn cmd_rm(cfg: &Config, force: bool, name: &str) -> i32 {
     } else {
         args(&["rm", name])
     };
-    match run_pelagos_inherited(cfg, &sub) {
+    let exit = match run_pelagos_inherited(cfg, &sub) {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => {
             eprintln!("pelagos-docker rm: {}", e);
             1
         }
-    }
+    };
+    // Remove from shim cache regardless of exit code: if pelagos already cleaned
+    // the container up (which it does immediately on exit), rm returns non-zero,
+    // but VS Code still expects the cache entry to be gone.
+    uncache_container(name);
+    exit
 }
 
 /// Call `pelagos inspect <name>` and return the parsed JSON value.
@@ -1100,8 +1171,62 @@ fn cmd_inspect_container(cfg: &Config, names: &[String]) -> i32 {
                 network_settings: NetworkSettings { ports },
             });
         } else {
-            eprintln!("pelagos-docker inspect: container '{}' not found", name);
-            missing = true;
+            // Container not in pelagos ps --all.  Check shim cache: pelagos removes
+            // exited containers from its state immediately, but Docker retains them
+            // until `docker rm`.  VS Code inspects after `docker run` completes and
+            // expects to see the container in "exited" state.
+            let cache = load_shim_containers();
+            if let Some(cached) = cache.get(name.as_str()) {
+                let share_map = read_vm_share_map();
+                let all_specs: Vec<String> = cached
+                    .vol_specs
+                    .iter()
+                    .chain(cached.bind_specs.iter())
+                    .map(|s| translate_volume_spec(s, &share_map))
+                    .collect();
+                let mounts: Vec<MountEntry> = all_specs
+                    .iter()
+                    .filter_map(|spec| {
+                        let (src, dst) = spec.split_once(':')?;
+                        Some(MountEntry {
+                            mount_type: "bind".into(),
+                            source: src.to_string(),
+                            destination: dst.to_string(),
+                            mode: String::new(),
+                            rw: true,
+                            propagation: "rprivate".into(),
+                        })
+                    })
+                    .collect();
+                let binds: Vec<String> = all_specs.clone();
+                let port_map = load_port_map();
+                let ports = build_ports_map(name, &port_map);
+                results.push(ContainerInspect {
+                    id: name.clone(),
+                    name: format!("/{}", name),
+                    created: cached.started_at.clone(),
+                    state: ContainerState {
+                        running: false,
+                        status: "exited".into(),
+                        started_at: cached.started_at.clone(),
+                    },
+                    config: ContainerConfig {
+                        image: cached.image.clone(),
+                        labels: cached.labels.clone(),
+                        user: String::new(),
+                        env: vec![],
+                        cmd: vec![],
+                        working_dir: String::new(),
+                        entrypoint: None,
+                    },
+                    host_config: HostConfig { binds },
+                    mounts,
+                    network_settings: NetworkSettings { ports },
+                });
+            } else {
+                eprintln!("pelagos-docker inspect: container '{}' not found", name);
+                missing = true;
+            }
         }
     }
 
@@ -1141,6 +1266,78 @@ fn cmd_inspect_image(cfg: &Config, names: &[String]) -> i32 {
     // For now: trust the caller; return 0 (image existence check is best-effort).
     let _ = cfg; // suppress unused warning
     0
+}
+
+// ---------------------------------------------------------------------------
+// Container state cache
+//
+// pelagos removes exited containers from its in-memory state immediately after
+// the main process exits.  Docker, by contrast, retains exited containers until
+// explicitly `docker rm`'d.  The VS Code devcontainer extension calls
+// `docker inspect <container>` after `docker run` completes and expects to see
+// the container in "exited" state.  Without this cache, inspect returns exit
+// code 1 ("not found") and VS Code shows "Dev container not found."
+//
+// The cache is a JSON object at ~/.local/share/pelagos/shim-containers.json,
+// keyed by container name.  Entries are written by cmd_run and removed by cmd_rm.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct CachedContainer {
+    image: String,
+    labels: HashMap<String, String>,
+    vol_specs: Vec<String>,
+    bind_specs: Vec<String>,
+    started_at: String,
+}
+
+fn shim_containers_path() -> Option<std::path::PathBuf> {
+    let base = if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        std::path::PathBuf::from(xdg).join("pelagos")
+    } else if let Ok(home) = std::env::var("HOME") {
+        std::path::PathBuf::from(home).join(".local/share/pelagos")
+    } else {
+        return None;
+    };
+    Some(base.join("shim-containers.json"))
+}
+
+fn load_shim_containers() -> HashMap<String, CachedContainer> {
+    let path = match shim_containers_path() {
+        Some(p) => p,
+        None => return HashMap::new(),
+    };
+    let s = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+    serde_json::from_str(&s).unwrap_or_default()
+}
+
+fn save_shim_containers(map: &HashMap<String, CachedContainer>) {
+    let path = match shim_containers_path() {
+        Some(p) => p,
+        None => return,
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string(map) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+fn cache_container(name: &str, entry: CachedContainer) {
+    let mut map = load_shim_containers();
+    map.insert(name.to_string(), entry);
+    save_shim_containers(&map);
+}
+
+fn uncache_container(name: &str) {
+    let mut map = load_shim_containers();
+    if map.remove(name).is_some() {
+        save_shim_containers(&map);
+    }
 }
 
 // ---------------------------------------------------------------------------
