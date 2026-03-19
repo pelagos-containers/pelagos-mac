@@ -1,7 +1,7 @@
 # pelagos-mac — Ongoing Tasks
 
 
-*Last updated: 2026-03-19 (branch feat/native-pid-namespace-exec, PR #107)*
+*Last updated: 2026-03-19 (branch feat/native-pid-namespace-exec, PR #107; pelagos v0.59.0)*
 
 ---
 
@@ -98,19 +98,9 @@ and verify: IDE attaches, extensions install, terminal opens inside container.
    **Verified:** `mypid=2`, `readlink /proc/self/ns/mnt` → `mnt:[4026532138]`, exit 0.
 
 5. **pelagos#124 — `pelagos run` must persist container PID before relaying stdout.**
-   Root cause of `exec-into: open ns fds: ENOENT` / `PID is '-'` race: pelagos relays
-   the container's stdout (including the "Container started" readiness echo) before
-   writing the container's PID to its state store. The devcontainer CLI reads
-   "Container started" and immediately fires exec-into. `pelagos ps --all` returns
-   `PID=-` because the state write has not completed yet.
-
-   **Workaround (pelagos-guest/src/main.rs):** `wait_for_container_ns()` retries
-   `get_container_pid` + `open_ns_fds` + `open_root_fd` for up to 3 s at 100 ms
-   intervals.  **Must be removed once pelagos#124 is fixed.**
-
-   **Required fix in pelagos:** In the run handler, write `{name, pid, status:running}`
-   to state store AND ensure it is visible to concurrent `pelagos ps` callers
-   **before** beginning stdout/stderr relay to the client.
+   **FIXED in pelagos v0.59.0 (PR #125).** Integrated in pelagos-mac (PELAGOS_VERSION bumped
+   to 0.59.0). No workaround needed; `wait_for_container_ns()` was never committed to master
+   (removed before PR #107 merge). All 22 devcontainer e2e tests pass with v0.59.0.
 
 4. **"Dev container not found" after docker run exits** — **FIXED in PR #106.**
    Root cause: pelagos removes exited containers from in-memory state immediately.
