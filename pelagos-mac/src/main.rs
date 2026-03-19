@@ -1756,7 +1756,11 @@ fn exec_command(stream: UnixStream, cmd: GuestCommand, tty: bool) -> i32 {
             // sees no POLLIN (kernel fd is empty) and those bytes are never forwarded.
             // Direct libc::read reads exactly what poll() knows about — no over-read.
             // (Fixes pelagos#119 / pelagos-mac#103)
-            if fds[0].revents & libc::POLLIN != 0 {
+            // Include POLLHUP so that when the write end of the pipe is closed
+            // (and no more bytes remain), read() returns 0 and we break cleanly.
+            // Without POLLHUP here, poll() fires instantly every iteration but
+            // POLLIN is never set → read() is never called → 100% CPU spin.
+            if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
                 let n = unsafe {
                     libc::read(
                         libc::STDIN_FILENO,
@@ -1783,12 +1787,14 @@ fn exec_command(stream: UnixStream, cmd: GuestCommand, tty: bool) -> i32 {
                     }
                 }
             }
-            // POLLERR means an unrecoverable error on the fd — send EOF and stop.
-            // Do NOT break on POLLHUP: POLLHUP on a pipe only signals that the write
-            // end was closed; there may still be unread bytes in the pipe buffer.
-            // Let libc::read returning 0 be the definitive EOF signal after all
-            // remaining data has been drained (fixes large-pipe data loss).
-            if fds[0].revents & libc::POLLERR != 0 {
+            // POLLERR or POLLNVAL: unrecoverable — send EOF and stop.
+            // POLLNVAL (0x20 on macOS) fires when the fd is closed (e.g. bash
+            // closes fd 0 when backgrounding a process with job control inactive).
+            if fds[0].revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                log::warn!(
+                    "exec: stdin fd closed/error (revents={:#x}), sending EOF",
+                    fds[0].revents
+                );
                 let mut w = writer_stdin.lock().unwrap();
                 let _ = send_frame(&mut *w, FRAME_STDIN, &[]);
                 break;
@@ -1829,7 +1835,8 @@ fn read_guest_frames(reader: &mut impl Read, _tty: bool) -> i32 {
                 return 0;
             }
             Ok((frame_type, _)) => {
-                log::warn!("exec: unexpected frame type {}", frame_type);
+                log::warn!("exec: unexpected frame type {} — closing", frame_type);
+                return 1;
             }
             Err(e) => {
                 if e.kind() != io::ErrorKind::UnexpectedEof

@@ -864,9 +864,18 @@ fn cmd_rm(cfg: &Config, force: bool, name: &str) -> i32 {
 
 /// Call `pelagos inspect <name>` and return the parsed JSON value.
 /// The host `pelagos inspect` delegates to `pelagos container inspect` in the guest.
-/// Returns None if the container is not found or the command fails.
+/// Returns None if the container is not found, the command fails, or it times out.
+///
+/// A 2-second timeout guards against broken/stale containers: `pelagos inspect`
+/// should never take more than a few hundred milliseconds on a healthy VM.  If it
+/// does, the container state is unresolvable and the caller gets an empty result
+/// rather than a permanent hang.
 fn pelagos_container_inspect_json(cfg: &Config, name: &str) -> Option<serde_json::Value> {
-    let out = run_pelagos(cfg, &args(&["inspect", name])).ok()?;
+    let out = invoke::run_pelagos_timeout(
+        cfg,
+        &args(&["inspect", name]),
+        std::time::Duration::from_secs(2),
+    )?;
     if !out.status.success() {
         return None;
     }

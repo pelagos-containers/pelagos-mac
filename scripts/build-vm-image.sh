@@ -771,7 +771,7 @@ dropbear -s -R -p 22 2>/dev/null || true
 
 (while true; do /bin/sh </dev/hvc0 >/dev/hvc0 2>/dev/hvc0; sleep 1; done) &
 
-export RUST_LOG=debug
+export RUST_LOG=warn
 exec /usr/local/bin/pelagos-guest </dev/null >/tmp/guest.log 2>&1
 INIT_EOF
     chmod 755 "$INITRD_TMP/init"

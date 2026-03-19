@@ -1363,39 +1363,23 @@ fn handle_exec_into(
 ) -> std::io::Result<()> {
     use std::ffi::CString;
 
-    let pid = get_container_pid(container).map_err(|e| {
-        let mut w = FdWriter(fd);
-        let _ = send_response(
-            &mut w,
-            &GuestResponse::Error {
-                error: format!("exec-into: {}", e),
-            },
-        );
-        e
-    })?;
-
-    // Open all 5 namespace fds (net/uts/ipc/pid/mnt) + container root.
+    log::warn!(
+        "exec-into: container={} tty={} args={:?}",
+        container,
+        tty,
+        args
+    );
+    // Retry obtaining the container PID and opening namespace fds for up to 3 s.
+    // VS Code exec-into can race container startup: pelagos may still report
+    // PID='-' (container creating) or the process may not yet have entered its
+    // namespaces (ENOENT on /proc/<pid>/ns/*).
     // ns_fds order: [net=0, uts=1, ipc=2, pid=3, mnt=4].
-    let ns_fds = open_ns_fds(pid).map_err(|e| {
+    let (pid, ns_fds, root_fd) = wait_for_container_ns(container, 3000).map_err(|e| {
         let mut w = FdWriter(fd);
         let _ = send_response(
             &mut w,
             &GuestResponse::Error {
-                error: format!("exec-into: open ns fds: {}", e),
-            },
-        );
-        e
-    })?;
-
-    let root_fd = open_root_fd(pid).map_err(|e| {
-        for &nfd in &ns_fds {
-            unsafe { libc::close(nfd) };
-        }
-        let mut w = FdWriter(fd);
-        let _ = send_response(
-            &mut w,
-            &GuestResponse::Error {
-                error: format!("exec-into: open root fd: {}", e),
+                error: format!("exec-into: container not ready: {}", e),
             },
         );
         e
@@ -1437,11 +1421,13 @@ fn handle_exec_into(
     }
     log::debug!("exec-into: prog={:?} args={:?}", prog, rest);
 
+    log::warn!("exec-into: ns_fds open, root_fd open, sending Ready");
     // Send ready — both sides switch to framed binary protocol.
     {
         let mut w = FdWriter(fd);
         send_response(&mut w, &GuestResponse::Ready { ready: true })?;
     }
+    log::warn!("exec-into: Ready sent, forking");
 
     // Prepare execve arguments BEFORE fork.  In the grandchild (post double-fork)
     // we must call only async-signal-safe functions; all heap allocation happens here.
@@ -1716,12 +1702,14 @@ fn handle_exec_into(
                 };
             }
 
+            log::warn!("exec-into: parent entering relay (tty={})", tty);
             // Relay I/O until the process exits, then collect exit code.
             let result = if tty {
                 relay_exec_into_tty(fd, master_fd, status_r)
             } else {
                 relay_exec_into_piped(fd, stdin_w, stdout_r, stderr_r, status_r)
             };
+            log::warn!("exec-into: relay done");
 
             // Reap intermediate (it exits after writing exit code to status pipe).
             unsafe { libc::waitpid(intermediate_pid, std::ptr::null_mut(), 0) };
@@ -1761,6 +1749,60 @@ fn get_container_pid(container: &str) -> std::io::Result<u32> {
         std::io::ErrorKind::NotFound,
         format!("container '{}' not found or not running", container),
     ))
+}
+
+/// Retry wrapper around `get_container_pid` + `open_ns_fds` + `open_root_fd`.
+///
+/// VS Code exec-into can arrive while the container process is still starting
+/// (pelagos reports PID='-') or immediately after (process exists but has not
+/// yet entered its namespaces → ENOENT on /proc/<pid>/ns/*).  We retry the
+/// entire sequence with 100 ms sleeps for up to `timeout_ms` milliseconds
+/// before giving up.
+fn wait_for_container_ns(
+    container: &str,
+    timeout_ms: u64,
+) -> std::io::Result<(u32, [libc::c_int; 5], libc::c_int)> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        let err = match get_container_pid(container) {
+            Ok(pid) => {
+                log::warn!("exec-into: got pid={}", pid);
+                match open_ns_fds(pid) {
+                    Ok(ns_fds) => match open_root_fd(pid) {
+                        Ok(root_fd) => return Ok((pid, ns_fds, root_fd)),
+                        Err(e) => {
+                            log::warn!(
+                                "exec-into: open_root_fd pid={} failed: {} — retrying",
+                                pid,
+                                e
+                            );
+                            e
+                        }
+                    },
+                    Err(e) => {
+                        log::warn!(
+                            "exec-into: open_ns_fds pid={} failed: {} — retrying",
+                            pid,
+                            e
+                        );
+                        e
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "exec-into: get_container_pid '{}' failed: {} — retrying",
+                    container,
+                    e
+                );
+                e
+            }
+        };
+        if std::time::Instant::now() >= deadline {
+            return Err(err);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// Thin wrapper around setns(2) that compiles on all platforms.
@@ -2233,34 +2275,63 @@ fn relay_exec_into_piped(
     let stdin_thread = std::thread::spawn(move || {
         let mut child_stdin = unsafe { std::fs::File::from_raw_fd(stdin_w) };
         let mut reader = FdReader(fd);
+        let mut frame_count = 0usize;
+        log::warn!("relay_piped: stdin_thread started, waiting for FRAME_STDIN");
         loop {
             match recv_frame(&mut reader) {
                 Ok((FRAME_STDIN, data)) => {
+                    frame_count += 1;
+                    log::warn!(
+                        "relay_piped: FRAME_STDIN #{} len={}",
+                        frame_count,
+                        data.len()
+                    );
                     if data.is_empty() {
+                        log::warn!("relay_piped: stdin EOF signal");
                         break; // zero-length = EOF signal
                     }
                     if child_stdin.write_all(&data).is_err() {
+                        log::warn!("relay_piped: write to child stdin failed");
                         break;
                     }
                 }
                 Ok((FRAME_RESIZE, _)) => {} // no PTY in piped mode; ignore
-                Ok(_) | Err(_) => break,
+                Ok((t, _)) => {
+                    log::warn!("relay_piped: unexpected frame type {}", t);
+                    break;
+                }
+                Err(e) => {
+                    log::warn!("relay_piped: recv_frame error: {}", e);
+                    break;
+                }
             }
         }
+        log::warn!(
+            "relay_piped: stdin_thread exiting after {} frames",
+            frame_count
+        );
         drop(child_stdin); // EOF to child
         drop(w_stdin);
     });
 
     // Stdout thread: read from stdout_r, send FRAME_STDOUT.
+    log::warn!("relay_piped: stdout_thread starting");
     let w_out = Arc::clone(&writer);
     let stdout_thread = std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
+        let mut total = 0usize;
         loop {
             let n =
                 unsafe { libc::read(stdout_r, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n <= 0 {
+                log::warn!(
+                    "relay_piped: stdout_r read returned {} (total bytes sent={})",
+                    n,
+                    total
+                );
                 break;
             }
+            total += n as usize;
             let mut w = w_out.lock().unwrap();
             if send_frame(&mut *w, FRAME_STDOUT, &buf[..n as usize]).is_err() {
                 break;
