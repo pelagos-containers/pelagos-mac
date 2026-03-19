@@ -249,6 +249,12 @@ enum DockerCmd {
         /// Destination: `container:path` or local path.
         dst: String,
     },
+
+    /// Show port mappings for a container.
+    Port {
+        /// Container name.
+        name: String,
+    },
     /// Manage Docker contexts (stub — always returns a single default context).
     Context {
         /// Subcommand: ls, inspect, use, create, rm, show, update, export, import.
@@ -374,6 +380,7 @@ fn main() {
         DockerCmd::Network { sub, name, quiet } => cmd_network(&cfg, &sub, name.as_deref(), quiet),
         DockerCmd::Cp { src, dst } => cmd_cp(&cfg, &src, &dst),
         DockerCmd::Context { sub, args: _ } => cmd_context(&sub),
+        DockerCmd::Port { name } => cmd_port(&name),
     };
 
     process::exit(exit_code);
@@ -488,11 +495,10 @@ fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
 
     let mut sub: Vec<OsString> = Vec::new();
 
-    // Port forwards go before "run" as global flags on pelagos.
-    for p in &ports {
-        sub.push("--port".into());
-        sub.push(p.into());
-    }
+    // Port forwards are handled by a separate `pelagos port-proxy` process managed
+    // by the shim (not by the pelagos daemon).  Do NOT pass --port to the main CLI:
+    // the daemon validates that requested ports were registered at startup, which
+    // fails when the daemon was started by an earlier `docker ps` without ports.
 
     sub.push("run".into());
 
@@ -559,6 +565,32 @@ fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
         })
         .collect();
 
+    // Spawn the port proxy before the container run so the listener is ready
+    // as soon as the container process starts.  For non-detach runs the proxy
+    // is killed when run_pelagos_inherited returns (container has exited).
+    // For detach runs the proxy keeps running; its PID is stored in the cache
+    // and killed on `docker stop` / `docker rm`.
+    let proxy_child: Option<std::process::Child> = if ports.is_empty() {
+        None
+    } else {
+        let mut proxy_cmd = std::process::Command::new(&cfg.pelagos_bin);
+        proxy_cmd.args(cfg.pelagos_prefix_args());
+        proxy_cmd.arg("port-proxy");
+        for p in &ports {
+            proxy_cmd.arg("--port").arg(p);
+        }
+        proxy_cmd.stdin(std::process::Stdio::null());
+        proxy_cmd.stdout(std::process::Stdio::null());
+        proxy_cmd.stderr(std::process::Stdio::null());
+        match proxy_cmd.spawn() {
+            Ok(child) => Some(child),
+            Err(e) => {
+                eprintln!("pelagos-docker: port-proxy spawn failed: {}", e);
+                None
+            }
+        }
+    };
+
     let exit_code = match run_pelagos_inherited(cfg, &sub) {
         Ok(status) => status.code().unwrap_or(1),
         Err(e) => {
@@ -569,9 +601,24 @@ fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
 
     // Cache the container metadata so that `docker inspect` can return valid
     // data even after pelagos removes the exited container from its state.
-    // Only cache if the run succeeded (exit 0) or the container was actually
-    // created (exit 0 for foreground runs that exited cleanly).
     if exit_code == 0 {
+        // For detach runs: container is still running — keep proxy alive and
+        // store its PID so docker stop/rm can kill it.
+        // For non-detach runs: container has exited — kill proxy immediately.
+        let proxy_pid: Option<u32> = if let Some(mut child) = proxy_child {
+            if detach {
+                let pid = child.id();
+                std::mem::forget(child); // detach: don't wait, let it run
+                Some(pid)
+            } else {
+                let _ = child.kill();
+                let _ = child.wait();
+                None
+            }
+        } else {
+            None
+        };
+
         cache_container(
             &effective_name,
             CachedContainer {
@@ -586,8 +633,14 @@ fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
                         .as_secs();
                     format!("{}", secs)
                 },
+                port_specs: ports.clone(),
+                proxy_pid,
             },
         );
+    } else if let Some(mut child) = proxy_child {
+        // Run failed: kill proxy regardless.
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     exit_code
@@ -833,16 +886,21 @@ fn cmd_start(cfg: &Config, names: &[String]) -> i32 {
 }
 
 fn cmd_stop(cfg: &Config, name: &str) -> i32 {
-    match run_pelagos_inherited(cfg, &args(&["stop", name])) {
+    let exit = match run_pelagos_inherited(cfg, &args(&["stop", name])) {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => {
             eprintln!("pelagos-docker stop: {}", e);
             1
         }
-    }
+    };
+    // Kill port-proxy if one is running for this container.
+    kill_proxy_for_container(name);
+    exit
 }
 
 fn cmd_rm(cfg: &Config, force: bool, name: &str) -> i32 {
+    // Kill proxy first so the port is freed before we remove the cache entry.
+    kill_proxy_for_container(name);
     let sub = if force {
         args(&["rm", "--force", name])
     } else {
@@ -860,6 +918,20 @@ fn cmd_rm(cfg: &Config, force: bool, name: &str) -> i32 {
     // but VS Code still expects the cache entry to be gone.
     uncache_container(name);
     exit
+}
+
+/// Kill the port-proxy process for `name` if one is recorded in the shim cache.
+fn kill_proxy_for_container(name: &str) {
+    let cache = load_shim_containers();
+    if let Some(entry) = cache.get(name) {
+        if let Some(pid) = entry.proxy_pid {
+            // Send SIGTERM via `kill` command — avoids a libc dependency.
+            let _ = std::process::Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .status();
+        }
+    }
 }
 
 /// Call `pelagos inspect <name>` and return the parsed JSON value.
@@ -1083,8 +1155,8 @@ fn cmd_inspect_container(cfg: &Config, names: &[String]) -> i32 {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let entries = parse_pelagos_ps(&stdout);
 
-    // Load port forwards from state file.
-    let port_map = load_port_map();
+    // Load shim cache once for per-container port specs.
+    let shim_cache = load_shim_containers();
     // Load virtiofs share map for VM path → host path translation.
     let share_map = read_vm_share_map();
 
@@ -1150,7 +1222,12 @@ fn cmd_inspect_container(cfg: &Config, names: &[String]) -> i32 {
                 .collect();
             let binds: Vec<String> = all_specs.iter().map(|s| s.to_string()).collect();
 
-            let ports = build_ports_map(name, &port_map);
+            // Per-container port specs from shim cache (populated by cmd_run -p).
+            let port_specs_for_container = shim_cache
+                .get(name.as_str())
+                .map(|c| c.port_specs.clone())
+                .unwrap_or_default();
+            let ports = build_ports_map(&port_specs_for_container);
             // Extract started_at from pelagos inspect for lifecycle marker idempotency.
             let started_at = native
                 .as_ref()
@@ -1175,7 +1252,10 @@ fn cmd_inspect_container(cfg: &Config, names: &[String]) -> i32 {
                     working_dir: String::new(),
                     entrypoint: None,
                 },
-                host_config: HostConfig { binds },
+                host_config: HostConfig {
+                    binds,
+                    port_bindings: ports.clone(),
+                },
                 mounts,
                 network_settings: NetworkSettings { ports },
             });
@@ -1208,8 +1288,7 @@ fn cmd_inspect_container(cfg: &Config, names: &[String]) -> i32 {
                     })
                     .collect();
                 let binds: Vec<String> = all_specs.clone();
-                let port_map = load_port_map();
-                let ports = build_ports_map(name, &port_map);
+                let ports = build_ports_map(&cached.port_specs);
                 results.push(ContainerInspect {
                     id: name.clone(),
                     name: format!("/{}", name),
@@ -1228,7 +1307,10 @@ fn cmd_inspect_container(cfg: &Config, names: &[String]) -> i32 {
                         working_dir: String::new(),
                         entrypoint: None,
                     },
-                    host_config: HostConfig { binds },
+                    host_config: HostConfig {
+                        binds,
+                        port_bindings: ports.clone(),
+                    },
                     mounts,
                     network_settings: NetworkSettings { ports },
                 });
@@ -1298,6 +1380,13 @@ struct CachedContainer {
     vol_specs: Vec<String>,
     bind_specs: Vec<String>,
     started_at: String,
+    /// Port specs from `-p HOST:CONTAINER` flags, stored as-is (e.g. "5000:5000").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    port_specs: Vec<String>,
+    /// PID of the running `pelagos port-proxy` process for detached containers.
+    /// None for non-detach runs (proxy is killed when run exits).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy_pid: Option<u32>,
 }
 
 fn shim_containers_path() -> Option<std::path::PathBuf> {
@@ -1353,43 +1442,65 @@ fn uncache_container(name: &str) {
 // Port map helpers
 // ---------------------------------------------------------------------------
 
-/// Load the running daemon's port forwards from the state file.
-fn load_port_map() -> Vec<(u16, u16)> {
-    let base = if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        std::path::PathBuf::from(xdg).join("pelagos")
-    } else if let Ok(home) = std::env::var("HOME") {
-        std::path::PathBuf::from(home).join(".local/share/pelagos")
-    } else {
-        return Vec::new();
-    };
-    let path = base.join("vm.ports");
-    let s = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    // vm.ports is a JSON array: [{"host_port":N,"container_port":M}, ...]
-    let arr: Vec<serde_json::Value> = serde_json::from_str(&s).unwrap_or_default();
-    arr.iter()
-        .filter_map(|v| {
-            let hp = v["host_port"].as_u64()? as u16;
-            let cp = v["container_port"].as_u64()? as u16;
-            Some((hp, cp))
-        })
-        .collect()
-}
-
-/// Build Docker's NetworkSettings.Ports map for a container.
-/// We have no per-container port info, so we expose all daemon-level forwards.
-fn build_ports_map(_container: &str, port_map: &[(u16, u16)]) -> HashMap<String, Vec<PortBinding>> {
+/// Build Docker's NetworkSettings.Ports / HostConfig.PortBindings map from
+/// per-container port specs (e.g. `["5000:5000", "8080:80/tcp"]`).
+///
+/// Docker spec: key is `container_port/proto`; value is a list of host bindings.
+fn build_ports_map(port_specs: &[String]) -> HashMap<String, Vec<PortBinding>> {
     let mut map = HashMap::new();
-    for (host_port, container_port) in port_map {
-        let key = format!("{}/tcp", container_port);
+    for spec in port_specs {
+        // Strip optional protocol suffix: "5000:5000/tcp" → ("5000:5000", "tcp")
+        let (spec_no_proto, proto) = if let Some((s, p)) = spec.rsplit_once('/') {
+            (s, p.to_string())
+        } else {
+            (spec.as_str(), "tcp".to_string())
+        };
+        // Handle "[host_ip:]host_port:container_port"
+        let parts: Vec<&str> = spec_no_proto.splitn(3, ':').collect();
+        let (host_port, container_port) = match parts.len() {
+            3 => (parts[1], parts[2]),
+            2 => (parts[0], parts[1]),
+            _ => continue,
+        };
+        let key = format!("{}/{}", container_port, proto);
         map.entry(key).or_insert_with(Vec::new).push(PortBinding {
             host_ip: "0.0.0.0".into(),
             host_port: host_port.to_string(),
         });
     }
     map
+}
+
+/// `docker port <container>` — print port mappings in Docker's text format:
+///   5000/tcp -> 0.0.0.0:5000
+fn cmd_port(name: &str) -> i32 {
+    let cache = load_shim_containers();
+    let port_specs = match cache.get(name) {
+        Some(c) => c.port_specs.clone(),
+        None => {
+            eprintln!("Error: No such container: {}", name);
+            return 1;
+        }
+    };
+    if port_specs.is_empty() {
+        // No ports — Docker prints nothing and exits 0.
+        return 0;
+    }
+    for spec in &port_specs {
+        let (spec_no_proto, proto) = if let Some((s, p)) = spec.rsplit_once('/') {
+            (s, p.to_string())
+        } else {
+            (spec.as_str(), "tcp".to_string())
+        };
+        let parts: Vec<&str> = spec_no_proto.splitn(3, ':').collect();
+        let (host_port, container_port) = match parts.len() {
+            3 => (parts[1], parts[2]),
+            2 => (parts[0], parts[1]),
+            _ => continue,
+        };
+        println!("{}/{} -> 0.0.0.0:{}", container_port, proto, host_port);
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------

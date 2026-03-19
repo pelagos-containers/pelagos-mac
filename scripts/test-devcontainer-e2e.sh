@@ -14,12 +14,13 @@
 #   Suite C — Features           (R-DC-03, R-DC-04)         fixture: dc-features
 #   Suite D — postCreateCommand  (R-DC-01 lifecycle)        fixture: dc-postcreate
 #   Suite E — Container restart  (pelagos#90/#91 validation) fixture: dc-prebuilt
+#   Suite F — Port forwarding    (issue #113)                 direct shim invocation
 #
 # Usage:
-#   bash scripts/test-devcontainer-e2e.sh [--debug] [--suite A|B|C|D|E]
+#   bash scripts/test-devcontainer-e2e.sh [--debug] [--suite A|B|C|D|E|F]
 #
 #   --debug        Dump full devcontainer output for every test, not just failures.
-#   --suite <X>    Run only one suite (A, B, C, D, E). Default: all.
+#   --suite <X>    Run only one suite (A, B, C, D, E, F). Default: all.
 #
 # Prerequisites:
 #   - devcontainer CLI installed: npm install -g @devcontainers/cli
@@ -572,6 +573,94 @@ if suite_active E; then
     fi
 
     dc_down "$WS_E"
+    echo ""
+fi
+
+# ---------------------------------------------------------------------------
+# Suite F — Port forwarding (issue #113)
+# ---------------------------------------------------------------------------
+
+if suite_active F; then
+    echo "=== suite F: port forwarding (issue #113) ==="
+
+    cleanup_vm
+
+    F_NAME="peltest-portfwd-$$"
+    F_HOST_PORT=15678
+    F_CONT_PORT=15678
+
+    # TC-F-01: docker run -d -p HOST:CONT starts a container
+    F_RUN_OUT=$("$SHIM" run -d --name "$F_NAME" \
+        -p "${F_HOST_PORT}:${F_CONT_PORT}" \
+        public.ecr.aws/docker/library/python:3.12-alpine \
+        python3 -m http.server "$F_CONT_PORT" 2>&1)
+    F_RUN_RC=$?
+    [ "$DEBUG" -eq 1 ] && dump "docker run -d -p output" "$F_RUN_OUT"
+    if [ "$F_RUN_RC" -eq 0 ]; then
+        pass "TC-F-01: docker run -d -p ${F_HOST_PORT}:${F_CONT_PORT}: exit 0"
+    else
+        fail "TC-F-01: docker run -d -p ${F_HOST_PORT}:${F_CONT_PORT}" \
+             "exit=$F_RUN_RC" "exit=0"
+    fi
+
+    # Give the HTTP server and proxy a moment to start.
+    sleep 3
+
+    # TC-F-02: curl localhost:HOST_PORT succeeds
+    F_CURL_OUT=$(curl -sf --max-time 5 "http://localhost:${F_HOST_PORT}/" 2>&1)
+    F_CURL_RC=$?
+    [ "$DEBUG" -eq 1 ] && dump "curl localhost output" "$F_CURL_OUT"
+    if [ "$F_CURL_RC" -eq 0 ]; then
+        pass "TC-F-02: curl localhost:${F_HOST_PORT}/ succeeds"
+    else
+        fail "TC-F-02: curl localhost:${F_HOST_PORT}/" \
+             "exit=$F_CURL_RC" "exit=0"
+    fi
+
+    # TC-F-03: docker port <name> shows the mapping
+    F_PORT_OUT=$("$SHIM" port "$F_NAME" 2>&1)
+    F_PORT_RC=$?
+    [ "$DEBUG" -eq 1 ] && dump "docker port output" "$F_PORT_OUT"
+    EXPECTED_PORT_LINE="${F_CONT_PORT}/tcp -> 0.0.0.0:${F_HOST_PORT}"
+    if [ "$F_PORT_RC" -eq 0 ] && echo "$F_PORT_OUT" | grep -qF "$EXPECTED_PORT_LINE"; then
+        pass "TC-F-03: docker port $F_NAME shows '${EXPECTED_PORT_LINE}'"
+    else
+        fail "TC-F-03: docker port $F_NAME" \
+             "$F_PORT_OUT" "$EXPECTED_PORT_LINE"
+    fi
+
+    # TC-F-04: docker inspect PortBindings contains the mapping
+    F_INSPECT_OUT=$("$SHIM" inspect "$F_NAME" 2>&1)
+    [ "$DEBUG" -eq 1 ] && dump "docker inspect output" "$F_INSPECT_OUT"
+    F_PORT_KEY="${F_CONT_PORT}/tcp"
+    if echo "$F_INSPECT_OUT" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+item = data[0] if isinstance(data, list) else data
+pb = item.get('HostConfig', {}).get('PortBindings', {})
+bindings = pb.get('${F_PORT_KEY}', [])
+assert any(b.get('HostPort') == '${F_HOST_PORT}' for b in bindings), f'PortBindings={pb}'
+" 2>/dev/null; then
+        pass "TC-F-04: docker inspect PortBindings has ${F_PORT_KEY}=>${F_HOST_PORT}"
+    else
+        fail "TC-F-04: docker inspect PortBindings" \
+             "$(echo "$F_INSPECT_OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('HostConfig',{}).get('PortBindings',{}))" 2>/dev/null)" \
+             "${F_PORT_KEY}: [{HostPort: ${F_HOST_PORT}}]"
+    fi
+
+    # TC-F-05: docker stop kills the proxy (curl fails after stop)
+    "$SHIM" stop "$F_NAME" >/dev/null 2>&1
+    sleep 1
+    F_CURL2_OUT=$(curl -sf --max-time 3 "http://localhost:${F_HOST_PORT}/" 2>&1)
+    F_CURL2_RC=$?
+    if [ "$F_CURL2_RC" -ne 0 ]; then
+        pass "TC-F-05: curl after docker stop fails (proxy cleaned up)"
+    else
+        fail "TC-F-05: curl after docker stop should fail" \
+             "exit=0 (proxy still listening)" "exit!=0"
+    fi
+
+    "$SHIM" rm "$F_NAME" >/dev/null 2>&1 || true
     echo ""
 fi
 

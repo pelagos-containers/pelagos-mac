@@ -393,7 +393,7 @@ fn proxy(unix: UnixStream, vsock: OwnedFd, conn_id: std::thread::ThreadId) {
 /// Accept TCP connections on `host_port` and proxy each one to
 /// `192.168.105.2:container_port` inside the VM.  Runs for the lifetime of
 /// the daemon process.
-fn port_forward_loop(host_port: u16, container_port: u16) {
+pub(crate) fn port_forward_loop(host_port: u16, container_port: u16) {
     let listener = match TcpListener::bind(("0.0.0.0", host_port)) {
         Ok(l) => l,
         Err(e) => {

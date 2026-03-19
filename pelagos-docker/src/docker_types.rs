@@ -31,6 +31,8 @@ pub struct ContainerInspect {
 pub struct HostConfig {
     /// Bind mounts in "host:container[:options]" format.
     pub binds: Vec<String>,
+    /// Port bindings: "container_port/proto" → list of host bindings.
+    pub port_bindings: HashMap<String, Vec<PortBinding>>,
 }
 
 /// One entry in the container's Mounts list.
@@ -76,7 +78,7 @@ pub struct NetworkSettings {
     pub ports: HashMap<String, Vec<PortBinding>>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "PascalCase")]
 pub struct PortBinding {
     pub host_ip: String,

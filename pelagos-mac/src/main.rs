@@ -206,6 +206,15 @@ enum Commands {
     /// Internal: run as the persistent VM daemon. Not for direct use.
     #[command(hide = true)]
     VmDaemonInternal,
+
+    /// Internal: TCP port-proxy. Binds host TCP listeners and forwards each
+    /// accepted connection to the VM at 192.168.105.2. Not for direct use.
+    #[command(hide = true)]
+    PortProxy {
+        /// Port forward HOST_PORT:VM_PORT (repeatable).
+        #[arg(short = 'p', long = "port")]
+        ports: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -870,6 +879,36 @@ fn main() {
                 process::exit(1);
             }
         }
+
+        Commands::PortProxy { ref ports } => {
+            cmd_port_proxy(ports);
+        }
+    }
+}
+
+/// Start a TCP port-proxy for each `HOST:VM` spec.  Binds `0.0.0.0:HOST` on
+/// macOS and forwards each accepted connection to `192.168.105.2:VM`.
+/// Runs until the process is killed (SIGTERM from the shim on container stop/rm).
+fn cmd_port_proxy(ports: &[String]) {
+    if ports.is_empty() {
+        log::warn!("port-proxy: no ports specified, exiting immediately");
+        return;
+    }
+    for spec in ports {
+        match daemon::parse_port_spec(spec) {
+            Some(pf) => {
+                let (hp, cp) = (pf.host_port, pf.container_port);
+                std::thread::spawn(move || daemon::port_forward_loop(hp, cp));
+            }
+            None => {
+                log::error!("port-proxy: invalid port spec {:?}", spec);
+                process::exit(1);
+            }
+        }
+    }
+    // Block until killed.
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(86400));
     }
 }
 
