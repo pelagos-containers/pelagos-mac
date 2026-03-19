@@ -1369,17 +1369,40 @@ fn handle_exec_into(
         tty,
         args
     );
-    // Retry obtaining the container PID and opening namespace fds for up to 3 s.
-    // VS Code exec-into can race container startup: pelagos may still report
-    // PID='-' (container creating) or the process may not yet have entered its
-    // namespaces (ENOENT on /proc/<pid>/ns/*).
-    // ns_fds order: [net=0, uts=1, ipc=2, pid=3, mnt=4].
-    let (pid, ns_fds, root_fd) = wait_for_container_ns(container, 3000).map_err(|e| {
+    let pid = get_container_pid(container).map_err(|e| {
         let mut w = FdWriter(fd);
         let _ = send_response(
             &mut w,
             &GuestResponse::Error {
-                error: format!("exec-into: container not ready: {}", e),
+                error: format!("exec-into: {}", e),
+            },
+        );
+        e
+    })?;
+
+    log::warn!("exec-into: got pid={}", pid);
+    // Open all 5 namespace fds (net/uts/ipc/pid/mnt) + container root.
+    // ns_fds order: [net=0, uts=1, ipc=2, pid=3, mnt=4].
+    let ns_fds = open_ns_fds(pid).map_err(|e| {
+        let mut w = FdWriter(fd);
+        let _ = send_response(
+            &mut w,
+            &GuestResponse::Error {
+                error: format!("exec-into: open ns fds: {}", e),
+            },
+        );
+        e
+    })?;
+
+    let root_fd = open_root_fd(pid).map_err(|e| {
+        for &nfd in &ns_fds {
+            unsafe { libc::close(nfd) };
+        }
+        let mut w = FdWriter(fd);
+        let _ = send_response(
+            &mut w,
+            &GuestResponse::Error {
+                error: format!("exec-into: open root fd: {}", e),
             },
         );
         e
@@ -1749,60 +1772,6 @@ fn get_container_pid(container: &str) -> std::io::Result<u32> {
         std::io::ErrorKind::NotFound,
         format!("container '{}' not found or not running", container),
     ))
-}
-
-/// Retry wrapper around `get_container_pid` + `open_ns_fds` + `open_root_fd`.
-///
-/// VS Code exec-into can arrive while the container process is still starting
-/// (pelagos reports PID='-') or immediately after (process exists but has not
-/// yet entered its namespaces → ENOENT on /proc/<pid>/ns/*).  We retry the
-/// entire sequence with 100 ms sleeps for up to `timeout_ms` milliseconds
-/// before giving up.
-fn wait_for_container_ns(
-    container: &str,
-    timeout_ms: u64,
-) -> std::io::Result<(u32, [libc::c_int; 5], libc::c_int)> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    loop {
-        let err = match get_container_pid(container) {
-            Ok(pid) => {
-                log::warn!("exec-into: got pid={}", pid);
-                match open_ns_fds(pid) {
-                    Ok(ns_fds) => match open_root_fd(pid) {
-                        Ok(root_fd) => return Ok((pid, ns_fds, root_fd)),
-                        Err(e) => {
-                            log::warn!(
-                                "exec-into: open_root_fd pid={} failed: {} — retrying",
-                                pid,
-                                e
-                            );
-                            e
-                        }
-                    },
-                    Err(e) => {
-                        log::warn!(
-                            "exec-into: open_ns_fds pid={} failed: {} — retrying",
-                            pid,
-                            e
-                        );
-                        e
-                    }
-                }
-            }
-            Err(e) => {
-                log::warn!(
-                    "exec-into: get_container_pid '{}' failed: {} — retrying",
-                    container,
-                    e
-                );
-                e
-            }
-        };
-        if std::time::Instant::now() >= deadline {
-            return Err(err);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
 }
 
 /// Thin wrapper around setns(2) that compiles on all platforms.
