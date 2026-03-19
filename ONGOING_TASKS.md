@@ -1,19 +1,16 @@
 # pelagos-mac — Ongoing Tasks
 
 
-*Last updated: 2026-03-19 (branch fix/devcontainer-suite-isolation; pelagos v0.59.0)*
+*Last updated: 2026-03-19 — **v0.1.0 tagged and released** (SHA 2f31fa0)*
 
 ---
 
 ## Current State
 
-**Phase 4 (VS Code devcontainer support) complete.** The Docker CLI shim covers
-the full devcontainer lifecycle. The exec-into `/proc/self` blocker is fixed in
-pelagos-guest via `unshare(CLONE_NEWNS)` + `/proc` remount in exec-into grandchild.
-The "Dev container not found" blocker (shim inspect after exit) is fixed via
-a local container state cache in pelagos-docker.
-All 22 devcontainer e2e tests (Suites A–E) pass. VS Code "Reopen in Container"
-ready for manual verification.
+**Pilot milestone reached: v0.1.0 tagged.** VS Code "Reopen in Container" works
+end-to-end on Apple Silicon. All 22 devcontainer e2e tests (Suites A–E) pass.
+Flask app confirmed running inside container and accessible from macOS host at
+`http://192.168.105.2:<port>` (VM directly routable via socket_vmnet).
 
 ### What works today
 
@@ -29,7 +26,7 @@ ready for manual verification.
 | `pelagos run --detach --name` | ✅ | PR #37 |
 | `pelagos vm shell` | ✅ | PR #45 |
 | Busybox applet symlinks in VM | ✅ | PR #47 |
-| Persistent OCI image cache (`/dev/vda` ext4) | ✅ | PR #50 |
+| Persistent OCI image cache (`/dev/vda` ext4) | ✅ | PR #50/#107 |
 | ECR Public test image (no rate limits) | ✅ | PR #50 |
 | devpts mount + PTY job control | ✅ | PR #38/#40 |
 | `pelagos vm console` (hvc0 serial) | ✅ | PR #51 |
@@ -57,7 +54,7 @@ ready for manual verification.
 | overlayfs / linux-lts kernel | #89 | ✅ PR #90 |
 
 | docker build multi-stage + features test | #92 | ✅ PR #94+#100 |
-| VS Code full extension integration test | #91 | 🔲 |
+| VS Code full extension integration test | #91 | ✅ verified 2026-03-19 |
 
 ---
 
@@ -67,7 +64,9 @@ ready for manual verification.
 ### VS Code devcontainer — current state
 
 T2 integration harness (`scripts/test-devcontainer-e2e.sh`) is built and running.
-Current result: **Suite A/B/C/D/E: 22/22 PASS** (with pelagos v0.58.0 + nsenter fix).
+Current result: **Suite A/B/C/D/E: 22/22 PASS** (pelagos v0.59.0, ext4 root fs).
+VS Code "Reopen in Container" verified — container opens, terminal works, Flask app
+runs and is accessible from macOS host at `http://192.168.105.2:<port>`.
 
 ### VS Code full extension integration test (#91)
 
@@ -119,10 +118,12 @@ and verify: IDE attaches, extensions install, terminal opens inside container.
 
    **Verified:** `docker run exits` → `docker inspect` returns exit 0, `State.Status="exited"`.
 
-### pelagos-mac — Lower priority
+### Next priorities (post-v0.1.0)
 
+- **Port forwarding** — container port → VM port → macOS `localhost`. Needed for
+  VS Code Ports panel and `localhost` access. Currently workaround: direct VM IP
+  (`192.168.105.2:<port>`) is routable from macOS host via socket_vmnet.
 - **`docker volume inspect`** — `create/ls/rm` works; `inspect` not implemented.
-  Bind mounts cover most real use cases so this is low priority.
 - **Dynamic virtiofs shares** (#74) — current per-path shares require knowing all
   paths at VM start time; proper dynamic sharing needed for general-purpose use.
 - **Signed installer** — `.pkg` for distribution. Requires Developer ID + notarization
