@@ -247,6 +247,15 @@ fn main() {
         let conn_fd = match accept_vsock(&listener) {
             Ok(fd) => fd,
             Err(e) => {
+                // EMFILE/ENFILE: fd table exhausted — back off so we don't
+                // spin hot filling the log while waiting for fds to be freed.
+                if let Some(os_err) = e.raw_os_error() {
+                    if os_err == libc::EMFILE || os_err == libc::ENFILE {
+                        log::warn!("accept: fd table exhausted ({}), backing off", e);
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        continue;
+                    }
+                }
                 log::error!("accept failed: {}", e);
                 continue;
             }

@@ -621,9 +621,18 @@ UDHCPC
     mkdir -p "$INITRD_TMP/etc/ssl/certs"
     cp "$CA_BUNDLE" "$INITRD_TMP/etc/ssl/certs/ca-certificates.crt"
 
+    # Compute a version marker from the pelagos-guest binary hash.  Embedded
+    # as a literal string in the init script at build time; pass 1 compares it
+    # against /etc/pelagos-root-version on /dev/vda to decide whether to
+    # refresh the disk root.  A new guest binary → new hash → auto-refresh on
+    # next boot, with the OCI cache preserved.
+    ROOT_VERSION="$(shasum -a 256 "$INITRD_TMP/usr/local/bin/pelagos-guest" | cut -c1-16)"
+    echo "$ROOT_VERSION" > "$INITRD_TMP/etc/pelagos-root-version"
+    echo "  root version marker: $ROOT_VERSION"
+
     # Replace /init.
-    # $KVER is expanded here (build-time variable); \$ inside the heredoc are
-    # runtime shell variables that must NOT be expanded at build time.
+    # $KVER and $ROOT_VERSION are build-time variables expanded by bash now.
+    # \$ inside the heredoc are runtime shell variables — NOT expanded at build time.
     cat > "$INITRD_TMP/init" <<INIT_EOF
 #!/bin/sh
 
@@ -637,7 +646,8 @@ busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 busybox mount -t proc proc /proc 2>/dev/null || true
 
 # Pass 1: if we are still on the initramfs rootfs, load kernel modules and
-# switch_root to a tmpfs so that pivot_root(2) works for container spawns.
+# switch_root to /dev/vda (ext4) so that pivot_root(2) works for container
+# spawns and the root filesystem is persistent on disk (not RAM).
 if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
     echo "[pelagos-init] pass 1: loading modules"
 
@@ -666,17 +676,66 @@ if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
     echo "[pelagos-init] pass 1: modules loaded"
 
     busybox mkdir -p /newroot
-    busybox mount -t tmpfs -o size=2048m tmpfs /newroot
-    for d in bin sbin usr lib etc root mnt var; do
-        [ -d "/\$d" ] && busybox cp -a "/\$d" /newroot/ 2>/dev/null || true
-    done
-    busybox cp /init /newroot/init
-    busybox mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/dev/pts \
-                     /newroot/dev/net \
-                     /newroot/tmp /newroot/run /newroot/run/pelagos \
-                     /newroot/sys/fs/cgroup /newroot/newroot
-    busybox mknod /newroot/dev/net/tun c 10 200 2>/dev/null || true
-    busybox chmod 0666 /newroot/dev/net/tun 2>/dev/null || true
+
+    # Determine whether /dev/vda already has a current root filesystem.
+    # ROOT_VERSION is the build-time hash of pelagos-guest (first 16 hex chars
+    # of SHA256), embedded as a literal string here at image-build time.
+    EXPECTED_VERSION="${ROOT_VERSION}"
+    NEEDS_FORMAT=0
+    NEEDS_COPY=0
+
+    if ! busybox blkid /dev/vda 2>/dev/null | busybox grep -q 'TYPE="ext4"'; then
+        echo "[pelagos-init] pass 1: /dev/vda has no ext4 filesystem — will format"
+        NEEDS_FORMAT=1
+        NEEDS_COPY=1
+    elif busybox mount -t ext4 /dev/vda /newroot 2>/dev/null; then
+        DISK_VERSION="\$(busybox cat /newroot/etc/pelagos-root-version 2>/dev/null || true)"
+        if [ "\$DISK_VERSION" = "\$EXPECTED_VERSION" ]; then
+            echo "[pelagos-init] pass 1: disk root is current (version=\$EXPECTED_VERSION)"
+        else
+            echo "[pelagos-init] pass 1: version mismatch (disk='\${DISK_VERSION:-none}' want='\$EXPECTED_VERSION') — refreshing"
+            NEEDS_COPY=1
+        fi
+    else
+        echo "[pelagos-init] pass 1: ext4 mount failed — will reformat"
+        NEEDS_FORMAT=1
+        NEEDS_COPY=1
+    fi
+
+    if [ "\$NEEDS_FORMAT" = "1" ]; then
+        busybox umount /newroot 2>/dev/null || true
+        echo "[pelagos-init] pass 1: formatting /dev/vda as ext4"
+        /sbin/mke2fs -F -t ext4 -L pelagos-root /dev/vda 2>/dev/null || {
+            echo "[pelagos-init] FATAL: mke2fs failed" >/dev/console
+            exec busybox sh
+        }
+        busybox mount -t ext4 /dev/vda /newroot || {
+            echo "[pelagos-init] FATAL: mount of fresh ext4 /dev/vda failed" >/dev/console
+            exec busybox sh
+        }
+    fi
+
+    if [ "\$NEEDS_COPY" = "1" ]; then
+        echo "[pelagos-init] pass 1: copying root filesystem to /dev/vda"
+        # Copy Alpine userland from initramfs to disk.  /var/lib/pelagos is
+        # deliberately excluded so the OCI image cache survives root refreshes.
+        for d in bin sbin usr lib etc root mnt; do
+            [ -d "/\$d" ] && busybox cp -a "/\$d" /newroot/ 2>/dev/null || true
+        done
+        busybox cp /init /newroot/init
+        busybox mkdir -p /newroot/proc /newroot/sys \
+                         /newroot/dev /newroot/dev/pts /newroot/dev/net \
+                         /newroot/tmp /newroot/run /newroot/run/pelagos \
+                         /newroot/sys/fs/cgroup /newroot/newroot \
+                         /newroot/var /newroot/var/lib /newroot/var/lib/pelagos \
+                         /newroot/var/run /newroot/var/log /newroot/var/tmp
+        busybox mknod /newroot/dev/net/tun c 10 200 2>/dev/null || true
+        busybox chmod 0666 /newroot/dev/net/tun 2>/dev/null || true
+        # Write version marker LAST — an interrupted copy leaves no marker so
+        # the next boot detects the incomplete state and re-copies.
+        echo "\$EXPECTED_VERSION" > /newroot/etc/pelagos-root-version
+        echo "[pelagos-init] pass 1: root filesystem written (version=\$EXPECTED_VERSION)"
+    fi
 
     exec busybox switch_root /newroot /init
 
@@ -684,7 +743,7 @@ if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
     exec busybox sh
 fi
 
-# Pass 2: root is tmpfs. Kernel modules already loaded.
+# Pass 2: root is /dev/vda (ext4). Kernel modules already loaded.
 # Mount devtmpfs WITHOUT 2>/dev/null — /dev is empty here, so the redirect
 # would fail and skip the mount entirely.
 busybox mkdir -p /dev
@@ -703,20 +762,18 @@ busybox mount -t cgroup2  cgroup2  /sys/fs/cgroup 2>/dev/null || true
 
 busybox ip link set lo up
 busybox ip link set eth0 up
-if busybox udhcpc -i eth0 -s /usr/share/udhcpc/default.script -q -t 5 -T 3 >/dev/null 2>&1; then
-    echo "[pelagos-init] network: DHCP OK"
-else
-    echo "[pelagos-init] network: DHCP failed, using static 192.168.105.2/24"
-    busybox ip addr add 192.168.105.2/24 dev eth0
-    busybox ip route add default via 192.168.105.1
-fi
+busybox ip addr add 192.168.105.2/24 dev eth0
+busybox ip route add default via 192.168.105.1
+echo "[pelagos-init] network: static 192.168.105.2/24"
 echo "[pelagos-init] network ready"
 busybox mkdir -p /etc
 echo 'nameserver 8.8.8.8' > /etc/resolv.conf
 echo 'nameserver 8.8.4.4' >> /etc/resolv.conf
 
+# /tmp: bounded tmpfs — prevents VM-level OOM from unbounded temp storage.
+# Container workloads write to their own overlayfs (on /dev/vda), not here.
 busybox mkdir -p /tmp /run /run/pelagos
-busybox mount -t tmpfs tmpfs /tmp
+busybox mount -t tmpfs -o size=512m tmpfs /tmp
 
 # Gate on network readiness before pelagos-guest starts pulling images.
 i=0
@@ -763,28 +820,9 @@ for kv in \$CMDLINE; do
     esac
 done
 
+# /var/lib/pelagos is already on /dev/vda (we are /dev/vda).  No secondary
+# mount needed.  Ensure the directory exists in case this is a fresh disk.
 busybox mkdir -p /var/lib/pelagos
-if busybox test -b /dev/vda; then
-    if busybox blkid /dev/vda 2>/dev/null | busybox grep -q 'TYPE="ext4"'; then
-        busybox mount -t ext4 /dev/vda /var/lib/pelagos 2>/dev/null && \
-            echo "[pelagos-init] mounted /dev/vda (ext4) at /var/lib/pelagos" || \
-            echo "[pelagos-init] WARNING: ext4 mount of /dev/vda failed" >&2
-    elif busybox test -x /sbin/mke2fs; then
-        if busybox blkid /dev/vda 2>/dev/null | busybox grep -q 'TYPE="ext2"'; then
-            echo "[pelagos-init] ext2 detected — reformatting as ext4 (OCI cache will be repopulated)..."
-        else
-            echo "[pelagos-init] formatting /dev/vda as ext4 for OCI image cache..."
-        fi
-        /sbin/mke2fs -F -t ext4 /dev/vda 2>/dev/null && \
-            busybox mount -t ext4 /dev/vda /var/lib/pelagos 2>/dev/null && \
-            echo "[pelagos-init] formatted and mounted /dev/vda (ext4) at /var/lib/pelagos" || \
-            echo "[pelagos-init] WARNING: ext4 format/mount failed — OCI cache in RAM" >&2
-    else
-        echo "[pelagos-init] WARNING: mke2fs missing — OCI cache will be in RAM" >&2
-    fi
-else
-    echo "[pelagos-init] WARNING: /dev/vda not found — OCI cache will be in RAM (tmpfs)" >&2
-fi
 
 if [ "\$PELAGOS_VOLUMES_PRESENT" = "1" ]; then
     busybox mkdir -p /var/lib/pelagos/volumes
@@ -797,12 +835,15 @@ export PELAGOS_IMAGE_STORE=/var/lib/pelagos
 
 busybox chown -R 0:0 /root 2>/dev/null || true
 mkdir -p /etc/dropbear
-dropbear -s -R -p 22 2>/dev/null || true
+/usr/sbin/dropbear -s -R -p 22 -F &
 
 (while true; do /bin/sh </dev/hvc0 >/dev/hvc0 2>/dev/hvc0; sleep 1; done) &
 
-export RUST_LOG=debug
-exec /usr/local/bin/pelagos-guest </dev/null >/tmp/guest.log 2>&1
+export RUST_LOG=warn
+# Log to disk (/var/log is on /dev/vda ext4) so guest output does not consume
+# tmpfs RAM.  /tmp is a bounded 512 MiB tmpfs reserved for transient workloads.
+busybox mkdir -p /var/log
+exec /usr/local/bin/pelagos-guest </dev/null >/var/log/pelagos-guest.log 2>&1
 INIT_EOF
     chmod 755 "$INITRD_TMP/init"
 
