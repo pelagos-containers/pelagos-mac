@@ -1453,16 +1453,24 @@ fn handle_exec_into(
         cmd.env(k, v);
     }
 
+    // open_ns_fds returns [net(0), uts(1), ipc(2), pid(3), mnt(4)].
+    // PID namespace must be joined in the **parent** before fork (not in
+    // pre_exec): setns(CLONE_NEWPID) in a child only sets pid_for_children,
+    // so the exec'd process stays in the host PID namespace.  Extract the PID
+    // fd and handle it separately; pass only net/uts/ipc/mnt to pre_exec.
+    let pid_ns_fd = ns_fds[3];
+    let ns_fds_no_pid = [ns_fds[0], ns_fds[1], ns_fds[2], ns_fds[4]]; // net, uts, ipc, mnt
+
     // Enter namespaces in the child after fork, before exec.
     // Only async-signal-safe operations (setns, close, fchdir, chroot) are used.
-    // Order: net/uts/ipc first, pid before mnt (so /proc stays readable).
+    // Order: net/uts/ipc first, then mnt (pid is joined in parent — see below).
     // After all setns calls, fchdir+chroot into the container's rootfs so that
     // absolute paths resolve through the container filesystem, not the guest root.
     let workdir_owned: Option<std::ffi::CString> =
         workdir.and_then(|w| std::ffi::CString::new(w.as_bytes()).ok());
     unsafe {
         cmd.pre_exec(move || {
-            for &ns_fd in &ns_fds {
+            for &ns_fd in &ns_fds_no_pid {
                 if call_setns(ns_fd) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -1488,20 +1496,51 @@ fn handle_exec_into(
         });
     }
 
-    // Spawn and run; parent closes its copies of ns_fds and root_fd after spawn.
-    let result = if tty {
-        handle_exec_tty(fd, cmd)
-    } else {
-        handle_exec_piped(fd, cmd)
-    };
+    // Spawn and relay on a dedicated thread so that setns(CLONE_NEWPID) below
+    // only affects pid_for_children on **this thread** (Linux: per-thread since
+    // kernel 3.9).  The daemon's main thread is unaffected.
+    let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
+    std::thread::spawn(move || {
+        // Join PID namespace in the parent (this thread) before fork.
+        // The forked child inherits pid_for_children → exec'd process enters
+        // the container PID namespace correctly.
+        let ret = unsafe { setns_pid(pid_ns_fd) };
+        if ret != 0 {
+            let e = std::io::Error::last_os_error();
+            unsafe { libc::close(pid_ns_fd) };
+            // Close parent copies of remaining fds before returning.
+            for &nfd in &ns_fds_no_pid {
+                unsafe { libc::close(nfd) };
+            }
+            unsafe { libc::close(root_fd) };
+            let mut w = FdWriter(fd);
+            let _ = send_frame(
+                &mut w,
+                FRAME_STDERR,
+                format!("exec-into: setns(CLONE_NEWPID): {}", e).as_bytes(),
+            );
+            let _ = send_frame(&mut w, FRAME_EXIT, &1i32.to_be_bytes());
+            let _ = tx.send(Ok(()));
+            return;
+        }
+        unsafe { libc::close(pid_ns_fd) };
 
-    // Close parent copies (child already closed its copies in pre_exec).
-    for &ns_fd in &ns_fds {
-        unsafe { libc::close(ns_fd) };
-    }
-    unsafe { libc::close(root_fd) };
+        let result = if tty {
+            handle_exec_tty(fd, cmd)
+        } else {
+            handle_exec_piped(fd, cmd)
+        };
 
-    result
+        // Close parent copies (child already closed its copies in pre_exec).
+        for &nfd in &ns_fds_no_pid {
+            unsafe { libc::close(nfd) };
+        }
+        unsafe { libc::close(root_fd) };
+
+        let _ = tx.send(result);
+    });
+
+    rx.recv().unwrap_or(Ok(()))
 }
 
 /// Parse `pelagos ps --all` output and return the PID of the named container.
@@ -1547,6 +1586,20 @@ unsafe fn call_setns(fd: libc::c_int) -> libc::c_int {
 }
 #[cfg(not(target_os = "linux"))]
 unsafe fn call_setns(_fd: libc::c_int) -> libc::c_int {
+    panic!("setns is Linux-only; pelagos-guest only runs inside the Linux VM")
+}
+
+/// Join the PID namespace explicitly (CLONE_NEWPID required, not 0).
+/// Must be called in the **parent** before fork so that `pid_for_children`
+/// is set; only the forked child (exec'd process) enters the namespace.
+/// Since `pid_for_children` is per-thread on Linux (kernel ≥ 3.9), calling
+/// this on a dedicated thread leaves the daemon's main thread unaffected.
+#[cfg(target_os = "linux")]
+unsafe fn setns_pid(fd: libc::c_int) -> libc::c_int {
+    libc::setns(fd, libc::CLONE_NEWPID)
+}
+#[cfg(not(target_os = "linux"))]
+unsafe fn setns_pid(_fd: libc::c_int) -> libc::c_int {
     panic!("setns is Linux-only; pelagos-guest only runs inside the Linux VM")
 }
 
@@ -2338,5 +2391,41 @@ mod tests {
         let (ft, data) = recv_frame(&mut cursor).unwrap();
         assert_eq!(ft, FRAME_STDOUT);
         assert_eq!(data, payload);
+    }
+
+    /// Verify that open_ns_fds returns valid fds and that the PID ns fd
+    /// (index 3) is at the correct position in the array (issue #108 fix).
+    ///
+    /// Structural: open ns fds for the current process, confirm all five
+    /// descriptors are ≥ 0 (valid), and that index 3 is the PID namespace
+    /// by reading the /proc/self/fd/<n> symlink target.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_ns_fds_pid_is_index_3_issue_108() {
+        use super::open_ns_fds;
+
+        let my_pid = std::process::id();
+        let fds = open_ns_fds(my_pid).expect("open_ns_fds failed for self");
+
+        // All fds must be valid.
+        for &fd in &fds {
+            assert!(fd >= 0, "expected valid fd, got {}", fd);
+        }
+
+        // Index 3 must be the PID namespace.
+        let pid_fd = fds[3];
+        let link = std::fs::read_link(format!("/proc/self/fd/{}", pid_fd))
+            .expect("readlink of pid ns fd failed");
+        let link_str = link.to_string_lossy();
+        assert!(
+            link_str.starts_with("pid:["),
+            "expected pid:[ but got {}",
+            link_str
+        );
+
+        // Close all fds.
+        for &fd in &fds {
+            unsafe { libc::close(fd) };
+        }
     }
 }
