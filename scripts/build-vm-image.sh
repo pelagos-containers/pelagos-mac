@@ -673,13 +673,9 @@ busybox mount -t cgroup2  cgroup2  /sys/fs/cgroup 2>/dev/null || true
 
 busybox ip link set lo up
 busybox ip link set eth0 up
-if busybox udhcpc -i eth0 -s /usr/share/udhcpc/default.script -q -t 5 -T 3 >/dev/null 2>&1; then
-    echo "[pelagos-init] network: DHCP OK"
-else
-    echo "[pelagos-init] network: DHCP failed, using static 192.168.105.2/24"
-    busybox ip addr add 192.168.105.2/24 dev eth0
-    busybox ip route add default via 192.168.105.1
-fi
+busybox ip addr add 192.168.105.2/24 dev eth0
+busybox ip route add default via 192.168.105.1
+echo "[pelagos-init] network: static 192.168.105.2/24"
 echo "[pelagos-init] network ready"
 busybox mkdir -p /etc
 echo 'nameserver 8.8.8.8' > /etc/resolv.conf
@@ -767,7 +763,7 @@ export PELAGOS_IMAGE_STORE=/var/lib/pelagos
 
 busybox chown -R 0:0 /root 2>/dev/null || true
 mkdir -p /etc/dropbear
-dropbear -s -R -p 22 2>/dev/null || true
+/usr/sbin/dropbear -s -R -p 22 -F &
 
 (while true; do /bin/sh </dev/hvc0 >/dev/hvc0 2>/dev/hvc0; sleep 1; done) &
 

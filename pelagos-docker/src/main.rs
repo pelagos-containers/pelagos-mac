@@ -952,10 +952,10 @@ fn cmd_ps(cfg: &Config, all: bool, quiet: bool, filters: &[String], format: Opti
     if all {
         sub.push("--all".into());
     }
-    let out = match run_pelagos(cfg, &sub) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("pelagos-docker ps: {}", e);
+    let out = match invoke::run_pelagos_timeout(cfg, &sub, std::time::Duration::from_secs(5)) {
+        Some(o) => o,
+        None => {
+            eprintln!("pelagos-docker ps: timed out (VM not responding)");
             return 1;
         }
     };

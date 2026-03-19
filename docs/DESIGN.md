@@ -487,21 +487,91 @@ management. Those come after the architecture is validated.
 - macOS 13.5+ minimum for full feature set. A macOS 12 fallback (drop virtiofs +
   Rosetta) is possible but not a priority.
 
-### Known operational limitation: PF/NAT state degradation (issue #26)
+### Known operational limitation: PF/NAT state degradation (issue #26) — RESOLVED
 
 `VZNATNetworkDeviceAttachment` relies on macOS `InternetSharing` to install NAT
-masquerade rules via the kernel's packet filter (PF). After approximately 5 VM
-lifecycles in a single session, InternetSharing loses its connection to the PF
-device. Symptoms: all outbound TCP from inside the VM fails silently; `pelagos image
-pull` reports "error sending request for url". ICMP (ping) continues working because
-it routes through a different PF rule set.
+masquerade rules via the kernel's packet filter (PF). Stress testing confirmed that
+after approximately 18–40 VM lifecycles in a single session, InternetSharing loses its
+connection to the PF device. Symptoms: all outbound TCP from inside the VM fails
+silently; `pelagos image pull` reports "error sending request for url". ICMP (ping)
+continues working because it routes through a different PF rule set.
 
-**Recovery:** `sudo pfctl -f /etc/pf.conf`
+**Resolution (PR #34):** Migrated to `socket_vmnet` (a Homebrew package that wraps
+Apple's `vmnet.framework` directly via a privileged helper). `socket_vmnet` does not
+use InternetSharing or PF anchors; the NAT stability issue does not manifest.
+`pfctl` has no effect on `vmnet.framework` NAT — do not attempt `pfctl -f` to fix
+networking problems. If networking degrades, restart `socket_vmnet` via
+`sudo brew services restart socket_vmnet`.
 
-This is an OS-level issue with `InternetSharing`'s PF anchor management, not a bug
-in our code. The long-term fix is the persistent VM (Phase 2): with one VM reused
-across many `pelagos run` calls, the VM lifecycle count stays at 1 and the issue
-does not manifest.
+---
+
+## VM Image and Kernel
+
+### Kernel selection: linux-lts (not linux-virt)
+
+The VM uses Alpine's `linux-lts` package (currently 6.12.x). An earlier version of
+the image used `linux-virt`, the lightweight kernel Alpine ships for virtual machines.
+We switched in PR #90 (issue #89) for a single reason:
+
+**`linux-virt` does not have `CONFIG_OVERLAY_FS`.** pelagos uses overlayfs for
+container filesystems. Without it, containers cannot start.
+
+`linux-lts` is Alpine's long-term-support kernel and does include overlayfs.
+
+#### CONFIG_ differences that matter
+
+| Feature | linux-virt | linux-lts | Notes |
+|---|---|---|---|
+| `CONFIG_OVERLAY_FS` | ❌ absent | ✅ present | **Why we switched** |
+| `CONFIG_PACKET` (AF_PACKET) | ❌ absent | ❌ absent | Absent in both; DHCP clients require it |
+| Virtio drivers | ✅ built-in | ⚠️ modules | linux-lts ships them as loadable modules |
+
+The modules cost is real: the initramfs init script must explicitly `modprobe virtio_pci`
+before any virtio device driver, then `modprobe virtio_net`, `modprobe vsock`, etc.
+`virtio_pci` must come first — AVF presents virtio devices over PCIe, so without the
+bus driver the device drivers have nothing to bind to.
+
+### VM networking: static IP, not DHCP
+
+The VM uses a fixed static IP: `192.168.105.2/24`, gateway `192.168.105.1` (the
+`socket_vmnet` subnet). DHCP is not used.
+
+**Why static:**
+
+1. `CONFIG_PACKET=n` in linux-lts. Standard DHCP clients (`udhcpc`, `dhcpcd`) require
+   `AF_PACKET` sockets. With the flag absent, opening the socket fails and DHCP cannot
+   work in either Alpine kernel without a custom kernel build.
+
+2. `socket_vmnet` DHCP assigns addresses sequentially from a pool. Without a pinned MAC
+   address, each VM boot gets a different lease. The host must then discover the assigned
+   IP — Lima does this by polling `/private/var/db/dhcpd_leases` and by deriving a
+   deterministic MAC from the instance ID. That is complexity we do not need for a
+   single-VM architecture.
+
+3. A fixed IP is simpler to reason about, eliminates the discovery step, and is always
+   predictable.
+
+**Where it is hardcoded:**
+- `scripts/build-vm-image.sh` — the init script calls `ip addr add 192.168.105.2/24 dev eth0`
+- `pelagos-mac/src/main.rs` — the SSH target for `pelagos vm ssh`
+
+**Re-evaluation criteria:** If multi-VM support is ever added, or if a future Alpine
+kernel build re-enables `CONFIG_PACKET`, revisit with MAC pinning + DHCP lease polling
+(the Lima pattern). For single-VM use, static IP is correct.
+
+### VM stability notes
+
+- `/dev/vda` is formatted as **ext4** (journaled). Unclean shutdowns (hard kill of the
+  daemon) do not corrupt the disk; the journal replays on the next mount. An earlier
+  revision used ext2, which was vulnerable to corruption.
+- The init script creates `/dev/null` with `mknod` before any `2>/dev/null` redirect.
+  POSIX sh silently skips any command whose redirect target does not exist — this means
+  a missing `/dev/null` silently swallows all subsequent `modprobe` calls.
+- NTP sync is required before OCI image pulls. The VM clock starts at epoch; TLS
+  certificate validation fails until `busybox ntpd -n -q -p pool.ntp.org` completes
+  after the network comes up.
+- AVF NAT warmup: a `ping 8.8.8.8` is issued before `exec`-ing `pelagos-guest`. Without
+  it, the first outbound TCP connect races against NAT initialization and fails.
 
 ---
 

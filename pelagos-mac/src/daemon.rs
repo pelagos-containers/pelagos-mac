@@ -161,15 +161,17 @@ pub fn ensure_running(args: &DaemonArgs) -> io::Result<()> {
     cmd.arg("vm-daemon-internal");
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
-    // If RUST_LOG is set, send daemon stderr to a log file for debugging.
-    // Otherwise discard it.
-    if std::env::var_os("RUST_LOG").is_some() {
-        let log_path = state.sock_file.with_file_name("daemon.log");
-        let log_file = std::fs::File::create(&log_path)?;
-        cmd.stderr(log_file);
-        cmd.env("RUST_LOG", std::env::var("RUST_LOG").unwrap());
+    // Always write daemon stderr to a log file so failures are diagnosable
+    // regardless of whether the caller set RUST_LOG.  Default to "info" so
+    // lifecycle events are always captured; the caller can override verbosity
+    // by setting RUST_LOG before invoking any pelagos command.
+    let log_path = state.sock_file.with_file_name("daemon.log");
+    let log_file = std::fs::File::create(&log_path)?;
+    cmd.stderr(log_file);
+    if std::env::var_os("RUST_LOG").is_none() {
+        cmd.env("RUST_LOG", "info");
     } else {
-        cmd.stderr(std::process::Stdio::null());
+        cmd.env("RUST_LOG", std::env::var("RUST_LOG").unwrap());
     }
     cmd.spawn()?;
 
@@ -314,15 +316,18 @@ pub fn run(args: DaemonArgs) -> ! {
         // up to ~45 s during the ping-gate phase).
         let vm2 = Arc::clone(&vm);
         std::thread::spawn(move || {
+            let conn_id = std::thread::current().id();
+            log::info!("[{conn_id:?}] client connected");
             let vsock_fd = match vm2.connect_vsock() {
                 Ok(fd) => fd,
                 Err(e) => {
-                    log::error!("vsock connect: {}", e);
+                    log::error!("[{conn_id:?}] vsock connect: {}", e);
                     return; // unix stream dropped → EOF on CLI side
                 }
             };
             drop(vm2); // release Arc before entering the proxy loop
-            proxy(unix, vsock_fd);
+            proxy(unix, vsock_fd, conn_id);
+            log::info!("[{conn_id:?}] client disconnected");
         });
     }
 }
@@ -346,7 +351,7 @@ extern "C" fn sigterm_handler(_: libc::c_int) {
 
 /// Proxy bytes between a Unix socket (CLI side) and a vsock fd (guest side).
 /// Runs two threads: Unix→vsock and vsock→Unix. Returns when either side closes.
-fn proxy(unix: UnixStream, vsock: OwnedFd) {
+fn proxy(unix: UnixStream, vsock: OwnedFd, conn_id: std::thread::ThreadId) {
     // dup the vsock fd so each thread owns one end.
     let vsock_raw = vsock.into_raw_fd();
     let vsock_read_fd = unsafe { libc::dup(vsock_raw) };
@@ -362,7 +367,8 @@ fn proxy(unix: UnixStream, vsock: OwnedFd) {
         let mut src = unix;
         let mut dst = vsock_write;
         move || {
-            let _ = std::io::copy(&mut src, &mut dst);
+            let n = std::io::copy(&mut src, &mut dst);
+            log::debug!("[{conn_id:?}] unix→vsock closed ({n:?} bytes)");
         }
     });
 
@@ -371,7 +377,8 @@ fn proxy(unix: UnixStream, vsock: OwnedFd) {
         let mut src = vsock_read;
         let mut dst = unix_write;
         move || {
-            let _ = std::io::copy(&mut src, &mut dst);
+            let n = std::io::copy(&mut src, &mut dst);
+            log::debug!("[{conn_id:?}] vsock→unix closed ({n:?} bytes)");
         }
     });
 

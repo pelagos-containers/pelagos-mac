@@ -11,6 +11,10 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 pkill -KILL -f "pelagos.*vm-daemon-internal" 2>/dev/null || true
 rm -f ~/.local/share/pelagos/vm.pid ~/.local/share/pelagos/vm.sock
 
+echo "=== Restarting socket_vmnet (clears NAT state) ==="
+sudo brew services restart socket_vmnet
+sleep 2
+
 if [[ "${1:-}" == "--nuke" ]]; then
     echo "=== Recreating root.img ==="
     rm -f "$REPO_ROOT/out/root.img"

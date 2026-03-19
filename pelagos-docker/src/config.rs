@@ -3,7 +3,7 @@
 //! Resolution order:
 //!   1. `$XDG_CONFIG_HOME/pelagos/config.toml` (or `~/.config/pelagos/config.toml`)
 //!   2. Environment variables: PELAGOS_BIN, PELAGOS_KERNEL, PELAGOS_INITRD,
-//!      PELAGOS_DISK, PELAGOS_CMDLINE
+//!      PELAGOS_DISK, PELAGOS_CMDLINE, PELAGOS_MEMORY_MIB
 //!   3. Artifacts adjacent to the `pelagos` binary found on PATH
 //!   4. `./out/` relative to CWD (dev layout after `make image`)
 
@@ -16,6 +16,9 @@ pub struct Config {
     pub initrd: PathBuf,
     pub disk: PathBuf,
     pub cmdline: String,
+    /// VM memory in MiB.  Default 4096; override via `PELAGOS_MEMORY_MIB` env var
+    /// or `memory_mib = "4096"` in config.toml.
+    pub memory_mib: usize,
 }
 
 /// Minimal TOML parser — only handles `key = "value"` lines.
@@ -68,6 +71,9 @@ impl Config {
         let initrd = PathBuf::from(parse_toml_str(&src, "initrd")?);
         let disk = PathBuf::from(parse_toml_str(&src, "disk")?);
         let cmdline = parse_toml_str(&src, "cmdline").unwrap_or_else(|| "console=hvc0".into());
+        let memory_mib = parse_toml_str(&src, "memory_mib")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4096);
         if kernel.exists() && initrd.exists() && disk.exists() {
             Some(Self {
                 pelagos_bin,
@@ -75,6 +81,7 @@ impl Config {
                 initrd,
                 disk,
                 cmdline,
+                memory_mib,
             })
         } else {
             None
@@ -90,6 +97,10 @@ impl Config {
         let initrd = PathBuf::from(std::env::var("PELAGOS_INITRD").ok()?);
         let disk = PathBuf::from(std::env::var("PELAGOS_DISK").ok()?);
         let cmdline = std::env::var("PELAGOS_CMDLINE").unwrap_or_else(|_| "console=hvc0".into());
+        let memory_mib = std::env::var("PELAGOS_MEMORY_MIB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4096);
         if kernel.exists() && initrd.exists() && disk.exists() {
             Some(Self {
                 pelagos_bin,
@@ -97,6 +108,7 @@ impl Config {
                 initrd,
                 disk,
                 cmdline,
+                memory_mib,
             })
         } else {
             None
@@ -109,6 +121,10 @@ impl Config {
         let kernel = dir.join("vmlinuz");
         let initrd = dir.join("initramfs-custom.gz");
         let disk = dir.join("root.img");
+        let memory_mib = std::env::var("PELAGOS_MEMORY_MIB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4096);
         if kernel.exists() && initrd.exists() && disk.exists() {
             Some(Self {
                 pelagos_bin: bin,
@@ -116,6 +132,7 @@ impl Config {
                 initrd,
                 disk,
                 cmdline: "console=hvc0".into(),
+                memory_mib,
             })
         } else {
             None
@@ -137,6 +154,10 @@ impl Config {
         let kernel = out.join("vmlinuz");
         let initrd = out.join("initramfs-custom.gz");
         let disk = out.join("root.img");
+        let memory_mib = std::env::var("PELAGOS_MEMORY_MIB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4096);
         if kernel.exists() && initrd.exists() && disk.exists() {
             Some(Self {
                 pelagos_bin: bin,
@@ -144,6 +165,7 @@ impl Config {
                 initrd,
                 disk,
                 cmdline: "console=hvc0".into(),
+                memory_mib,
             })
         } else {
             None
@@ -161,6 +183,8 @@ impl Config {
             self.disk.as_os_str().to_owned(),
             "--cmdline".into(),
             self.cmdline.as_str().into(),
+            "--memory".into(),
+            self.memory_mib.to_string().into(),
         ]
     }
 }

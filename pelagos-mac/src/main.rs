@@ -40,8 +40,8 @@ struct Cli {
     #[arg(long, env = "PELAGOS_CMDLINE", default_value = "console=hvc0")]
     cmdline: String,
 
-    /// Memory in MiB (default 2048)
-    #[arg(long, default_value = "2048")]
+    /// Memory in MiB (default 4096)
+    #[arg(long, default_value = "4096")]
     memory: usize,
 
     /// Number of vCPUs (default 2)
