@@ -957,8 +957,10 @@ fn cmd_port_proxy(ports: &[String]) {
 /// Protocol: connect → write 2-byte big-endian port number → raw stream.
 /// SSH invokes this as a subprocess and speaks SSH protocol over its stdio.
 fn ssh_relay_proxy(port: u16) -> ! {
+    use std::fs::File;
     use std::io::Write;
     use std::net::TcpStream;
+    use std::os::unix::io::FromRawFd;
 
     const RELAY_PROXY_PORT: u16 = pelagos_vz::nat_relay::RELAY_PROXY_PORT;
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], RELAY_PROXY_PORT));
@@ -980,6 +982,12 @@ fn ssh_relay_proxy(port: u16) -> ! {
     // the session done; blocking on the other direction creates a deadlock
     // (SSH holds its write pipe open waiting for us to exit; we're blocked
     // reading that pipe waiting for SSH to close it).
+    //
+    // IMPORTANT: stdout() uses a LineWriter that only flushes on '\n'.
+    // The SSH banner ends with \r\n (flushed), but the subsequent binary
+    // KEXINIT packet has no newline and would be buffered indefinitely.
+    // Write to raw fd 1 directly (via File::from_raw_fd) to bypass the
+    // LineWriter and ensure all bytes reach SSH immediately.
     let relay_read = relay.try_clone().expect("clone relay");
     std::thread::spawn(move || {
         let mut src = std::io::stdin().lock();
@@ -989,7 +997,8 @@ fn ssh_relay_proxy(port: u16) -> ! {
     });
     std::thread::spawn(move || {
         let mut src = relay_read;
-        let mut dst = std::io::stdout().lock();
+        // SAFETY: fd 1 is stdout, open for the lifetime of this process.
+        let mut dst = unsafe { File::from_raw_fd(1) };
         let _ = std::io::copy(&mut src, &mut dst);
         process::exit(0);
     });
