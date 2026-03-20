@@ -118,6 +118,96 @@ and verify: IDE attaches, extensions install, terminal opens inside container.
 
    **Verified:** `docker run exits` → `docker inspect` returns exit 0, `State.Status="exited"`.
 
+### Epic #119 — pelagos builder VM (in progress, PR #125)
+
+Goal: boot a standalone Ubuntu 22.04 aarch64 VM as a named profile (`--profile build`)
+that can build and test pelagos natively, without a separate Linux machine.
+
+**Completed (PR #125, branch `feat/build-vm-profile`):**
+- Per-profile `vm.conf` in Rust (`state.rs`, `main.rs`): named profiles load
+  `~/.local/share/pelagos/profiles/<name>/vm.conf` for disk/kernel/initrd/memory/cpus.
+  Precedence: CLI flag > vm.conf > compiled default.
+- `loop.ko` staged in initramfs (needed for losetup during provisioning).
+- Init script external-rootfs label check: if `/dev/vda` label ≠ `pelagos-root`,
+  init skips Alpine copy and pivots directly to Ubuntu's `/sbin/init`.
+- `scripts/build-build-image.sh`: provisions `out/build.img` inside the running
+  Alpine VM via SSH + chroot, then writes `vm.conf` for the named profile.
+- `vm-ping.sh` / `vm-restart.sh` updated for profile-aware path resolution.
+
+**Remaining steps to reach a working builder VM:**
+
+1. **Merge PR #125** and pull to master.
+
+2. **Rebuild the initramfs** (one-time, to bake in `loop.ko`):
+   ```bash
+   bash scripts/build-vm-image.sh
+   ```
+
+3. **Boot the Alpine VM** with the new image:
+   ```bash
+   bash scripts/vm-ping.sh
+   ```
+
+4. **Provision the Ubuntu build image** (takes several minutes):
+   ```bash
+   bash scripts/build-build-image.sh
+   ```
+   Creates `out/build.img` (20 GB sparse ext4), installs Ubuntu 22.04 base +
+   build-essential + Rust stable via chroot inside the Alpine VM, writes
+   `~/.local/share/pelagos/profiles/build/vm.conf`.
+
+   > **Known risk — virtiofs loop I/O:** the image file lives on the macOS
+   > virtiofs share; all `apt-get` and `tar` I/O goes virtiofs → macOS APFS →
+   > virtiofs → loop → ext4. If this causes errors or hangs, see the alternative
+   > design below.
+
+5. **Boot the Ubuntu build VM:**
+   ```bash
+   bash scripts/vm-restart.sh --profile build
+   ```
+
+6. **Verify the build environment:**
+   ```bash
+   pelagos --profile build vm ssh -- rustc --version
+   pelagos --profile build vm ssh -- git clone https://github.com/skeptomai/pelagos /root/pelagos
+   pelagos --profile build vm ssh -- bash -c 'cd /root/pelagos && cargo build --release'
+   pelagos --profile build vm ssh -- bash -c 'cd /root/pelagos && cargo test'
+   ```
+
+**virtiofs loop device — design risk and alternatives:**
+
+The current provisioning path:
+```
+mke2fs → build.img (on macOS APFS, via virtiofs) → losetup /dev/loop0 →
+mount ext4 → chroot → apt-get/tar write into ext4 → virtiofs → macOS
+```
+Every byte written during provisioning crosses virtiofs twice (once to reach
+the file, once to flush through the FUSE daemon). This is a one-time cost but
+could be slow or trigger FUSE/virtiofs bugs under heavy write load (millions
+of small files from apt and cargo).
+
+**Alternative A (preferred if virtiofs provisioning proves unreliable):**
+Pass `build.img` directly to the Alpine VM as a second virtio-blk device.
+Requires adding a `--extra-disk` flag to `daemon.rs` / `VmConfig`. The image
+gets a real block device (`/dev/vdb`) — no loop, no virtiofs in the I/O path.
+`build-build-image.sh` would restart the Alpine VM with `--extra-disk build.img`,
+provision onto `/dev/vdb`, then restart normally.
+
+**Alternative B (simplest, no new kernel path):**
+Do the provisioning entirely on macOS using `docker run --platform linux/arm64`
+with a Linux container that has the right tools. Writes ext4 into build.img from
+the container. Zero virtiofs involved. Requires Docker Desktop on macOS (violates
+the no-external-subsystem rule — reject this option).
+
+**Alternative C (deferred):**
+Add a dedicated NVMe or virtio-blk device attachment to pelagos-vz for secondary
+disks. More general than Alternative A; the right long-term answer but Significant
+Work.
+
+**Current plan:** attempt the virtiofs provisioning path first. If it fails or is
+too slow, implement Alternative A (extra virtio-blk disk for the Alpine provisioning
+session only).
+
 ### Next priorities (post-v0.1.0)
 
 - **Port forwarding** — container port → VM port → macOS `localhost`. Needed for
