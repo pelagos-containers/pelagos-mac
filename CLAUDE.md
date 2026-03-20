@@ -196,7 +196,10 @@ For every task, fix, or meaningful change:
    ```
 2. Commit work on the branch (one or more commits).
 3. Open a PR against `master` via `gh pr create`.
-4. Reference any related issues in the PR body (`Closes #N`).
+4. Reference issues in the PR body — **only use `Closes #N` if the issue is
+   fully resolved by this PR**. For partial work use `Related to #N` or
+   `Part of #N`. GitHub auto-closes on `Closes`/`Fixes`/`Resolves` at merge —
+   using these for partially-addressed issues permanently loses the issue.
 5. Merge via the PR (squash or merge commit — either is fine).
 
 Branch naming: `feat/`, `fix/`, `chore/`, `docs/` prefixes.
