@@ -117,6 +117,33 @@ dc_up() {
     dc up --workspace-folder "$workspace" "$@" | tail -1
 }
 
+# Run devcontainer up with live output to the terminal AND capture the full output.
+# Usage: dc_up_live <workspace> <timeout_seconds>
+# Sets DC_UP_OUT (full output) and DC_UP_RC (exit code) in the caller's scope.
+# Kills and sets DC_UP_RC=124 if the timeout is exceeded.
+dc_up_live() {
+    local workspace="$1"
+    local timeout_s="$2"
+    local _tmp
+    _tmp=$(mktemp)
+    local _start=$SECONDS
+    printf "  [live output — timeout %ds — started at %s]\n" "$timeout_s" "$(date +%T)"
+    # timeout wraps the devcontainer subprocess; tee fans output to terminal (indented) and tmpfile.
+    timeout "$timeout_s" \
+        bash -c "DOCKER_HOST='' devcontainer up --docker-path '$SHIM_WRAPPER' --workspace-folder '$workspace' 2>&1" \
+        | tee "$_tmp" \
+        | sed 's/^/    /'
+    DC_UP_RC=${PIPESTATUS[0]}
+    DC_UP_OUT=$(cat "$_tmp")
+    rm -f "$_tmp"
+    local _elapsed=$(( SECONDS - _start ))
+    if [ "$DC_UP_RC" -eq 124 ]; then
+        printf "  [TIMEOUT after %ds — devcontainer up did not finish]\n" "$_elapsed"
+    else
+        printf "  [finished in %ds — exit %d]\n" "$_elapsed" "$DC_UP_RC"
+    fi
+}
+
 # Extract a field from the devcontainer up JSON result.
 # Usage: dc_result_field <json> <field>
 dc_result_field() {
@@ -236,8 +263,8 @@ if suite_active A; then
 
     # TC-T2-01: devcontainer up exits 0, outcome=success
     printf "  Running devcontainer up (pre-built)...\n"
-    A_UP_OUT=$(dc up --workspace-folder "$WS_A" 2>&1)
-    A_UP_RC=$?
+    dc_up_live "$WS_A" 60
+    A_UP_OUT="$DC_UP_OUT"; A_UP_RC="$DC_UP_RC"
     A_RESULT=$(echo "$A_UP_OUT" | tail -1)
     print_invocations
     [ "$DEBUG" -eq 1 ] && dump "devcontainer up output" "$A_UP_OUT"
@@ -291,8 +318,8 @@ if suite_active A; then
 
     # TC-T2-05: second devcontainer up reuses container (idempotency)
     printf "  Running devcontainer up (second time, idempotency)...\n"
-    A_UP2_OUT=$(dc up --workspace-folder "$WS_A" 2>&1)
-    A_UP2_RC=$?
+    dc_up_live "$WS_A" 60
+    A_UP2_OUT="$DC_UP_OUT"; A_UP2_RC="$DC_UP_RC"
     A_RESULT2=$(echo "$A_UP2_OUT" | tail -1)
     [ "$DEBUG" -eq 1 ] && dump "second up output" "$A_UP2_OUT"
 
@@ -327,8 +354,8 @@ if suite_active B; then
     cleanup_fixture "$WS_B"
 
     printf "  Running devcontainer up (custom Dockerfile)...\n"
-    B_UP_OUT=$(dc up --workspace-folder "$WS_B" 2>&1)
-    B_UP_RC=$?
+    dc_up_live "$WS_B" 120
+    B_UP_OUT="$DC_UP_OUT"; B_UP_RC="$DC_UP_RC"
     B_RESULT=$(echo "$B_UP_OUT" | tail -1)
     [ "$DEBUG" -eq 1 ] && dump "devcontainer up output" "$B_UP_OUT"
 
@@ -374,9 +401,10 @@ if suite_active C; then
     cleanup_fixture "$WS_C"
 
     printf "  Running devcontainer up (features: node:lts)...\n"
-    printf "  (This builds a multi-stage feature Dockerfile — may be slow on first run)\n"
-    C_UP_OUT=$(dc up --workspace-folder "$WS_C" 2>&1)
-    C_UP_RC=$?
+    printf "  (Installs node via nvm+apt-get — network-heavy, watch output below)\n"
+    dc_up_live "$WS_C" 300
+    C_UP_OUT="$DC_UP_OUT"
+    C_UP_RC="$DC_UP_RC"
     C_RESULT=$(echo "$C_UP_OUT" | tail -1)
     [ "$DEBUG" -eq 1 ] && dump "devcontainer up output" "$C_UP_OUT"
 
@@ -420,8 +448,9 @@ if suite_active D; then
     cleanup_fixture "$WS_D"
 
     printf "  Running devcontainer up (postCreateCommand)...\n"
-    D_UP_OUT=$(dc up --workspace-folder "$WS_D" 2>&1)
-    D_UP_RC=$?
+    dc_up_live "$WS_D" 60
+    D_UP_OUT="$DC_UP_OUT"
+    D_UP_RC="$DC_UP_RC"
     D_RESULT=$(echo "$D_UP_OUT" | tail -1)
     [ "$DEBUG" -eq 1 ] && dump "devcontainer up output" "$D_UP_OUT"
 
@@ -482,8 +511,8 @@ if suite_active E; then
     # TC-T2-11: first devcontainer up succeeds
     printf "  Running devcontainer up (first time)...\n"
     : > "$DC_INVOCATION_LOG"
-    E_UP1_OUT=$(dc up --workspace-folder "$WS_E" 2>&1)
-    E_UP1_RC=$?
+    dc_up_live "$WS_E" 60
+    E_UP1_OUT="$DC_UP_OUT"; E_UP1_RC="$DC_UP_RC"
     E_RESULT1=$(echo "$E_UP1_OUT" | tail -1)
     E_CONT=$(dc_result_field "$E_RESULT1" "containerId")
     [ "$DEBUG" -eq 1 ] && dump "devcontainer up output" "$E_UP1_OUT"
@@ -544,8 +573,8 @@ if suite_active E; then
     # stop the container again so devcontainer up must call docker start
     [ -n "$E_CONT" ] && pelagos stop "$E_CONT" >/dev/null 2>&1 || true
     sleep 1
-    E_UP2_OUT=$(dc up --workspace-folder "$WS_E" 2>&1)
-    E_UP2_RC=$?
+    dc_up_live "$WS_E" 60
+    E_UP2_OUT="$DC_UP_OUT"; E_UP2_RC="$DC_UP_RC"
     E_RESULT2=$(echo "$E_UP2_OUT" | tail -1)
     E_CONT2=$(dc_result_field "$E_RESULT2" "containerId")
     [ "$DEBUG" -eq 1 ] && dump "devcontainer up (restart) output" "$E_UP2_OUT"
