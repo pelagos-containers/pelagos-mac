@@ -118,13 +118,14 @@ pub fn ensure_running(args: &DaemonArgs) -> io::Result<()> {
             ));
         }
         // Extra disks are block devices attached at VM boot; they cannot be
-        // added to a running VM.  If the caller requested extra disks the
-        // only valid action is to stop and restart.
-        if !args.extra_disks.is_empty() {
+        // changed on a running VM.  Verify the running daemon was started with
+        // the same set (persisted in vm.extra_disks by daemon::run()).
+        let running_extra = state.read_extra_disks()?;
+        if running_extra != args.extra_disks {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "daemon is already running without the requested extra disks; \
-                 run 'pelagos vm stop' first, then retry with --extra-disk",
+                "daemon is running with different extra-disk configuration; \
+                 run 'pelagos vm stop' first, then retry",
             ));
         }
         // Verify that any explicitly requested port forwards are active.
@@ -239,7 +240,7 @@ pub fn run(args: DaemonArgs) -> ! {
         log::error!("write pid: {}", e);
     });
 
-    // Persist mount and port configuration.
+    // Persist mount, port, and extra-disk configuration.
     state
         .write_mounts(&args.virtiofs_shares)
         .unwrap_or_else(|e| {
@@ -248,6 +249,11 @@ pub fn run(args: DaemonArgs) -> ! {
     state.write_ports(&args.port_forwards).unwrap_or_else(|e| {
         log::error!("write ports: {}", e);
     });
+    state
+        .write_extra_disks(&args.extra_disks)
+        .unwrap_or_else(|e| {
+            log::error!("write extra_disks: {}", e);
+        });
 
     // Start a TCP proxy thread for each requested port forward.
     for pf in &args.port_forwards {

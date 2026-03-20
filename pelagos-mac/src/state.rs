@@ -13,6 +13,8 @@ pub struct StateDir {
     pub mounts_file: PathBuf,
     /// Active port forwards for the running daemon (JSON).
     pub ports_file: PathBuf,
+    /// Extra block device paths attached at boot (JSON).
+    pub extra_disks_file: PathBuf,
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +102,7 @@ impl StateDir {
             console_sock_file: base.join("console.sock"),
             mounts_file: base.join("vm.mounts"),
             ports_file: base.join("vm.ports"),
+            extra_disks_file: base.join("vm.extra_disks"),
         })
     }
 
@@ -149,6 +152,33 @@ impl StateDir {
         }
     }
 
+    /// Write the extra block device paths for the running daemon as JSON.
+    pub fn write_extra_disks(&self, paths: &[PathBuf]) -> io::Result<()> {
+        let strs: Vec<String> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let json = serde_json::to_string(&strs)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let tmp = self.extra_disks_file.with_extension("extra_disks.tmp");
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, &self.extra_disks_file)
+    }
+
+    /// Read the running daemon's extra disk paths.  Returns an empty Vec if
+    /// the file does not exist.
+    pub fn read_extra_disks(&self) -> io::Result<Vec<PathBuf>> {
+        match std::fs::read_to_string(&self.extra_disks_file) {
+            Ok(s) => {
+                let strs: Vec<String> = serde_json::from_str(&s)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                Ok(strs.into_iter().map(PathBuf::from).collect())
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Write the current daemon's port forward configuration as JSON.
     pub fn write_ports(&self, ports: &[crate::daemon::PortForward]) -> io::Result<()> {
         let json = serde_json::to_string(ports)
@@ -170,13 +200,14 @@ impl StateDir {
         }
     }
 
-    /// Remove PID, socket, console socket, mounts, and ports files. Best-effort.
+    /// Remove PID, socket, console socket, mounts, ports, and extra_disks files. Best-effort.
     pub fn clear(&self) {
         let _ = std::fs::remove_file(&self.pid_file);
         let _ = std::fs::remove_file(&self.sock_file);
         let _ = std::fs::remove_file(&self.console_sock_file);
         let _ = std::fs::remove_file(&self.mounts_file);
         let _ = std::fs::remove_file(&self.ports_file);
+        let _ = std::fs::remove_file(&self.extra_disks_file);
     }
 }
 
@@ -237,6 +268,7 @@ mod tests {
             console_sock_file: base.join("console.sock"),
             mounts_file: base.join("vm.mounts"),
             ports_file: base.join("vm.ports"),
+            extra_disks_file: base.join("vm.extra_disks"),
         }
     }
 
@@ -341,6 +373,7 @@ mod tests {
             console_sock_file: base.join("console.sock"),
             mounts_file: base.join("vm.mounts"),
             ports_file: base.join("vm.ports"),
+            extra_disks_file: base.join("vm.extra_disks"),
         };
         assert_eq!(s.pid_file, PathBuf::from("/tmp/pelagos-path-test/vm.pid"));
         assert_eq!(s.sock_file, PathBuf::from("/tmp/pelagos-path-test/vm.sock"));

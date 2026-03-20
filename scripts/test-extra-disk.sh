@@ -108,24 +108,11 @@ fi
 echo ""
 echo "=== Level 3: /dev/vdb visible inside VM ==="
 
-SSH_KEY="$PELAGOS_BASE/vm_key"
-
-if [[ ! -f "$SSH_KEY" ]]; then
-    echo "  SKIP: SSH key $SSH_KEY not found"
-    exit 0
-fi
-
-# The VM should already be running from Level 2 (or already up).
-# Wait up to 10 s for SSH to be available.
-echo "  waiting for SSH..."
-for i in $(seq 1 10); do
-    if ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=2 root@192.168.105.2 true 2>/dev/null; then
-        break
-    fi
-    sleep 1
-done
-
-VDISKS=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no root@192.168.105.2 "ls /dev/vd* 2>/dev/null" 2>/dev/null || echo "")
+# Use pelagos vm ssh (goes through the daemon/vsock/smoltcp relay) rather
+# than direct SSH — 192.168.105.2 is not directly routable from macOS with
+# the smoltcp NAT relay.
+VDISKS=$("$BINARY" --kernel "$KERNEL" --initrd "$INITRD" --disk "$DISK" \
+    --extra-disk "$EXTRA_IMG" vm ssh -- "ls /dev/vd* 2>/dev/null" 2>/dev/null || echo "")
 if echo "$VDISKS" | grep -q vdb; then
     result ok "/dev/vdb present inside VM ($VDISKS)"
 else
