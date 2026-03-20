@@ -4,3 +4,24 @@ target/
 *.raw
 Cargo.lock
 .DS_Store
+
+# VM image build output and initramfs staging directories
+out/
+bin/
+etc/
+lib/
+root/
+sbin/
+usr/
+var/
+init
+echo
+
+# Test output logs
+*.out
+
+# Claude Code project memory
+.claude/
+
+# Stray files from test crashes
+EXIT:*

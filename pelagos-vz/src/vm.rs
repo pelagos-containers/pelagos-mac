@@ -169,8 +169,8 @@ pub struct Vm {
     sock_dev: Arc<SendSockDev>,
     queue: Arc<SendQueue>,
     config: VmConfig,
-    /// Keeps the socket_vmnet relay threads alive for the VM's lifetime.
-    _relay: crate::socket_vmnet::RelayHandle,
+    /// Keeps the NAT relay thread alive for the VM's lifetime.
+    _relay: crate::nat_relay::RelayHandle,
 }
 
 #[derive(Debug)]
@@ -397,12 +397,11 @@ unsafe fn start_vm(config: VmConfig) -> Result<(Vm, std::os::unix::io::OwnedFd),
     let storage_ref: &VZStorageDeviceConfiguration = &block_dev;
     vm_config.setStorageDevices(&NSArray::from_slice(&[storage_ref]));
 
-    // 5. socket_vmnet network via VZFileHandleNetworkDeviceAttachment.
-    //    Connects to the socket_vmnet privileged helper (vmnet.framework shared mode),
-    //    bridges its SOCK_STREAM length-prefixed frame protocol to a SOCK_DGRAM
-    //    socketpair that AVF can consume directly.
-    let (vmnet_fd, relay) = crate::socket_vmnet::connect()
-        .map_err(|e| crate::Error::Runtime(format!("socket_vmnet: {}", e)))?;
+    // 5. Userspace NAT relay via VZFileHandleNetworkDeviceAttachment.
+    //    Starts the smoltcp-based NAT relay (replaces socket_vmnet / vmnet.framework).
+    //    Returns a SOCK_DGRAM fd that AVF consumes directly as raw Ethernet frames.
+    let (vmnet_fd, relay) = crate::nat_relay::start()
+        .map_err(|e| crate::Error::Runtime(format!("nat_relay: {}", e)))?;
     let vmnet_fh = NSFileHandle::initWithFileDescriptor(NSFileHandle::alloc(), vmnet_fd);
     let net_attach = VZFileHandleNetworkDeviceAttachment::initWithFileHandle(
         VZFileHandleNetworkDeviceAttachment::alloc(),
@@ -412,7 +411,7 @@ unsafe fn start_vm(config: VmConfig) -> Result<(Vm, std::os::unix::io::OwnedFd),
     net_dev.setAttachment(Some(&*net_attach));
     let mac = VZMACAddress::randomLocallyAdministeredAddress();
     net_dev.setMACAddress(&mac);
-    log::info!("socket_vmnet: VM MAC address {}", mac.string());
+    log::info!("nat_relay: VM MAC address {}", mac.string());
     let net_ref: &VZNetworkDeviceConfiguration = &net_dev;
     vm_config.setNetworkDevices(&NSArray::from_slice(&[net_ref]));
 

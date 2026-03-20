@@ -25,3 +25,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 log.workspace = true
 libc.workspace = true
+smoltcp = { version = "0.12", default-features = false, features = [
+    "std", "log", "medium-ethernet", "proto-ipv4",
+    "socket-tcp",
+] }

@@ -390,10 +390,16 @@ fn proxy(unix: UnixStream, vsock: OwnedFd, conn_id: std::thread::ThreadId) {
 // Port forwarding
 // ---------------------------------------------------------------------------
 
-/// Accept TCP connections on `host_port` and proxy each one to
-/// `192.168.105.2:container_port` inside the VM.  Runs for the lifetime of
-/// the daemon process.
+/// Accept TCP connections on `host_port` and proxy each one to the VM container
+/// port via the smoltcp NAT relay proxy (127.0.0.1:RELAY_PROXY_PORT).
+///
+/// Protocol: connect to relay, send 2-byte big-endian container_port, then
+/// use the socket as a bidirectional stream into the VM.  This avoids needing
+/// a macOS route to 192.168.105.2 (which no longer exists without vmnet).
 pub(crate) fn port_forward_loop(host_port: u16, container_port: u16) {
+    use std::io::Write;
+    const RELAY_PROXY_PORT: u16 = pelagos_vz::nat_relay::RELAY_PROXY_PORT;
+
     let listener = match TcpListener::bind(("0.0.0.0", host_port)) {
         Ok(l) => l,
         Err(e) => {
@@ -402,9 +408,10 @@ pub(crate) fn port_forward_loop(host_port: u16, container_port: u16) {
         }
     };
     log::info!(
-        "port forward active: 0.0.0.0:{} → 192.168.105.2:{}",
+        "port forward active: 0.0.0.0:{} → VM:{}  (via relay :{})",
         host_port,
-        container_port
+        container_port,
+        RELAY_PROXY_PORT
     );
     for incoming in listener.incoming() {
         let client = match incoming {
@@ -415,18 +422,19 @@ pub(crate) fn port_forward_loop(host_port: u16, container_port: u16) {
             }
         };
         std::thread::spawn(move || {
-            let target = std::net::SocketAddr::from(([192, 168, 105, 2], container_port));
-            let server = match TcpStream::connect(target) {
-                Ok(s) => s,
-                Err(e) => {
-                    log::warn!(
-                        "port forward connect 192.168.105.2:{}: {}",
-                        container_port,
-                        e
-                    );
-                    return;
-                }
-            };
+            let relay_addr = std::net::SocketAddr::from(([127, 0, 0, 1], RELAY_PROXY_PORT));
+            let mut server =
+                match TcpStream::connect_timeout(&relay_addr, std::time::Duration::from_secs(5)) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("port forward connect relay:{}: {}", RELAY_PROXY_PORT, e);
+                        return;
+                    }
+                };
+            // Send 2-byte big-endian container port.
+            if server.write_all(&container_port.to_be_bytes()).is_err() {
+                return;
+            }
             tcp_proxy(client, server);
         });
     }
