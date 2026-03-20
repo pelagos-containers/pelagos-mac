@@ -29,7 +29,15 @@ else
     STATE_DIR="$PELAGOS_BASE/profiles/$PROFILE"
 fi
 
-pkill -KILL -f "pelagos.*vm-daemon-internal" 2>/dev/null || true
+# Kill only the daemon for this profile by reading its pid file.
+PID_FILE="$STATE_DIR/vm.pid"
+if [[ -f "$PID_FILE" ]]; then
+    pid="$(cat "$PID_FILE")"
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null || true
+        sleep 0.3
+    fi
+fi
 rm -f "$STATE_DIR/vm.pid" "$STATE_DIR/vm.sock"
 
 if [[ "$NUKE" -eq 1 ]]; then
