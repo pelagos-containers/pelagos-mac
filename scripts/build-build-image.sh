@@ -164,32 +164,37 @@ cat > "$ALPINE_VOLUMES_DIR/provision-build.sh" << OUTER_EOF
 #!/bin/sh
 # Provisioning script — runs inside the Alpine VM as root.
 # Executed by build-build-image.sh via pelagos vm ssh.
+# Uses only busybox-compatible commands (no util-linux losetup extensions).
 set -eux
 
 VOLUMES=/var/lib/pelagos/volumes
 IMG="\$VOLUMES/build.img"
 MNT=/mnt/build-provision
+LODEV=/dev/loop0
 
 echo "[provision] loading loop module"
 modprobe loop
+# Loop module doesn't auto-create device nodes without udev; create manually.
+mknod "\$LODEV" b 7 0 2>/dev/null || true
 
-# Set up loop device.
-echo "[provision] attaching loop device"
-LODEV=\$(losetup --find --show "\$IMG")
-echo "[provision] loop device: \$LODEV"
-
-# Check if we need to format.
-if blkid "\$LODEV" 2>/dev/null | grep -q 'LABEL="ubuntu-build"'; then
+# Format the image if it doesn't already have the ubuntu-build label.
+# mke2fs -F operates directly on a regular file — no loop device needed.
+if blkid "\$IMG" 2>/dev/null | grep -q 'LABEL="ubuntu-build"'; then
     echo "[provision] image already formatted as ubuntu-build — skipping format"
 else
     echo "[provision] formatting as ext4 label=ubuntu-build"
-    mke2fs -F -t ext4 -L ubuntu-build "\$LODEV"
+    /sbin/mke2fs -F -t ext4 -L ubuntu-build "\$IMG"
 fi
+
+# Attach loop device for mounting.
+losetup "\$LODEV" "\$IMG"
+echo "[provision] attached \$LODEV"
 
 mkdir -p "\$MNT"
 mount "\$LODEV" "\$MNT"
 
-# Check if Ubuntu is already extracted.
+# ---- Ubuntu base extraction ----
+
 if [ -f "\$MNT/etc/os-release" ]; then
     echo "[provision] Ubuntu base already extracted — skipping download"
 else
@@ -206,7 +211,9 @@ fi
 
 # ---- chroot provisioning ----
 
-# Bind-mount kernel filesystems into chroot.
+# Bind-mount kernel filesystems.  Create target dirs first — ubuntu-base
+# includes /proc and /sys but /dev/pts may be absent.
+mkdir -p "\$MNT/proc" "\$MNT/sys" "\$MNT/dev" "\$MNT/dev/pts"
 mount -t proc  proc   "\$MNT/proc"
 mount -t sysfs sysfs  "\$MNT/sys"
 mount --bind /dev     "\$MNT/dev"
@@ -225,11 +232,13 @@ SOURCES
 
 echo "[provision] apt-get update + install"
 chroot "\$MNT" apt-get update -qq
-chroot "\$MNT" apt-get install -y --no-install-recommends \
+chroot "\$MNT" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     build-essential git curl wget ca-certificates \
     iproute2 nftables openssh-server \
     systemd systemd-sysv \
     pkg-config libssl-dev
+
+# ---- networking: systemd-networkd with static IP ----
 
 echo "[provision] setting up systemd-networkd for static IP"
 mkdir -p "\$MNT/etc/systemd/network"
@@ -244,30 +253,44 @@ DNS=8.8.8.8
 DNS=1.1.1.1
 NETCFG
 
-# Enable systemd-networkd and ssh.
-chroot "\$MNT" systemctl enable systemd-networkd 2>/dev/null || true
-chroot "\$MNT" systemctl enable ssh              2>/dev/null || true
+# Enable services via symlinks — systemctl enable doesn't work without running
+# systemd, but symlink creation is equivalent and always works in a chroot.
+mkdir -p "\$MNT/etc/systemd/system/multi-user.target.wants"
+ln -sf /lib/systemd/system/systemd-networkd.service \
+    "\$MNT/etc/systemd/system/multi-user.target.wants/systemd-networkd.service" 2>/dev/null || true
+ln -sf /lib/systemd/system/ssh.service \
+    "\$MNT/etc/systemd/system/multi-user.target.wants/ssh.service" 2>/dev/null || true
 
-# SSH authorized key for root.
+# ---- SSH ----
+
 mkdir -p "\$MNT/root/.ssh"
 chmod 700 "\$MNT/root/.ssh"
-echo "${PUB_KEY_CONTENT}" > "\$MNT/root/.ssh/authorized_keys"
+printf '%s\n' "${PUB_KEY_CONTENT}" > "\$MNT/root/.ssh/authorized_keys"
 chmod 600 "\$MNT/root/.ssh/authorized_keys"
 
-# Allow root login via key.
-sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' "\$MNT/etc/ssh/sshd_config" 2>/dev/null || true
+# Ubuntu default PermitRootLogin is "prohibit-password" (key auth only) — correct.
+# No sshd_config edit needed; just confirm it's not set to "no".
+sed -i 's/^PermitRootLogin no/PermitRootLogin prohibit-password/' "\$MNT/etc/ssh/sshd_config" 2>/dev/null || true
 
-echo "[provision] installing Rust toolchain"
-chroot "\$MNT" bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --no-modify-path'
+# ---- Rust toolchain ----
+
+echo "[provision] installing Rust stable toolchain"
+# HOME must be set explicitly; chroot doesn't inherit it reliably.
+chroot "\$MNT" env HOME=/root \
+    bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+             | sh -s -- -y --default-toolchain stable --no-modify-path'
+
+# ---- cleanup ----
 
 echo "[provision] cleaning up"
 chroot "\$MNT" apt-get clean
-umount "\$MNT/dev/pts" || true
-umount "\$MNT/dev"     || true
-umount "\$MNT/sys"     || true
-umount "\$MNT/proc"    || true
+umount "\$MNT/dev/pts" 2>/dev/null || true
+umount "\$MNT/dev"     2>/dev/null || true
+umount "\$MNT/sys"     2>/dev/null || true
+umount "\$MNT/proc"    2>/dev/null || true
 umount "\$MNT"
 losetup -d "\$LODEV"
+rmdir  "\$MNT" 2>/dev/null || true
 
 echo "[provision] done"
 OUTER_EOF
