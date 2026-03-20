@@ -10,9 +10,13 @@
 # --profile <name>  Use a named VM profile (isolated state dir).
 #                   Default: "default" (~/.local/share/pelagos/).
 #
-# For the default profile, --kernel/--initrd/--disk are passed explicitly
-# from out/.  For named profiles that have a vm.conf, those paths are read
-# from vm.conf by the binary — do not pass flags that would override them.
+# Kernel/disk/initrd resolution (in precedence order):
+#   1. vm.conf in the profile state dir (named profiles with build images)
+#   2. out/vmlinuz, out/root.img, out/initramfs-custom.gz (default fallback)
+#
+# When a vm.conf exists for the named profile, CLI flags are NOT passed to
+# avoid overriding vm.conf values.  When no vm.conf exists (e.g. test
+# profiles), the out/ defaults are passed — same as the default profile.
 
 set -uo pipefail
 
@@ -47,9 +51,25 @@ fi
 PROFILE_ARG=()
 [[ "$PROFILE" != "default" ]] && PROFILE_ARG=(--profile "$PROFILE")
 
-# For the default profile, pass kernel/initrd/disk explicitly.
-# For named profiles, vm.conf provides them — passing CLI flags would override.
+# Determine whether the profile has a vm.conf that provides disk/kernel/initrd.
+# Named profiles with a vm.conf (e.g. build profile) must NOT get explicit
+# --kernel/--disk flags — those would override vm.conf with the wrong paths.
+# Named profiles without a vm.conf (e.g. test-vm-profiles.sh test profiles)
+# fall back to the out/ defaults, same as the default profile.
+PELAGOS_BASE="${XDG_DATA_HOME:-$HOME/.local/share}/pelagos"
 if [[ "$PROFILE" == "default" ]]; then
+    VMCONF="$PELAGOS_BASE/vm.conf"
+else
+    VMCONF="$PELAGOS_BASE/profiles/$PROFILE/vm.conf"
+fi
+
+if [[ -f "$VMCONF" ]] && [[ "$PROFILE" != "default" ]]; then
+    # Profile has a vm.conf — let the binary read kernel/disk/initrd from it.
+    exec "$BINARY" \
+        "${PROFILE_ARG[@]}" \
+        ping
+else
+    # No vm.conf (or default profile) — pass out/ defaults explicitly.
     for f in "$KERNEL" "$INITRD" "$DISK"; do
         if [[ ! -f "$f" ]]; then
             echo "Missing: $f" >&2
@@ -58,12 +78,9 @@ if [[ "$PROFILE" == "default" ]]; then
         fi
     done
     exec "$BINARY" \
+        "${PROFILE_ARG[@]}" \
         --kernel "$KERNEL" \
         --initrd "$INITRD" \
         --disk   "$DISK" \
-        ping
-else
-    exec "$BINARY" \
-        "${PROFILE_ARG[@]}" \
         ping
 fi
