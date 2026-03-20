@@ -396,6 +396,8 @@ enum GuestResponse {
 // Framed binary protocol constants
 // ---------------------------------------------------------------------------
 
+const VM_SSH_PORT: u16 = 22;
+
 const FRAME_STDIN: u8 = 0;
 const FRAME_STDOUT: u8 = 1;
 const FRAME_STDERR: u8 = 2;
@@ -532,7 +534,7 @@ fn main() {
                 eprintln!("error: cannot determine current executable path");
                 process::exit(1);
             });
-            let proxy_cmd = format!("{} ssh-relay-proxy 22", exe.display());
+            let proxy_cmd = format!("{} ssh-relay-proxy {}", exe.display(), VM_SSH_PORT);
             let mut cmd = std::process::Command::new("ssh");
             cmd.arg("-i")
                 .arg(&ssh_key)

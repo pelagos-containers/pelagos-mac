@@ -29,7 +29,7 @@ pelagos() {
         "$@"
 }
 
-ms_now() { python3 -c "import time; print(int(time.time()*1000))"; }
+ms_now() { perl -e 'print int(time*1000), "\n"'; }
 
 stats() {
     # stats <label> <n> <sample1> <sample2> ...
