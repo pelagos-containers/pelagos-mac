@@ -15,6 +15,71 @@ pub struct StateDir {
     pub ports_file: PathBuf,
 }
 
+// ---------------------------------------------------------------------------
+// Per-profile VM configuration
+// ---------------------------------------------------------------------------
+
+/// Per-profile VM configuration loaded from `vm.conf` in the profile state
+/// directory.  All fields are optional; absent fields fall back to CLI flags
+/// (or their own defaults).
+///
+/// File format: simple `key = value` lines; `#` comments; blank lines ignored.
+///
+/// ```text
+/// # vm.conf — written by build-build-image.sh
+/// disk   = /path/to/build.img
+/// kernel = /path/to/vmlinuz
+/// initrd = /path/to/initramfs.gz
+/// memory = 4096
+/// cpus   = 4
+/// ```
+#[derive(Debug, Default)]
+pub struct VmProfileConfig {
+    pub disk: Option<PathBuf>,
+    pub kernel: Option<PathBuf>,
+    pub initrd: Option<PathBuf>,
+    pub memory: Option<usize>,
+    pub cpus: Option<usize>,
+}
+
+impl VmProfileConfig {
+    /// Load `vm.conf` from the given profile's state directory.
+    /// Returns a zeroed config (all `None`) if the file does not exist.
+    pub fn load(profile: &str) -> io::Result<Self> {
+        let path = profile_dir(profile)?.join("vm.conf");
+        Self::load_path(&path)
+    }
+
+    fn load_path(path: &std::path::Path) -> io::Result<Self> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(e),
+        };
+        let mut cfg = Self::default();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, val)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            let val = val.trim();
+            match key {
+                "disk" => cfg.disk = Some(PathBuf::from(val)),
+                "kernel" => cfg.kernel = Some(PathBuf::from(val)),
+                "initrd" => cfg.initrd = Some(PathBuf::from(val)),
+                "memory" => cfg.memory = val.parse::<usize>().ok(),
+                "cpus" => cfg.cpus = val.parse::<usize>().ok(),
+                _ => {}
+            }
+        }
+        Ok(cfg)
+    }
+}
+
 impl StateDir {
     /// Open the default profile state directory (~/.local/share/pelagos/).
     #[allow(dead_code)]
@@ -312,6 +377,46 @@ mod tests {
             PathBuf::from("/tmp/pelagos-xdg-test/pelagos/profiles/build")
         );
         std::env::remove_var("XDG_DATA_HOME");
+    }
+
+    /// VmProfileConfig parses a vm.conf file correctly.
+    #[test]
+    fn vm_profile_config_parse() {
+        use std::io::Write;
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let dir = std::env::temp_dir().join(format!("pelagos-conf-test-{}", ns));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf_path = dir.join("vm.conf");
+        let mut f = std::fs::File::create(&conf_path).unwrap();
+        writeln!(f, "# comment").unwrap();
+        writeln!(f, "disk   = /data/build.img").unwrap();
+        writeln!(f, "kernel = /boot/vmlinuz").unwrap();
+        writeln!(f, "initrd = /boot/initrd.gz").unwrap();
+        writeln!(f, "memory = 8192").unwrap();
+        writeln!(f, "cpus   = 4").unwrap();
+        writeln!(f, "unknown = ignored").unwrap();
+        drop(f);
+
+        let cfg = super::VmProfileConfig::load_path(&conf_path).unwrap();
+        assert_eq!(cfg.disk, Some(PathBuf::from("/data/build.img")));
+        assert_eq!(cfg.kernel, Some(PathBuf::from("/boot/vmlinuz")));
+        assert_eq!(cfg.initrd, Some(PathBuf::from("/boot/initrd.gz")));
+        assert_eq!(cfg.memory, Some(8192));
+        assert_eq!(cfg.cpus, Some(4));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// VmProfileConfig returns all-None when vm.conf is absent.
+    #[test]
+    fn vm_profile_config_missing_returns_default() {
+        let absent = PathBuf::from("/tmp/pelagos-no-such-conf-file.conf");
+        let cfg = super::VmProfileConfig::load_path(&absent).unwrap();
+        assert!(cfg.disk.is_none());
+        assert!(cfg.memory.is_none());
     }
 
     /// default and named profiles use distinct state directories.

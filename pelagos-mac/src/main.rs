@@ -45,13 +45,13 @@ struct Cli {
     #[arg(long, env = "PELAGOS_CMDLINE", default_value = "console=hvc0")]
     cmdline: String,
 
-    /// Memory in MiB (default 4096)
-    #[arg(long, default_value = "4096")]
-    memory: usize,
+    /// Memory in MiB (default 4096; overridden by vm.conf memory= in profile)
+    #[arg(long)]
+    memory: Option<usize>,
 
-    /// Number of vCPUs (default 2)
-    #[arg(long, default_value = "2")]
-    cpus: usize,
+    /// Number of vCPUs (default 2; overridden by vm.conf cpus= in profile)
+    #[arg(long)]
+    cpus: Option<usize>,
 
     /// Bind-mount a host directory into the container: /host/path:/container/path[:ro]
     /// May be specified multiple times.
@@ -1011,12 +1011,19 @@ fn ssh_relay_proxy(port: u16) -> ! {
 }
 
 fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
-    let kernel = cli.kernel.clone().unwrap_or_else(|| {
-        log::error!("--kernel / PELAGOS_KERNEL is required");
-        process::exit(1);
-    });
-    let disk = cli.disk.clone().unwrap_or_else(|| {
-        log::error!("--disk / PELAGOS_DISK is required");
+    // Load per-profile vm.conf as a fallback layer below CLI flags.
+    let profile_cfg = state::VmProfileConfig::load(&cli.profile).unwrap_or_default();
+
+    let kernel = cli
+        .kernel
+        .clone()
+        .or(profile_cfg.kernel)
+        .unwrap_or_else(|| {
+            log::error!("--kernel / PELAGOS_KERNEL is required (or set kernel= in vm.conf)");
+            process::exit(1);
+        });
+    let disk = cli.disk.clone().or(profile_cfg.disk).unwrap_or_else(|| {
+        log::error!("--disk / PELAGOS_DISK is required (or set disk= in vm.conf)");
         process::exit(1);
     });
 
@@ -1084,11 +1091,11 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
 
     daemon::DaemonArgs {
         kernel,
-        initrd: cli.initrd.clone(),
+        initrd: cli.initrd.clone().or(profile_cfg.initrd),
         disk,
         cmdline,
-        memory_mib: cli.memory,
-        cpus: cli.cpus,
+        memory_mib: cli.memory.or(profile_cfg.memory).unwrap_or(4096),
+        cpus: cli.cpus.or(profile_cfg.cpus).unwrap_or(2),
         virtiofs_shares,
         port_forwards,
         profile: cli.profile.clone(),
