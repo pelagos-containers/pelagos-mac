@@ -46,8 +46,4 @@ if [[ "$NUKE" -eq 1 ]]; then
     dd if=/dev/zero of="$REPO_ROOT/out/root.img" bs=1m count=0 seek=8192
 fi
 
-PING_ARGS=()
-if [[ "$PROFILE" != "default" ]]; then
-    PING_ARGS=(--profile "$PROFILE")
-fi
-exec bash "$SCRIPT_DIR/vm-ping.sh" "${PING_ARGS[@]}"
+exec bash "$SCRIPT_DIR/vm-ping.sh" --profile "$PROFILE"
