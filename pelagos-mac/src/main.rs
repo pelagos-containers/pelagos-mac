@@ -975,20 +975,28 @@ fn ssh_relay_proxy(port: u16) -> ! {
     });
 
     // Proxy stdin → relay and relay → stdout in two threads.
+    // When either direction closes, call process::exit immediately.
+    // SSH waits for the ProxyCommand process to exit before it considers
+    // the session done; blocking on the other direction creates a deadlock
+    // (SSH holds its write pipe open waiting for us to exit; we're blocked
+    // reading that pipe waiting for SSH to close it).
     let relay_read = relay.try_clone().expect("clone relay");
-    let t1 = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut src = std::io::stdin().lock();
         let mut dst = relay;
         let _ = std::io::copy(&mut src, &mut dst);
+        process::exit(0);
     });
-    let t2 = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut src = relay_read;
         let mut dst = std::io::stdout().lock();
         let _ = std::io::copy(&mut src, &mut dst);
+        process::exit(0);
     });
-    let _ = t1.join();
-    let _ = t2.join();
-    process::exit(0);
+    // Park; the proxy threads call process::exit when either side closes.
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(86400));
+    }
 }
 
 fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
