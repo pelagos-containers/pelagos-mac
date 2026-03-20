@@ -795,6 +795,7 @@ fn handle_udp_frame(relay_fd: RawFd, frame: &[u8]) -> bool {
 }
 
 /// Synthesize a UDP reply Ethernet frame and send it back to the VM.
+#[allow(clippy::too_many_arguments)]
 fn send_udp_reply(
     relay_fd: RawFd,
     orig_eth_ip_hdr: &[u8], // original Ethernet + IPv4 header bytes
