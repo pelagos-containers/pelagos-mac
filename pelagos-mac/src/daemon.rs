@@ -117,6 +117,16 @@ pub fn ensure_running(args: &DaemonArgs) -> io::Result<()> {
                  run 'pelagos vm stop' first, then retry",
             ));
         }
+        // Extra disks are block devices attached at VM boot; they cannot be
+        // added to a running VM.  If the caller requested extra disks the
+        // only valid action is to stop and restart.
+        if !args.extra_disks.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "daemon is already running without the requested extra disks; \
+                 run 'pelagos vm stop' first, then retry with --extra-disk",
+            ));
+        }
         // Verify that any explicitly requested port forwards are active.
         // Requesting no ports (-p not given) always succeeds even if the daemon
         // has active forwards (the proxies are already running).

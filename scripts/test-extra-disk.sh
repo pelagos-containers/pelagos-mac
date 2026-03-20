@@ -66,6 +66,13 @@ for f in "$KERNEL" "$INITRD" "$DISK" "$BINARY"; do
     fi
 done
 
+# Stop any running VM daemon — extra disks cannot be added to a live VM.
+echo "  stopping any running VM daemon..."
+pkill -TERM -f "pelagos.*vm-daemon-internal" 2>/dev/null || true
+sleep 2
+pkill -KILL -f "pelagos.*vm-daemon-internal" 2>/dev/null || true
+rm -f "$PELAGOS_BASE/vm.pid" "$PELAGOS_BASE/vm.sock"
+
 # Create a tiny sparse extra disk just for the boot test.
 dd if=/dev/zero of="$EXTRA_IMG" bs=1m count=0 seek=10 2>/dev/null
 echo "  created test extra disk: $EXTRA_IMG (10 MB sparse)"
