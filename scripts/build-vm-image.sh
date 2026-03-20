@@ -496,6 +496,17 @@ if [ ! -f "$INITRAMFS_OUT" ] \
         echo "  WARNING: virtio_blk.ko not found in modloop — /dev/vda will be unavailable" >&2
     fi
 
+    # loop.ko: needed by build-build-image.sh to losetup a sparse image file
+    # inside the Alpine VM and provision an Ubuntu rootfs via chroot.
+    LOOP_KO="$NETMOD_BASE/drivers/block/loop.ko"
+    if [ -f "$LOOP_KO" ]; then
+        mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/block"
+        cp "$LOOP_KO" "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/block/loop.ko"
+        echo "  staged loop.ko"
+    else
+        echo "  WARNING: loop.ko not found in modloop — losetup will be unavailable" >&2
+    fi
+
     # ext4 filesystem module (+ jbd2 journal + mbcache deps): needed to mount /dev/vda.
     # ext4 is a module in linux-lts (not built-in).  ext4 replaces ext2 because its
     # journal makes the filesystem self-healing after unclean VM shutdowns — no more
@@ -666,6 +677,16 @@ if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
         NEEDS_FORMAT=1
         NEEDS_COPY=1
     elif busybox mount -t ext4 /dev/vda /newroot 2>/dev/null; then
+        # If the disk carries a non-pelagos label (e.g. "ubuntu-build"), it is an
+        # external rootfs managed by build-build-image.sh.  Skip the Alpine copy
+        # entirely and hand off directly to the disk's own /sbin/init (systemd).
+        DISK_LABEL="\$(busybox blkid /dev/vda 2>/dev/null | busybox grep -o 'LABEL="[^"]*"' | busybox cut -d'"' -f2)"
+        if [ -n "\$DISK_LABEL" ] && [ "\$DISK_LABEL" != "pelagos-root" ]; then
+            echo "[pelagos-init] pass 1: external rootfs label='\$DISK_LABEL' — pivoting to disk's /sbin/init"
+            exec busybox switch_root /newroot /sbin/init
+            echo "[pelagos-init] FATAL: switch_root to external rootfs failed" >/dev/console 2>&1
+            exec busybox sh
+        fi
         DISK_VERSION="\$(busybox cat /newroot/etc/pelagos-root-version 2>/dev/null || true)"
         if [ "\$DISK_VERSION" = "\$EXPECTED_VERSION" ]; then
             echo "[pelagos-init] pass 1: disk root is current (version=\$EXPECTED_VERSION)"
