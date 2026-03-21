@@ -360,13 +360,39 @@ ln -sf /lib/systemd/system/systemd-timesyncd.service \
 # handles zstd initrds natively).  Both files land on the virtiofs share so
 # the outer script can move them to out/ on the macOS host.
 
-echo "[provision] extracting Ubuntu kernel and initrd for host AVF boot"
+echo "[provision] extracting Ubuntu kernel, initrd, and modules for host AVF boot"
 KVER=\$(ls "\$MNT/boot/vmlinuz-"* 2>/dev/null | sort -V | tail -1 | sed 's|.*/vmlinuz-||')
 if [ -n "\$KVER" ]; then
     zcat "\$MNT/boot/vmlinuz-\$KVER" > /var/lib/pelagos/volumes/ubuntu-vmlinuz
     cp "\$MNT/boot/initrd.img-\$KVER" /var/lib/pelagos/volumes/ubuntu-initrd.img
     echo "  kernel: vmlinuz-\$KVER (\$(du -sh /var/lib/pelagos/volumes/ubuntu-vmlinuz | cut -f1) decompressed)"
     echo "  initrd: initrd.img-\$KVER (\$(du -sh /var/lib/pelagos/volumes/ubuntu-initrd.img | cut -f1))"
+
+    # Extract the two kernel modules that are =m in Ubuntu 6.8 HWE and are
+    # required by the container VM initramfs: vsock (pelagos-guest comms) and
+    # overlayfs (container layer stacking).  All other virtio drivers are =y
+    # (built-in) so no modules are needed for them.
+    MODDIR="\$MNT/lib/modules/\$KVER/kernel"
+    VOLS=/var/lib/pelagos/volumes
+    mkdir -p "\$VOLS/ubuntu-modules/net/vmw_vsock" "\$VOLS/ubuntu-modules/fs/overlayfs"
+    for ko in \
+        "\$MODDIR/net/vmw_vsock/vsock.ko" \
+        "\$MODDIR/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko" \
+        "\$MODDIR/net/vmw_vsock/vmw_vsock_virtio_transport.ko"
+    do
+        [ -f "\$ko" ] && cp "\$ko" "\$VOLS/ubuntu-modules/net/vmw_vsock/" \
+            && echo "  module: \$(basename \$ko)"
+    done
+    [ -f "\$MODDIR/fs/overlayfs/overlay.ko" ] \
+        && cp "\$MODDIR/fs/overlayfs/overlay.ko" "\$VOLS/ubuntu-modules/fs/overlayfs/" \
+        && echo "  module: overlay.ko"
+    # Also copy modules.dep so modprobe can resolve the vsock dependency chain.
+    cp "\$MNT/lib/modules/\$KVER/modules.dep" "\$VOLS/ubuntu-modules/" 2>/dev/null || true
+    cp "\$MNT/lib/modules/\$KVER/modules.dep.bin" "\$VOLS/ubuntu-modules/" 2>/dev/null || true
+    # Write kver.txt so build-vm-image.sh can detect the kernel version without
+    # parsing modules.dep (which uses relative paths, not absolute paths).
+    echo "\$KVER" > "\$VOLS/ubuntu-modules/kver.txt"
+    echo "  stored Ubuntu modules in volumes/ubuntu-modules/ (kver: \$KVER)"
 else
     echo "WARNING: no vmlinuz found in \$MNT/boot — cannot extract kernel" >&2
 fi
@@ -437,10 +463,18 @@ echo ""
 UBUNTU_VMLINUZ="$REPO_ROOT/out/ubuntu-vmlinuz"
 UBUNTU_INITRD="$REPO_ROOT/out/ubuntu-initrd.img"
 if [[ -f "$ALPINE_VOLUMES_DIR/ubuntu-vmlinuz" ]]; then
-    mv "$ALPINE_VOLUMES_DIR/ubuntu-vmlinuz" "$UBUNTU_VMLINUZ"
+    mv "$ALPINE_VOLUMES_DIR/ubuntu-vmlinuz"   "$UBUNTU_VMLINUZ"
     mv "$ALPINE_VOLUMES_DIR/ubuntu-initrd.img" "$UBUNTU_INITRD"
     echo "--- extracted Ubuntu kernel to out/ubuntu-vmlinuz ($(du -sh "$UBUNTU_VMLINUZ" | cut -f1)) ---"
     echo "--- extracted Ubuntu initrd  to out/ubuntu-initrd.img ($(du -sh "$UBUNTU_INITRD" | cut -f1)) ---"
+    # Move kernel modules needed by the container VM initramfs.
+    UBUNTU_MODULES_SRC="$ALPINE_VOLUMES_DIR/ubuntu-modules"
+    UBUNTU_MODULES_DST="$REPO_ROOT/out/ubuntu-modules"
+    if [[ -d "$UBUNTU_MODULES_SRC" ]]; then
+        rm -rf "$UBUNTU_MODULES_DST"
+        mv "$UBUNTU_MODULES_SRC" "$UBUNTU_MODULES_DST"
+        echo "--- extracted Ubuntu kernel modules to out/ubuntu-modules/ ---"
+    fi
 else
     echo "ERROR: ubuntu-vmlinuz not found in Alpine volumes dir — kernel extraction failed" >&2
     exit 1
