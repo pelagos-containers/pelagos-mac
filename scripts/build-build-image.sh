@@ -334,6 +334,19 @@ chroot "\$MNT" env HOME=/root \
 printf '%s\n' 'export PATH=$PATH:/root/.cargo/bin' > "\$MNT/etc/profile.d/rust.sh"
 chmod +x "\$MNT/etc/profile.d/rust.sh"
 
+# Append to root's .bashrc so non-login interactive shells also get cargo.
+printf '\n# Rust toolchain\nsource /root/.cargo/env\n' >> "\$MNT/root/.bashrc"
+
+# git needs an explicit CA bundle path on Ubuntu 22.04 — without this, git
+# reports "CAfile: none" even though ca-certificates is installed.
+chroot "\$MNT" git config --global http.sslCAInfo /etc/ssl/certs/ca-certificates.crt
+
+# Sync the system clock on boot via systemd-timesyncd (NTP).
+# Without this the VM clock is frozen at image-build time, causing TLS
+# certificate verification failures for git and cargo.
+ln -sf /lib/systemd/system/systemd-timesyncd.service \
+    "\$MNT/etc/systemd/system/multi-user.target.wants/systemd-timesyncd.service" 2>/dev/null || true
+
 # ---- cleanup ----
 
 echo "[provision] cleaning up"
