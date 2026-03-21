@@ -29,16 +29,22 @@ else
     STATE_DIR="$PELAGOS_BASE/profiles/$PROFILE"
 fi
 
-# Kill only the daemon for this profile by reading its pid file.
-PID_FILE="$STATE_DIR/vm.pid"
-if [[ -f "$PID_FILE" ]]; then
-    pid="$(cat "$PID_FILE")"
+# Kill ALL running pelagos daemons, not just this profile's.
+# All profiles share the same socket_vmnet NAT IP (192.168.105.2); only one
+# VM can hold that address at a time. If a different profile's daemon is still
+# running when we start, it wins the IP and the new VM becomes unreachable.
+for pid_file in \
+    "$PELAGOS_BASE/vm.pid" \
+    "$PELAGOS_BASE"/profiles/*/vm.pid; do
+    [[ -f "$pid_file" ]] || continue
+    pid="$(cat "$pid_file")"
     if kill -0 "$pid" 2>/dev/null; then
         kill -KILL "$pid" 2>/dev/null || true
-        sleep 0.3
     fi
-fi
-rm -f "$STATE_DIR/vm.pid" "$STATE_DIR/vm.sock"
+    state_dir="$(dirname "$pid_file")"
+    rm -f "$pid_file" "$state_dir/vm.sock"
+done
+sleep 0.3
 
 if [[ "$NUKE" -eq 1 ]]; then
     echo "=== Recreating root.img ==="
