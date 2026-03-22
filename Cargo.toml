@@ -4,6 +4,7 @@ members = [
     "pelagos-guest",
     "pelagos-mac",
     "pelagos-docker",
+    "pelagos-tui",
 ]
 resolver = "2"
 
