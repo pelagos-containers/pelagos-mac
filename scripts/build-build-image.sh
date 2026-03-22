@@ -254,9 +254,13 @@ SOURCES
 
 echo "[provision] apt-get update + install"
 chroot "\$MNT" apt-get update -qq
+# flash-kernel tries to flash the kernel to embedded ARM hardware; it fails
+# in a VM with "Unsupported platform" and blocks post-install hooks for any
+# package that pulls in initramfs-tools.  Remove it before installing anything.
+chroot "\$MNT" env DEBIAN_FRONTEND=noninteractive apt-get remove -y flash-kernel 2>/dev/null || true
 chroot "\$MNT" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     build-essential git curl wget ca-certificates \
-    iproute2 nftables openssh-server \
+    iproute2 nftables openssh-server sudo \
     systemd systemd-sysv systemd-timesyncd \
     pkg-config libssl-dev
 

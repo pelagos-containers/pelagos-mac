@@ -1,6 +1,6 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-03-22 — **v0.4.0 released** (SHA f6433d3)*
+*Last updated: 2026-03-22 — **v0.4.0 released** (SHA f6433d3); build VM full test suite verified*
 
 ---
 
@@ -38,6 +38,7 @@ in ~16s; full console replay works.
 | Ubuntu build VM (`--profile build`) | ✅ | PR #125/#129/#131 |
 | Ubuntu 6.8 HWE kernel for container VM | ✅ | PR #131 |
 | hvc0 console drain — no RCU stall on boot | ✅ | PR #131 |
+| Build VM: full pelagos test suite (297/303, 0 fail) | ✅ | PR #136 + pelagos PRs |
 
 ---
 
@@ -58,10 +59,21 @@ in ~16s; full console replay works.
 
 ---
 
-## Epic #119 — pelagos builder VM ✅ COMPLETE (PR #125/#129/#131)
+## Epic #119 — pelagos builder VM + full test suite verified ✅ (PR #125/#129/#131/#136)
 
 Ubuntu 22.04 aarch64 VM running as `--profile build`. Boots in ~16s, SSH-ready.
-Full Rust build environment, can build and test pelagos natively.
+`cargo build --release` verified: pelagos v0.59.0, ELF64 AArch64, 1m 50s.
+`cargo test` (full suite): **297/303 passed, 0 failed, 6 ignored** (ignored tests
+require external services: docker registry, Go toolchain). All container, networking,
+cgroup, seccomp, namespace, and overlayfs integration tests pass.
+
+Fixes required to reach full pass:
+- pelagos#128: `SYS_chmod` → `SYS_fchmodat` in integration tests (aarch64 syscall table)
+- pelagos PR: `call_credential_helper` PATH injection via `Command::env` (data race fix)
+- pelagos PR: DNS label length typo in `test_parse_qname_labels`
+- build VM provisioning: `overlay` added to `/etc/modules` (Ubuntu 6.8 HWE ships it as `=m`)
+- build VM provisioning: `flash-kernel` removed before apt install (blocks post-install hooks in VMs)
+- build VM provisioning: `sudo` added to apt install list (required by `test_rootless_bridge_error`)
 
 **How it works:**
 - `build-build-image.sh` provisions `out/build.img`, extracts Ubuntu 6.8.0-106-generic
@@ -82,6 +94,8 @@ to any client connecting at any time. `pelagos vm console [--profile build]` wor
 
 ### Next priorities
 
+- **Epic #135 — pelagos-ui** — Tauri + Svelte macOS management GUI (new). M1: container list. Blocked on #98 (JSON ps output).
+- **Release CI workflow (#118)** — self-hosted runner + `release.yml` to build, sign, and publish binaries on tag push.
 - **Port forwarding** — container port → VM port → macOS `localhost`. Currently
   workaround: direct VM IP is routable from macOS host via smoltcp NAT.
 - **`docker volume inspect`** — `create/ls/rm` works; `inspect` not implemented.
@@ -89,9 +103,6 @@ to any client connecting at any time. `pelagos vm console [--profile build]` wor
   paths at VM start time.
 - **Signed installer** — `.pkg` for distribution. Requires Developer ID + notarization
   + `com.apple.security.virtualization`. Not yet scoped.
-- **Release CI workflow** — no binary artifacts on GitHub releases today; a
-  `release.yml` that builds + attaches the signed binary on tag push would be useful
-  when distributing to others.
 
 ---
 
