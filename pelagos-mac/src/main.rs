@@ -145,8 +145,11 @@ enum Commands {
         #[arg(value_name = "CONTAINER")]
         name: String,
     },
-    /// Remove all exited containers
-    ContainerPrune,
+    /// Manage containers (subcommands: prune)
+    Container {
+        #[command(subcommand)]
+        sub: ContainerCommands,
+    },
     /// Restart a stopped container with its original parameters
     Start {
         /// Name of the container to start
@@ -263,6 +266,12 @@ enum VmCommands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ContainerCommands {
+    /// Remove all exited containers
+    Prune,
 }
 
 // ---------------------------------------------------------------------------
@@ -791,7 +800,9 @@ fn main() {
             ));
         }
 
-        Commands::ContainerPrune => {
+        Commands::Container {
+            sub: ContainerCommands::Prune,
+        } => {
             let daemon_args = daemon_args_from_cli(&cli);
             if let Err(e) = daemon::ensure_running(&daemon_args) {
                 log::error!("failed to start VM daemon: {}", e);
