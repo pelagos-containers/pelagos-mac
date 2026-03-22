@@ -492,9 +492,14 @@ initrd    = $UBUNTU_INITRD
 memory    = $MEMORY_MIB
 cpus      = $CPUS
 ping_mode = ssh
-# net.ifnames=0: prevent udev from renaming eth0 → enp0sN (predictable names).
-# root=LABEL=ubuntu-build: the build image ext4 label set during provisioning.
-cmdline   = console=hvc0 net.ifnames=0 root=LABEL=ubuntu-build rw
+# net.ifnames=0: prevent udev from renaming eth0 → enp0sN.
+# Without this, udev brings eth0 down to rename it, dropping the IP configured
+# by the initramfs before switch_root, leaving smoltcp unable to ARP the VM.
+# cpuidle.off=1: disable cpuidle-psci deep idle states. Ubuntu 6.8 HWE uses
+# PSCI CPU_SUSPEND for deep idle; AVF does not reliably deliver hrtimers to
+# vCPUs parked in PSCI idle, causing rcu_preempt kthread timer stalls.
+# nohz=off alone did not help — tick delivery is fine, hrtimer delivery is not.
+cmdline   = console=hvc0 net.ifnames=0 cpuidle.off=1 root=LABEL=ubuntu-build rw
 VMCONF_EOF
 
 echo "  $PROFILE_STATE_DIR/vm.conf"

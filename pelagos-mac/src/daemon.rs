@@ -570,20 +570,65 @@ pub(crate) fn mounts_match(a: &[VirtiofsShare], b: &[VirtiofsShare]) -> bool {
 /// Accept console clients forever.  Each client gets the serial port for its
 /// session; when it disconnects we wait for the next one.  The serial port
 /// socketpair end (`relay_fd`) is kept alive for the process lifetime.
+///
+/// IMPORTANT: when no client is connected we must continuously drain console
+/// output from `relay_fd` (discard it).  If nobody reads, the socketpair
+/// buffer fills up (~128 KB on macOS), AVF's virtio-console backend stalls,
+/// and the guest kernel's hvc_write() path blocks while holding spinlocks in
+/// the printk path.  That prevents CPUs from passing through RCU quiescent
+/// states, causing rcu_preempt stalls at every boot.
 fn console_relay_loop(listener: UnixListener, relay_fd: OwnedFd) {
     let raw = relay_fd.into_raw_fd();
+    let listener_fd = listener.as_raw_fd();
+    let mut drain_buf = vec![0u8; 4096];
     loop {
-        let client = match listener.accept() {
-            Ok((stream, _)) => stream,
-            Err(e) => {
-                log::warn!("console accept: {}", e);
+        // Poll for either a new console client OR data to drain from the VM.
+        let mut pfds = [
+            libc::pollfd {
+                fd: listener_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: raw,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let n = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-        };
-        log::info!("console client connected");
-        proxy_console(client, raw);
-        log::info!("console client disconnected");
-        // Loop back to accept the next client; raw stays open.
+            log::warn!("console poll: {}", err);
+            break;
+        }
+
+        // New console client connecting — proxy bidirectionally until disconnect.
+        if pfds[0].revents & libc::POLLIN != 0 {
+            match listener.accept() {
+                Ok((client, _)) => {
+                    log::info!("console client connected");
+                    proxy_console(client, raw);
+                    log::info!("console client disconnected");
+                }
+                Err(e) => log::warn!("console accept: {}", e),
+            }
+            continue;
+        }
+
+        // Console output from VM with no client attached — drain and discard
+        // to prevent the guest's hvc write path from blocking.
+        if pfds[1].revents & libc::POLLIN != 0 {
+            unsafe {
+                libc::read(
+                    raw,
+                    drain_buf.as_mut_ptr() as *mut libc::c_void,
+                    drain_buf.len(),
+                )
+            };
+        }
     }
 }
 
