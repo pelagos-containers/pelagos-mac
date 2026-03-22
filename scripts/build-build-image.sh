@@ -309,6 +309,11 @@ ln -sf /dev/null "\$MNT/etc/systemd/system/systemd-resolved.service"
 rm -f "\$MNT/etc/resolv.conf"
 printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > "\$MNT/etc/resolv.conf"
 
+# Load overlay at boot — required for pelagos container workloads.
+# The Ubuntu 6.8 HWE kernel ships overlay as a module (=m), not built-in,
+# so it must be explicitly loaded.  /etc/modules is read by systemd-modules-load.
+printf 'overlay\n' >> "\$MNT/etc/modules"
+
 # Disable predictable interface renaming (belt-and-suspenders alongside
 # net.ifnames=0 in the kernel cmdline).  Without this, udev renames eth0
 # to enp0sN, bringing it down while networkd is trying to configure it.
