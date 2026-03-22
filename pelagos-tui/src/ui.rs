@@ -143,6 +143,18 @@ fn render_hint_bar(f: &mut Frame, app: &App, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn render_modeline(f: &mut Frame, app: &App, area: Rect) {
+    // Transient error/status from the last run command.
+    if let Some(msg) = &app.status_message {
+        let spans = vec![
+            Span::styled("  ! ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(msg.as_str(), Style::default().fg(Color::Yellow)),
+        ];
+        let modeline = Paragraph::new(Line::from(spans))
+            .style(Style::default().bg(Color::Black).fg(Color::White));
+        f.render_widget(modeline, area);
+        return;
+    }
+
     // In command palette mode the modeline becomes an input field.
     if app.mode == Mode::CommandPalette {
         let spans = vec![
