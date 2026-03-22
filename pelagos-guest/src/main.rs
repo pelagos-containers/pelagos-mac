@@ -140,6 +140,12 @@ pub enum GuestCommand {
     /// Restart a stopped container; maps to `pelagos start <name>`.
     Start {
         name: String,
+        /// Run interactively with a PTY (maps to `pelagos start -i`).
+        #[serde(default)]
+        interactive: bool,
+        /// Override the command for this run only (maps to `pelagos start -- CMD`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cmd_override: Vec<String>,
     },
     /// Stop a running container; maps to `pelagos stop <name>`.
     Stop {
@@ -456,10 +462,32 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 )?;
                 send_response(&mut writer, &GuestResponse::Exit { exit: 0 })?;
             }
-            GuestCommand::Start { name } => {
+            GuestCommand::Start {
+                name,
+                interactive,
+                cmd_override,
+            } => {
                 let mut cmd = Command::new(pelagos_bin());
-                cmd.arg("start").arg(&name);
-                spawn_and_stream(&mut writer, cmd)?;
+                cmd.arg("start");
+                if interactive {
+                    cmd.arg("-i");
+                }
+                cmd.arg(&name);
+                if !cmd_override.is_empty() {
+                    cmd.arg("--");
+                    cmd.args(&cmd_override);
+                }
+                if interactive {
+                    log::info!("start: container={} interactive=true", name);
+                    {
+                        let mut w = FdWriter(fd);
+                        send_response(&mut w, &GuestResponse::Ready { ready: true })?;
+                    }
+                    handle_exec_tty(fd, cmd)?;
+                    return Ok(());
+                } else {
+                    spawn_and_stream(&mut writer, cmd)?;
+                }
             }
             GuestCommand::Stop { name } => {
                 let mut cmd = Command::new(pelagos_bin());
