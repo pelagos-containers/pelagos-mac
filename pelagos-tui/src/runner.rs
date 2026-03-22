@@ -4,9 +4,7 @@
 //! that M5 can add a `LinuxRunner` without touching app or ui code.
 
 use std::path::PathBuf;
-use std::process::{Command, Output};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::process::Command;
 
 // ---------------------------------------------------------------------------
 // Data model
@@ -47,40 +45,6 @@ pub trait Runner {
 }
 
 // ---------------------------------------------------------------------------
-// Timeout helper
-// ---------------------------------------------------------------------------
-
-/// Run a `Command` and return its output, or `None` if it does not complete
-/// within `timeout`.
-///
-/// The subprocess is spawned on a background thread.  If the timeout fires the
-/// thread is abandoned — the subprocess continues running but the caller
-/// receives `None` and can proceed without blocking.  This keeps the TUI
-/// responsive when the guest daemon is occupied (e.g. serving an interactive
-/// container over vsock).
-fn output_timeout(mut cmd: Command, timeout: Duration) -> Option<Output> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(cmd.output());
-    });
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(out)) => Some(out),
-        Ok(Err(e)) => {
-            log::debug!("output_timeout: command error: {}", e);
-            None
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            log::debug!("output_timeout: timed out after {:?}", timeout);
-            None
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => None,
-    }
-}
-
-// How long to wait for a pelagos subprocess before giving up.
-const CMD_TIMEOUT: Duration = Duration::from_secs(5);
-
-// ---------------------------------------------------------------------------
 // MacOsRunner
 // ---------------------------------------------------------------------------
 
@@ -105,10 +69,7 @@ impl Runner for MacOsRunner {
             cmd.arg("--all");
         }
 
-        let Some(out) = output_timeout(cmd, CMD_TIMEOUT) else {
-            log::debug!("pelagos ps timed out — VM daemon busy");
-            return Ok(Vec::new());
-        };
+        let out = cmd.output()?;
 
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -140,13 +101,12 @@ impl Runner for MacOsRunner {
 
     fn vm_status(&self) -> bool {
         // `pelagos vm status` exits 0 when running, 1 when stopped.
-        let mut cmd = Command::new("pelagos");
-        cmd.arg("--profile")
+        let ok = Command::new("pelagos")
+            .arg("--profile")
             .arg(&self.profile)
             .arg("vm")
-            .arg("status");
-
-        let ok = output_timeout(cmd, CMD_TIMEOUT)
+            .arg("status")
+            .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
         log::trace!("vm_status profile={} running={}", self.profile, ok);
