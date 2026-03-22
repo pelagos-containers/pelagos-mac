@@ -254,9 +254,13 @@ SOURCES
 
 echo "[provision] apt-get update + install"
 chroot "\$MNT" apt-get update -qq
+# flash-kernel tries to flash the kernel to embedded ARM hardware; it fails
+# in a VM with "Unsupported platform" and blocks post-install hooks for any
+# package that pulls in initramfs-tools.  Remove it before installing anything.
+chroot "\$MNT" env DEBIAN_FRONTEND=noninteractive apt-get remove -y flash-kernel 2>/dev/null || true
 chroot "\$MNT" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     build-essential git curl wget ca-certificates \
-    iproute2 nftables openssh-server \
+    iproute2 nftables openssh-server sudo \
     systemd systemd-sysv systemd-timesyncd \
     pkg-config libssl-dev
 
@@ -308,6 +312,11 @@ ln -sf /dev/null "\$MNT/etc/systemd/system/systemd-resolved.service"
 # Static resolv.conf — plain file, not a symlink to the resolved stub.
 rm -f "\$MNT/etc/resolv.conf"
 printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > "\$MNT/etc/resolv.conf"
+
+# Load overlay at boot — required for pelagos container workloads.
+# The Ubuntu 6.8 HWE kernel ships overlay as a module (=m), not built-in,
+# so it must be explicitly loaded.  /etc/modules is read by systemd-modules-load.
+printf 'overlay\n' >> "\$MNT/etc/modules"
 
 # Disable predictable interface renaming (belt-and-suspenders alongside
 # net.ifnames=0 in the kernel cmdline).  Without this, udev renames eth0

@@ -959,7 +959,7 @@ mod tests {
     fn ring_push_overflow_overwrites_oldest() {
         let mut r = ConsoleRingBuffer::new(4);
         r.push_slice(b"abcd"); // fills buffer: [a,b,c,d]
-        r.push_slice(b"ef");   // overwrites a,b  → [e,f,c,d] with head=2
+        r.push_slice(b"ef"); // overwrites a,b  → [e,f,c,d] with head=2
         assert_eq!(r.contents(), b"cdef");
     }
 
@@ -982,7 +982,7 @@ mod tests {
     fn ring_overflow_then_more_data() {
         let mut r = ConsoleRingBuffer::new(4);
         r.push_slice(b"abcdefgh"); // only last 4 retained: efgh
-        r.push_slice(b"ij");       // overwrites e,f → ghi j
+        r.push_slice(b"ij"); // overwrites e,f → ghi j
         assert_eq!(r.contents(), b"ghij");
     }
 
