@@ -132,30 +132,35 @@ enum Commands {
     },
     /// Print container logs
     Logs {
-        /// Container name
+        /// Name of the container
+        #[arg(value_name = "CONTAINER")]
         name: String,
         /// Follow log output
         #[arg(short = 'f', long)]
         follow: bool,
     },
-    /// Print low-level JSON information about a container (delegates to `pelagos container inspect`)
+    /// Show low-level JSON details for a container
     Inspect {
-        /// Container name
+        /// Name of the container to inspect
+        #[arg(value_name = "CONTAINER")]
         name: String,
     },
     /// Restart a stopped container with its original parameters
     Start {
-        /// Container name
+        /// Name of the container to start
+        #[arg(value_name = "CONTAINER")]
         name: String,
     },
     /// Stop a running container
     Stop {
-        /// Container name
+        /// Name of the container to stop
+        #[arg(value_name = "CONTAINER")]
         name: String,
     },
     /// Remove a container
     Rm {
-        /// Container name
+        /// Name of the container to remove
+        #[arg(value_name = "CONTAINER")]
         name: String,
         /// Force remove even if running
         #[arg(short = 'f', long)]
