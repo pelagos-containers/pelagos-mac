@@ -42,7 +42,11 @@ struct Cli {
     disk: Option<PathBuf>,
 
     /// Kernel command-line arguments
-    #[arg(long, env = "PELAGOS_CMDLINE", default_value = "console=hvc0 random.trust_cpu=on")]
+    #[arg(
+        long,
+        env = "PELAGOS_CMDLINE",
+        default_value = "console=hvc0 random.trust_cpu=on"
+    )]
     cmdline: String,
 
     /// Memory in MiB (default 4096; overridden by vm.conf memory= in profile)
@@ -308,7 +312,6 @@ pub struct GuestMount {
 fn is_false(b: &bool) -> bool {
     !b
 }
-
 
 #[derive(Serialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -877,7 +880,10 @@ fn main() {
                 process::exit(1);
             }
             let stream = connect_or_exit(&profile);
-            process::exit(passthrough_command(stream, GuestCommand::Restart { name, time }));
+            process::exit(passthrough_command(
+                stream,
+                GuestCommand::Restart { name, time },
+            ));
         }
 
         Commands::Rm { ref name, force } => {
