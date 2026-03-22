@@ -49,6 +49,13 @@ DISK_IMG="$OUT/root.img"
 INITRAMFS_OUT="$OUT/initramfs-custom.gz"
 KERNEL_OUT="$OUT/vmlinuz"
 
+# Ubuntu 6.8 HWE kernel artifacts produced by build-build-image.sh.
+# When present, these replace the Alpine lts kernel and its modules.
+# CONFIG_KVM_GUEST=y in the Ubuntu kernel eliminates RCU stalls under AVF.
+# On first-time setup, run build-build-image.sh after this script to produce them.
+UBUNTU_VMLINUZ="$OUT/ubuntu-vmlinuz"
+UBUNTU_MODULES="$OUT/ubuntu-modules"
+
 PELAGOS_VERSION="0.59.0"
 PELAGOS_BIN="$WORK/pelagos-${PELAGOS_VERSION}-aarch64-linux"
 PELAGOS_URL="https://github.com/skeptomai/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-aarch64-linux"
@@ -148,6 +155,19 @@ done
 # ---------------------------------------------------------------------------
 echo "[3/8] Decompressing/staging kernel"
 # ---------------------------------------------------------------------------
+if [ ! -f "$KERNEL_OUT" ]; then
+    # Prefer the Ubuntu 6.8 HWE kernel (CONFIG_KVM_GUEST=y, no RCU stalls under AVF)
+    # when build-build-image.sh has already produced it.  Fall back to the Alpine lts
+    # kernel on first-time setup (before the Ubuntu build VM exists).
+    if [ -f "$UBUNTU_VMLINUZ" ]; then
+        cp "$UBUNTU_VMLINUZ" "$KERNEL_OUT"
+        echo "  kernel: using Ubuntu 6.8 HWE ($UBUNTU_VMLINUZ)"
+        echo "  (CONFIG_KVM_GUEST=y — no RCU stalls under AVF)"
+    else
+        echo "  Ubuntu kernel not yet available — using Alpine lts (run build-build-image.sh to upgrade)"
+    fi
+fi
+
 if [ ! -f "$KERNEL_OUT" ]; then
     RAW_VZ="$VMLINUZ_DL"
 
@@ -375,14 +395,37 @@ if [ ! -d "$MODLOOP_DIR/modules" ]; then
     unsquashfs -force -d "$MODLOOP_DIR" "$MODLOOP_DL" 2>/dev/null || true
 fi
 
-# Detect the kernel version string from the extracted module tree.
-# e.g. "6.6.71-0-lts" — baked into /init insmod paths at image build time.
-KVER=$(ls "$MODLOOP_DIR/modules/" 2>/dev/null | grep -- "-${ALPINE_FLAVOR}$" | head -1)
-if [ -z "$KVER" ]; then
-    echo "ERROR: could not detect kernel version from modloop (looked for *-${ALPINE_FLAVOR} in $MODLOOP_DIR/modules/)" >&2
-    exit 1
+# Detect which kernel version string to embed in the initramfs module tree.
+# If the Ubuntu 6.8 modules are available (produced by build-build-image.sh),
+# use their version and source vsock/overlay from there; all other virtio
+# drivers are built-in (=y) in Ubuntu 6.8 HWE and need no modules.
+# On first-time setup (before build-build-image.sh), fall back to Alpine lts.
+USE_UBUNTU_MODULES=0
+if [[ -f "$UBUNTU_VMLINUZ" && -d "$UBUNTU_MODULES" ]]; then
+    # Kernel version is stored in a kver.txt written by build-build-image.sh
+    # alongside the extracted modules (modules.dep uses relative paths, not
+    # absolute, so we cannot parse the version from it directly).
+    UBUNTU_KVER=""
+    if [[ -f "$UBUNTU_MODULES/kver.txt" ]]; then
+        UBUNTU_KVER=$(cat "$UBUNTU_MODULES/kver.txt" | tr -d '[:space:]')
+    fi
+    if [[ -n "$UBUNTU_KVER" ]]; then
+        KVER="$UBUNTU_KVER"
+        USE_UBUNTU_MODULES=1
+        echo "  kernel version: $KVER (Ubuntu 6.8 HWE — CONFIG_KVM_GUEST=y)"
+    else
+        echo "  WARNING: $UBUNTU_MODULES/kver.txt missing or empty — falling back to Alpine" >&2
+    fi
 fi
-echo "  kernel version: $KVER"
+
+if [[ "$USE_UBUNTU_MODULES" -eq 0 ]]; then
+    KVER=$(ls "$MODLOOP_DIR/modules/" 2>/dev/null | grep -- "-${ALPINE_FLAVOR}$" | head -1)
+    if [ -z "$KVER" ]; then
+        echo "ERROR: could not detect kernel version from modloop (looked for *-${ALPINE_FLAVOR} in $MODLOOP_DIR/modules/)" >&2
+        exit 1
+    fi
+    echo "  kernel version: $KVER (Alpine lts — run build-build-image.sh to upgrade to Ubuntu kernel)"
+fi
 
 if [ ! -f "$INITRAMFS_OUT" ] \
     || [ "$GUEST_BIN"   -nt "$INITRAMFS_OUT" ] \
@@ -415,124 +458,135 @@ if [ ! -f "$INITRAMFS_OUT" ] \
         [ -e "$target" ] || ln -sf busybox "$target"
     done
 
-    # Add vsock modules
-    mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/net/vmw_vsock"
-    for ko in vsock.ko vmw_vsock_virtio_transport_common.ko vmw_vsock_virtio_transport.ko; do
-        if [ -f "$VSOCK_SRC/$ko" ]; then
-            cp "$VSOCK_SRC/$ko" "$INITRD_TMP/lib/modules/$KVER/kernel/net/vmw_vsock/$ko"
+    if [[ "$USE_UBUNTU_MODULES" -eq 1 ]]; then
+        # Ubuntu 6.8 HWE: virtio_net, virtio_blk, virtio_pci, ext4, tun, virtio_console
+        # are all CONFIG_xxx=y (built-in).  Only vsock and overlayfs are =m.
+        # Stage exactly those two from the Ubuntu module tree extracted by
+        # build-build-image.sh; no Alpine modules needed.
+        mkdir -p \
+            "$INITRD_TMP/lib/modules/$KVER/kernel/net/vmw_vsock" \
+            "$INITRD_TMP/lib/modules/$KVER/kernel/fs/overlayfs"
+        for ko in vsock.ko vmw_vsock_virtio_transport_common.ko vmw_vsock_virtio_transport.ko; do
+            src="$UBUNTU_MODULES/net/vmw_vsock/$ko"
+            if [ -f "$src" ]; then
+                cp "$src" "$INITRD_TMP/lib/modules/$KVER/kernel/net/vmw_vsock/$ko"
+                echo "  staged (Ubuntu) $ko"
+            else
+                echo "  WARNING: $ko not found in $UBUNTU_MODULES" >&2
+            fi
+        done
+        if [ -f "$UBUNTU_MODULES/fs/overlayfs/overlay.ko" ]; then
+            cp "$UBUNTU_MODULES/fs/overlayfs/overlay.ko" \
+               "$INITRD_TMP/lib/modules/$KVER/kernel/fs/overlayfs/overlay.ko"
+            echo "  staged (Ubuntu) overlay.ko"
         else
-            echo "  WARNING: $ko not found in modloop — vsock may not work" >&2
+            echo "  WARNING: overlay.ko not found in $UBUNTU_MODULES" >&2
         fi
-    done
+        # Use the Ubuntu modules.dep so modprobe resolves vsock dependencies correctly.
+        cp "$UBUNTU_MODULES/modules.dep"     "$INITRD_TMP/lib/modules/$KVER/modules.dep"     2>/dev/null || true
+        cp "$UBUNTU_MODULES/modules.dep.bin" "$INITRD_TMP/lib/modules/$KVER/modules.dep.bin" 2>/dev/null || true
+        echo "  updated modules.dep from Ubuntu modules"
+    else
+        # Alpine lts fallback: all virtio drivers are modules, so we must stage them.
+        # Add vsock modules
+        mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/net/vmw_vsock"
+        for ko in vsock.ko vmw_vsock_virtio_transport_common.ko vmw_vsock_virtio_transport.ko; do
+            if [ -f "$VSOCK_SRC/$ko" ]; then
+                cp "$VSOCK_SRC/$ko" "$INITRD_TMP/lib/modules/$KVER/kernel/net/vmw_vsock/$ko"
+            else
+                echo "  WARNING: $ko not found in modloop — vsock may not work" >&2
+            fi
+        done
 
-    # Add virtio-net and virtio-rng modules.
-    # virtio-net load order: failover → net_failover → virtio_net
-    # virtio-rng load order: rng-core → virtio-rng
-    for src_path in \
-        "$NETMOD_BASE/net/core/failover.ko" \
-        "$NETMOD_BASE/drivers/net/net_failover.ko" \
-        "$NETMOD_BASE/drivers/net/virtio_net.ko" \
-        "$NETMOD_BASE/drivers/char/hw_random/rng-core.ko" \
-        "$NETMOD_BASE/drivers/char/hw_random/virtio-rng.ko"
-    do
-        dst_dir="$INITRD_TMP/lib/modules/$KVER/$(dirname "${src_path#$NETMOD_BASE/}")"
-        mkdir -p "$dst_dir"
-        if [ -f "$src_path" ]; then
-            cp "$src_path" "$dst_dir/"
+        # Add virtio-net and virtio-rng modules.
+        for src_path in \
+            "$NETMOD_BASE/net/core/failover.ko" \
+            "$NETMOD_BASE/drivers/net/net_failover.ko" \
+            "$NETMOD_BASE/drivers/net/virtio_net.ko" \
+            "$NETMOD_BASE/drivers/char/hw_random/rng-core.ko" \
+            "$NETMOD_BASE/drivers/char/hw_random/virtio-rng.ko"
+        do
+            dst_dir="$INITRD_TMP/lib/modules/$KVER/$(dirname "${src_path#$NETMOD_BASE/}")"
+            mkdir -p "$dst_dir"
+            if [ -f "$src_path" ]; then
+                cp "$src_path" "$dst_dir/"
+            else
+                echo "  WARNING: $(basename $src_path) not found in modloop" >&2
+            fi
+        done
+
+        # virtio core modules.
+        for ko in virtio_ring.ko virtio.ko; do
+            src="$NETMOD_BASE/drivers/virtio/$ko"
+            if [ -f "$src" ]; then
+                mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/virtio"
+                cp "$src" "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/virtio/$ko"
+            fi
+        done
+
+        VC_KO="$NETMOD_BASE/drivers/char/virtio_console.ko"
+        if [ -f "$VC_KO" ]; then
+            mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/char"
+            cp "$VC_KO" "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/char/virtio_console.ko"
+            echo "  staged virtio_console.ko"
+        fi
+
+        TUN_KO="$NETMOD_BASE/drivers/net/tun.ko"
+        if [ -f "$TUN_KO" ]; then
+            mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/net"
+            cp "$TUN_KO" "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/net/tun.ko"
+            echo "  staged tun.ko"
         else
-            echo "  WARNING: $(basename $src_path) not found in modloop" >&2
+            echo "  WARNING: tun.ko not found in modloop" >&2
         fi
-    done
 
-    # virtio core modules: depended upon by vsock, virtio-net, virtio-console.
-    # In linux-lts these are modules (built-in in linux-virt).  Stage from the
-    # base Alpine initramfs (which already includes them); also copy from the
-    # modloop to ensure we always have the version that matches this kernel.
-    for ko in virtio_ring.ko virtio.ko; do
-        src="$NETMOD_BASE/drivers/virtio/$ko"
-        if [ -f "$src" ]; then
-            mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/virtio"
-            cp "$src" "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/virtio/$ko"
-        fi
-    done
-    # virtio_console.ko provides /dev/hvc0 as a char device.
-    VC_KO="$NETMOD_BASE/drivers/char/virtio_console.ko"
-    if [ -f "$VC_KO" ]; then
-        mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/char"
-        cp "$VC_KO" "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/char/virtio_console.ko"
-        echo "  staged virtio_console.ko"
-    fi
-
-    # tun.ko: required by pasta (passt) to create TAP devices for pasta-mode
-    # networking in pelagos build RUN steps and pasta-mode containers.
-    TUN_KO="$NETMOD_BASE/drivers/net/tun.ko"
-    if [ -f "$TUN_KO" ]; then
-        mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/net"
-        cp "$TUN_KO" "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/net/tun.ko"
-        echo "  staged tun.ko"
-    else
-        echo "  WARNING: tun.ko not found in modloop" >&2
-    fi
-
-    # overlayfs: add overlay.ko if present as a module.
-    OVERLAY_KO="$NETMOD_BASE/fs/overlayfs/overlay.ko"
-    if [ -f "$OVERLAY_KO" ]; then
-        mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/fs/overlayfs"
-        cp "$OVERLAY_KO" "$INITRD_TMP/lib/modules/$KVER/kernel/fs/overlayfs/overlay.ko"
-        echo "  staged overlay.ko (module)"
-    else
-        echo "  overlay.ko not in modloop — assuming CONFIG_OVERLAY_FS=y (built-in)"
-    fi
-
-    # virtio_blk.ko: provides /dev/vda (the persistent OCI image cache disk).
-    # Without this, /dev/vda does not exist and the ext4 mount fails — all OCI
-    # layer data goes to the root tmpfs and fills it up during large builds.
-    VBK_KO="$NETMOD_BASE/drivers/block/virtio_blk.ko"
-    if [ -f "$VBK_KO" ]; then
-        mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/block"
-        cp "$VBK_KO" "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/block/virtio_blk.ko"
-        echo "  staged virtio_blk.ko"
-    else
-        echo "  WARNING: virtio_blk.ko not found in modloop — /dev/vda will be unavailable" >&2
-    fi
-
-    # loop.ko: needed by build-build-image.sh to losetup a sparse image file
-    # inside the Alpine VM and provision an Ubuntu rootfs via chroot.
-    LOOP_KO="$NETMOD_BASE/drivers/block/loop.ko"
-    if [ -f "$LOOP_KO" ]; then
-        mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/block"
-        cp "$LOOP_KO" "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/block/loop.ko"
-        echo "  staged loop.ko"
-    else
-        echo "  WARNING: loop.ko not found in modloop — losetup will be unavailable" >&2
-    fi
-
-    # ext4 filesystem module (+ jbd2 journal + mbcache deps): needed to mount /dev/vda.
-    # ext4 is a module in linux-lts (not built-in).  ext4 replaces ext2 because its
-    # journal makes the filesystem self-healing after unclean VM shutdowns — no more
-    # "deleted inode referenced" corruption when the daemon is killed mid-write.
-    for ko_rel in fs/mbcache.ko fs/jbd2/jbd2.ko fs/ext4/ext4.ko; do
-        src="$MODLOOP_DIR/modules/$KVER/kernel/$ko_rel"
-        dst="$INITRD_TMP/lib/modules/$KVER/kernel/$ko_rel"
-        if [ -f "$src" ]; then
-            mkdir -p "$(dirname "$dst")"
-            cp "$src" "$dst"
+        OVERLAY_KO="$NETMOD_BASE/fs/overlayfs/overlay.ko"
+        if [ -f "$OVERLAY_KO" ]; then
+            mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/fs/overlayfs"
+            cp "$OVERLAY_KO" "$INITRD_TMP/lib/modules/$KVER/kernel/fs/overlayfs/overlay.ko"
+            echo "  staged overlay.ko (module)"
         else
-            echo "  WARNING: $ko_rel not found in modloop" >&2
+            echo "  overlay.ko not in modloop — assuming CONFIG_OVERLAY_FS=y (built-in)"
         fi
-    done
-    echo "  staged ext4 + jbd2 + mbcache modules"
 
-    # Replace the Alpine initramfs's modules.dep with the one from the modloop.
-    # The Alpine initramfs modules.dep only covers its bundled subset; ours
-    # covers all linux-lts modules so modprobe can resolve full dependency chains.
-    for meta in modules.dep modules.dep.bin modules.alias modules.alias.bin \
-                modules.builtin modules.builtin.bin modules.builtin.modinfo \
-                modules.builtin.alias.bin modules.symbols.bin modules.devname; do
-        src="$MODLOOP_DIR/modules/$KVER/$meta"
-        [ -f "$src" ] && cp "$src" "$INITRD_TMP/lib/modules/$KVER/$meta"
-    done
-    echo "  updated modules.dep from modloop"
+        VBK_KO="$NETMOD_BASE/drivers/block/virtio_blk.ko"
+        if [ -f "$VBK_KO" ]; then
+            mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/block"
+            cp "$VBK_KO" "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/block/virtio_blk.ko"
+            echo "  staged virtio_blk.ko"
+        else
+            echo "  WARNING: virtio_blk.ko not found in modloop — /dev/vda will be unavailable" >&2
+        fi
+
+        LOOP_KO="$NETMOD_BASE/drivers/block/loop.ko"
+        if [ -f "$LOOP_KO" ]; then
+            mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/block"
+            cp "$LOOP_KO" "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/block/loop.ko"
+            echo "  staged loop.ko"
+        else
+            echo "  WARNING: loop.ko not found in modloop — losetup will be unavailable" >&2
+        fi
+
+        for ko_rel in fs/mbcache.ko fs/jbd2/jbd2.ko fs/ext4/ext4.ko; do
+            src="$MODLOOP_DIR/modules/$KVER/kernel/$ko_rel"
+            dst="$INITRD_TMP/lib/modules/$KVER/kernel/$ko_rel"
+            if [ -f "$src" ]; then
+                mkdir -p "$(dirname "$dst")"
+                cp "$src" "$dst"
+            else
+                echo "  WARNING: $ko_rel not found in modloop" >&2
+            fi
+        done
+        echo "  staged ext4 + jbd2 + mbcache modules"
+
+        for meta in modules.dep modules.dep.bin modules.alias modules.alias.bin \
+                    modules.builtin modules.builtin.bin modules.builtin.modinfo \
+                    modules.builtin.alias.bin modules.symbols.bin modules.devname; do
+            src="$MODLOOP_DIR/modules/$KVER/$meta"
+            [ -f "$src" ] && cp "$src" "$INITRD_TMP/lib/modules/$KVER/$meta"
+        done
+        echo "  updated modules.dep from modloop"
+    fi
 
     mkdir -p "$INITRD_TMP/proc" "$INITRD_TMP/sys" "$INITRD_TMP/dev"
 

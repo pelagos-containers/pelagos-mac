@@ -284,18 +284,22 @@ mkdir -p "\$MNT/etc/systemd/system/multi-user.target.wants"
 ln -sf /lib/systemd/system/ssh.service \
     "\$MNT/etc/systemd/system/multi-user.target.wants/ssh.service" 2>/dev/null || true
 
-# Mask serial-getty@hvc0 — without this, systemd waits ~8 minutes for
-# /dev/hvc0 to appear (virtio_console is loaded but udev times out),
-# blocking the entire boot including network configuration.
-ln -sf /dev/null "\$MNT/etc/systemd/system/serial-getty@hvc0.service"
+# Enable systemd-networkd — configures eth0 with the static IP at boot.
+# With the Ubuntu kernel, no initramfs pre-configures eth0; networkd is
+# responsible for bringing the interface up.
+ln -sf /lib/systemd/system/systemd-networkd.service \
+    "\$MNT/etc/systemd/system/multi-user.target.wants/systemd-networkd.service" 2>/dev/null || true
 
-# Mask systemd-networkd — the initramfs already configured eth0 with the
-# static IP (192.168.105.2/24) and default route before switch_root.
-# networkd starting at ~t=60s disrupts the interface briefly (re-applies
-# addresses, triggers ARP DAD, etc.), causing smoltcp's SYN packets to be
-# dropped silently for 40+ seconds per attempt.  The IP is stable without
-# networkd; there is no DHCP in this environment.
-ln -sf /dev/null "\$MNT/etc/systemd/system/systemd-networkd.service"
+# Enable serial-getty on hvc0 with root auto-login.
+# With the Ubuntu kernel, /dev/hvc0 is available at boot (virtio_console
+# is built in), so the getty starts cleanly.  Auto-login gives interactive
+# emergency access without a password — this is a single-user build VM.
+mkdir -p "\$MNT/etc/systemd/system/serial-getty@hvc0.service.d"
+cat > "\$MNT/etc/systemd/system/serial-getty@hvc0.service.d/autologin.conf" << 'AUTOLOGIN_CONF'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear %I \$TERM
+AUTOLOGIN_CONF
 
 # Mask systemd-resolved — without it, /etc/resolv.conf would be a dead
 # symlink pointing to resolved's stub socket, breaking all DNS lookups.
@@ -307,8 +311,7 @@ printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > "\$MNT/etc/resolv.conf"
 
 # Disable predictable interface renaming (belt-and-suspenders alongside
 # net.ifnames=0 in the kernel cmdline).  Without this, udev renames eth0
-# to enp0sN, bringing it down in the process and dropping the IP that the
-# initramfs configured before switch_root.
+# to enp0sN, bringing it down while networkd is trying to configure it.
 mkdir -p "\$MNT/etc/udev/rules.d"
 ln -sf /dev/null "\$MNT/etc/udev/rules.d/80-net-setup-link.rules"
 
@@ -348,6 +351,51 @@ chroot "\$MNT" git config --global http.sslCAInfo /etc/ssl/certs/ca-certificates
 # certificate verification failures for git and cargo.
 ln -sf /lib/systemd/system/systemd-timesyncd.service \
     "\$MNT/etc/systemd/system/multi-user.target.wants/systemd-timesyncd.service" 2>/dev/null || true
+
+# ---- Extract Ubuntu kernel and initrd for AVF boot ----
+#
+# AVF VZLinuxBootLoader requires a raw arm64 EFI-stub Image (MZ + ARMd at
+# offset 0x38), not the gzip-wrapped vmlinuz Ubuntu ships.  Decompress with
+# zcat here inside the Alpine VM, then copy initrd as-is (Ubuntu's 6.8 kernel
+# handles zstd initrds natively).  Both files land on the virtiofs share so
+# the outer script can move them to out/ on the macOS host.
+
+echo "[provision] extracting Ubuntu kernel, initrd, and modules for host AVF boot"
+KVER=\$(ls "\$MNT/boot/vmlinuz-"* 2>/dev/null | sort -V | tail -1 | sed 's|.*/vmlinuz-||')
+if [ -n "\$KVER" ]; then
+    zcat "\$MNT/boot/vmlinuz-\$KVER" > /var/lib/pelagos/volumes/ubuntu-vmlinuz
+    cp "\$MNT/boot/initrd.img-\$KVER" /var/lib/pelagos/volumes/ubuntu-initrd.img
+    echo "  kernel: vmlinuz-\$KVER (\$(du -sh /var/lib/pelagos/volumes/ubuntu-vmlinuz | cut -f1) decompressed)"
+    echo "  initrd: initrd.img-\$KVER (\$(du -sh /var/lib/pelagos/volumes/ubuntu-initrd.img | cut -f1))"
+
+    # Extract the two kernel modules that are =m in Ubuntu 6.8 HWE and are
+    # required by the container VM initramfs: vsock (pelagos-guest comms) and
+    # overlayfs (container layer stacking).  All other virtio drivers are =y
+    # (built-in) so no modules are needed for them.
+    MODDIR="\$MNT/lib/modules/\$KVER/kernel"
+    VOLS=/var/lib/pelagos/volumes
+    mkdir -p "\$VOLS/ubuntu-modules/net/vmw_vsock" "\$VOLS/ubuntu-modules/fs/overlayfs"
+    for ko in \
+        "\$MODDIR/net/vmw_vsock/vsock.ko" \
+        "\$MODDIR/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko" \
+        "\$MODDIR/net/vmw_vsock/vmw_vsock_virtio_transport.ko"
+    do
+        [ -f "\$ko" ] && cp "\$ko" "\$VOLS/ubuntu-modules/net/vmw_vsock/" \
+            && echo "  module: \$(basename \$ko)"
+    done
+    [ -f "\$MODDIR/fs/overlayfs/overlay.ko" ] \
+        && cp "\$MODDIR/fs/overlayfs/overlay.ko" "\$VOLS/ubuntu-modules/fs/overlayfs/" \
+        && echo "  module: overlay.ko"
+    # Also copy modules.dep so modprobe can resolve the vsock dependency chain.
+    cp "\$MNT/lib/modules/\$KVER/modules.dep" "\$VOLS/ubuntu-modules/" 2>/dev/null || true
+    cp "\$MNT/lib/modules/\$KVER/modules.dep.bin" "\$VOLS/ubuntu-modules/" 2>/dev/null || true
+    # Write kver.txt so build-vm-image.sh can detect the kernel version without
+    # parsing modules.dep (which uses relative paths, not absolute paths).
+    echo "\$KVER" > "\$VOLS/ubuntu-modules/kver.txt"
+    echo "  stored Ubuntu modules in volumes/ubuntu-modules/ (kver: \$KVER)"
+else
+    echo "WARNING: no vmlinuz found in \$MNT/boot — cannot extract kernel" >&2
+fi
 
 # ---- cleanup ----
 
@@ -409,21 +457,49 @@ echo ""
 # Write vm.conf for the build profile.
 # ---------------------------------------------------------------------------
 
+# Move the Ubuntu kernel and initrd from the Alpine volumes dir to out/.
+# These were extracted from the provisioned build.img by the provisioning
+# script and staged on the virtiofs share.
+UBUNTU_VMLINUZ="$REPO_ROOT/out/ubuntu-vmlinuz"
+UBUNTU_INITRD="$REPO_ROOT/out/ubuntu-initrd.img"
+if [[ -f "$ALPINE_VOLUMES_DIR/ubuntu-vmlinuz" ]]; then
+    mv "$ALPINE_VOLUMES_DIR/ubuntu-vmlinuz"   "$UBUNTU_VMLINUZ"
+    mv "$ALPINE_VOLUMES_DIR/ubuntu-initrd.img" "$UBUNTU_INITRD"
+    echo "--- extracted Ubuntu kernel to out/ubuntu-vmlinuz ($(du -sh "$UBUNTU_VMLINUZ" | cut -f1)) ---"
+    echo "--- extracted Ubuntu initrd  to out/ubuntu-initrd.img ($(du -sh "$UBUNTU_INITRD" | cut -f1)) ---"
+    # Move kernel modules needed by the container VM initramfs.
+    UBUNTU_MODULES_SRC="$ALPINE_VOLUMES_DIR/ubuntu-modules"
+    UBUNTU_MODULES_DST="$REPO_ROOT/out/ubuntu-modules"
+    if [[ -d "$UBUNTU_MODULES_SRC" ]]; then
+        rm -rf "$UBUNTU_MODULES_DST"
+        mv "$UBUNTU_MODULES_SRC" "$UBUNTU_MODULES_DST"
+        echo "--- extracted Ubuntu kernel modules to out/ubuntu-modules/ ---"
+    fi
+else
+    echo "ERROR: ubuntu-vmlinuz not found in Alpine volumes dir — kernel extraction failed" >&2
+    exit 1
+fi
+echo ""
+
 echo "--- writing vm.conf for profile '$PROFILE' ---"
 mkdir -p "$PROFILE_STATE_DIR"
 cat > "$PROFILE_STATE_DIR/vm.conf" << VMCONF_EOF
 # vm.conf — auto-written by build-build-image.sh
 # Profile: $PROFILE
 disk      = $BUILD_IMG
-kernel    = $KERNEL
-initrd    = $INITRD
+kernel    = $UBUNTU_VMLINUZ
+initrd    = $UBUNTU_INITRD
 memory    = $MEMORY_MIB
 cpus      = $CPUS
 ping_mode = ssh
 # net.ifnames=0: prevent udev from renaming eth0 → enp0sN.
 # Without this, udev brings eth0 down to rename it, dropping the IP configured
 # by the initramfs before switch_root, leaving smoltcp unable to ARP the VM.
-cmdline   = console=hvc0 net.ifnames=0 nohz=off cpuidle.off=1
+# cpuidle.off=1: disable cpuidle-psci deep idle states. Ubuntu 6.8 HWE uses
+# PSCI CPU_SUSPEND for deep idle; AVF does not reliably deliver hrtimers to
+# vCPUs parked in PSCI idle, causing rcu_preempt kthread timer stalls.
+# nohz=off alone did not help — tick delivery is fine, hrtimer delivery is not.
+cmdline   = console=hvc0 net.ifnames=0 cpuidle.off=1 root=LABEL=ubuntu-build rw
 VMCONF_EOF
 
 echo "  $PROFILE_STATE_DIR/vm.conf"

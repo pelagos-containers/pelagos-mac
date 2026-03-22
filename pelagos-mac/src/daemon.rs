@@ -567,23 +567,167 @@ pub(crate) fn mounts_match(a: &[VirtiofsShare], b: &[VirtiofsShare]) -> bool {
 // Serial console relay
 // ---------------------------------------------------------------------------
 
+/// Fixed-capacity circular buffer that retains recent console output so that
+/// late-connecting clients can replay what they missed.  Lives entirely in the
+/// `console_relay_loop` thread; no synchronisation needed.
+struct ConsoleRingBuffer {
+    buf: Vec<u8>,
+    /// Index of the oldest byte.
+    head: usize,
+    /// Number of valid bytes currently stored (0 ..= buf.len()).
+    len: usize,
+}
+
+impl ConsoleRingBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            buf: vec![0u8; capacity],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    /// Append `data` to the ring, overwriting the oldest bytes when full.
+    fn push_slice(&mut self, data: &[u8]) {
+        let cap = self.buf.len();
+        // If data exceeds capacity, only the last `cap` bytes matter.
+        let data = if data.len() > cap {
+            &data[data.len() - cap..]
+        } else {
+            data
+        };
+        for &b in data {
+            let tail = (self.head + self.len) % cap;
+            self.buf[tail] = b;
+            if self.len < cap {
+                self.len += 1;
+            } else {
+                // Overwrite oldest — advance head.
+                self.head = (self.head + 1) % cap;
+            }
+        }
+    }
+
+    /// Copy all buffered bytes to `fd` in chronological order.
+    /// Write errors are logged and silently ignored — a client that disappears
+    /// mid-replay is not a fatal condition.
+    fn replay_to_fd(&self, fd: RawFd) {
+        if self.len == 0 {
+            return;
+        }
+        let cap = self.buf.len();
+        // The ring may wrap: first segment is head..min(head+len, cap),
+        // second segment (if wrapped) is 0..remainder.
+        let first_end = self.head + self.len;
+        if first_end <= cap {
+            // Contiguous — one write.
+            unsafe {
+                libc::write(
+                    fd,
+                    self.buf[self.head..first_end].as_ptr() as *const libc::c_void,
+                    self.len,
+                )
+            };
+        } else {
+            // Wrapped — two writes.
+            let first_len = cap - self.head;
+            let second_len = self.len - first_len;
+            unsafe {
+                libc::write(
+                    fd,
+                    self.buf[self.head..].as_ptr() as *const libc::c_void,
+                    first_len,
+                );
+                libc::write(
+                    fd,
+                    self.buf[..second_len].as_ptr() as *const libc::c_void,
+                    second_len,
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn contents(&self) -> Vec<u8> {
+        let cap = self.buf.len();
+        let mut out = Vec::with_capacity(self.len);
+        for i in 0..self.len {
+            out.push(self.buf[(self.head + i) % cap]);
+        }
+        out
+    }
+}
+
 /// Accept console clients forever.  Each client gets the serial port for its
 /// session; when it disconnects we wait for the next one.  The serial port
 /// socketpair end (`relay_fd`) is kept alive for the process lifetime.
+///
+/// IMPORTANT: when no client is connected we must continuously drain console
+/// output from `relay_fd`.  If nobody reads, the socketpair buffer fills up
+/// (~128 KB on macOS), AVF's virtio-console backend stalls, and the guest
+/// kernel's hvc_write() path blocks while holding spinlocks in the printk
+/// path.  That prevents CPUs from passing through RCU quiescent states,
+/// causing rcu_preempt stalls at every boot.
+///
+/// Rather than discarding drained bytes we store them in a ring buffer so
+/// late-connecting clients can replay everything they missed.
 fn console_relay_loop(listener: UnixListener, relay_fd: OwnedFd) {
     let raw = relay_fd.into_raw_fd();
+    let listener_fd = listener.as_raw_fd();
+    let mut ring = ConsoleRingBuffer::new(256 * 1024);
+    let mut drain_buf = vec![0u8; 4096];
     loop {
-        let client = match listener.accept() {
-            Ok((stream, _)) => stream,
-            Err(e) => {
-                log::warn!("console accept: {}", e);
+        // Poll for either a new console client OR data to drain from the VM.
+        let mut pfds = [
+            libc::pollfd {
+                fd: listener_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: raw,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let n = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-        };
-        log::info!("console client connected");
-        proxy_console(client, raw);
-        log::info!("console client disconnected");
-        // Loop back to accept the next client; raw stays open.
+            log::warn!("console poll: {}", err);
+            break;
+        }
+
+        // New console client connecting — replay buffered output then proxy live.
+        if pfds[0].revents & libc::POLLIN != 0 {
+            match listener.accept() {
+                Ok((client, _)) => {
+                    log::info!("console client connected");
+                    ring.replay_to_fd(client.as_raw_fd());
+                    proxy_console(client, raw);
+                    log::info!("console client disconnected");
+                }
+                Err(e) => log::warn!("console accept: {}", e),
+            }
+            continue;
+        }
+
+        // Console output from VM with no client attached — drain into ring to
+        // prevent the guest's hvc write path from blocking.
+        if pfds[1].revents & libc::POLLIN != 0 {
+            let n = unsafe {
+                libc::read(
+                    raw,
+                    drain_buf.as_mut_ptr() as *mut libc::c_void,
+                    drain_buf.len(),
+                )
+            };
+            if n > 0 {
+                ring.push_slice(&drain_buf[..n as usize]);
+            }
+        }
     }
 }
 
@@ -784,6 +928,104 @@ mod tests {
         assert!(parse_port_spec("notaport").is_none());
         assert!(parse_port_spec("abc:def").is_none());
         assert!(parse_port_spec("99999:80").is_none()); // u16 overflow
+    }
+
+    // -----------------------------------------------------------------------
+    // ConsoleRingBuffer
+    // -----------------------------------------------------------------------
+    use super::ConsoleRingBuffer;
+
+    #[test]
+    fn ring_empty_contents() {
+        let r = ConsoleRingBuffer::new(8);
+        assert_eq!(r.contents(), b"");
+    }
+
+    #[test]
+    fn ring_push_less_than_capacity() {
+        let mut r = ConsoleRingBuffer::new(8);
+        r.push_slice(b"hello");
+        assert_eq!(r.contents(), b"hello");
+    }
+
+    #[test]
+    fn ring_push_exactly_capacity() {
+        let mut r = ConsoleRingBuffer::new(5);
+        r.push_slice(b"hello");
+        assert_eq!(r.contents(), b"hello");
+    }
+
+    #[test]
+    fn ring_push_overflow_overwrites_oldest() {
+        let mut r = ConsoleRingBuffer::new(4);
+        r.push_slice(b"abcd"); // fills buffer: [a,b,c,d]
+        r.push_slice(b"ef");   // overwrites a,b  → [e,f,c,d] with head=2
+        assert_eq!(r.contents(), b"cdef");
+    }
+
+    #[test]
+    fn ring_multiple_pushes_in_order() {
+        let mut r = ConsoleRingBuffer::new(8);
+        r.push_slice(b"abc");
+        r.push_slice(b"def");
+        assert_eq!(r.contents(), b"abcdef");
+    }
+
+    #[test]
+    fn ring_large_push_keeps_last_cap_bytes() {
+        let mut r = ConsoleRingBuffer::new(4);
+        r.push_slice(b"123456789"); // only last 4 bytes retained
+        assert_eq!(r.contents(), b"6789");
+    }
+
+    #[test]
+    fn ring_overflow_then_more_data() {
+        let mut r = ConsoleRingBuffer::new(4);
+        r.push_slice(b"abcdefgh"); // only last 4 retained: efgh
+        r.push_slice(b"ij");       // overwrites e,f → ghi j
+        assert_eq!(r.contents(), b"ghij");
+    }
+
+    #[test]
+    fn ring_replay_to_fd_matches_contents() {
+        let mut r = ConsoleRingBuffer::new(8);
+        r.push_slice(b"boot!");
+
+        // socketpair: write end for replay, read end to verify
+        let mut fds = [-1i32; 2];
+        unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        r.replay_to_fd(write_fd);
+        unsafe { libc::close(write_fd) };
+
+        let mut out = vec![0u8; 16];
+        let n = unsafe { libc::read(read_fd, out.as_mut_ptr() as *mut libc::c_void, out.len()) };
+        unsafe { libc::close(read_fd) };
+
+        assert!(n > 0);
+        assert_eq!(&out[..n as usize], b"boot!");
+    }
+
+    #[test]
+    fn ring_replay_wrapped_to_fd() {
+        // Force a wrap: capacity=4, push "abcdef" → ring holds "cdef" (wrapped)
+        let mut r = ConsoleRingBuffer::new(4);
+        r.push_slice(b"abcdef"); // last 4: cdef; head=2, buf=[e,f,c,d]
+
+        let mut fds = [-1i32; 2];
+        unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        r.replay_to_fd(write_fd);
+        unsafe { libc::close(write_fd) };
+
+        let mut out = vec![0u8; 16];
+        let n = unsafe { libc::read(read_fd, out.as_mut_ptr() as *mut libc::c_void, out.len()) };
+        unsafe { libc::close(read_fd) };
+
+        assert!(n > 0);
+        assert_eq!(&out[..n as usize], b"cdef");
     }
 
     fn base_args() -> DaemonArgs {
