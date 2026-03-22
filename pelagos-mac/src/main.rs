@@ -200,6 +200,11 @@ enum Commands {
     Ping,
     /// Print version information for pelagos-mac and (if the VM is running) pelagos-guest
     Version,
+    /// Subscribe to container lifecycle events (NDJSON stream on stdout).
+    ///
+    /// Sends an initial snapshot then streams ContainerStarted / ContainerExited
+    /// events until disconnected.  Intended for the TUI and other tooling.
+    Subscribe,
     /// Build an OCI image from a Dockerfile (Remfile) inside the VM
     Build {
         /// Image tag (e.g. myapp:latest)
@@ -398,6 +403,7 @@ enum GuestCommand {
     },
     Ping,
     Version,
+    Subscribe,
     Build {
         tag: String,
         dockerfile: String,
@@ -786,6 +792,20 @@ fn main() {
                 },
                 tty,
             ));
+        }
+
+        Commands::Subscribe => {
+            // Subscribe does not start the daemon — if the VM is not running
+            // there are no containers to report.  Just exit cleanly.
+            let alive = state::StateDir::open_profile(&profile)
+                .map(|s| s.is_daemon_alive())
+                .unwrap_or(false);
+            if !alive {
+                log::warn!("subscribe: VM daemon not running");
+                process::exit(0);
+            }
+            let stream = connect_or_exit(&profile);
+            subscribe_command(stream);
         }
 
         Commands::Ping => {
@@ -2003,6 +2023,36 @@ fn ping_command(stream: UnixStream) -> i32 {
         other => {
             log::error!("unexpected ping response: {:?}", other);
             1
+        }
+    }
+}
+
+/// Subscribe to container lifecycle events; stream NDJSON to stdout until
+/// the guest disconnects or the process is killed.
+fn subscribe_command(stream: UnixStream) {
+    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+    let mut writer = stream;
+
+    // Send Subscribe command.
+    let mut msg = serde_json::to_string(&GuestCommand::Subscribe).unwrap();
+    msg.push('\n');
+    if let Err(e) = writer.write_all(msg.as_bytes()) {
+        log::error!("subscribe: write error: {}", e);
+        return;
+    }
+
+    // Forward every NDJSON line from the guest to our stdout verbatim.
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                print!("{}", line);
+                if std::io::stdout().flush().is_err() {
+                    break;
+                }
+            }
         }
     }
 }

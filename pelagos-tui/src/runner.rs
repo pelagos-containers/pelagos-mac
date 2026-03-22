@@ -35,6 +35,8 @@ pub struct Container {
 // Runner trait
 // ---------------------------------------------------------------------------
 
+// ps and vm_status will be used by LinuxRunner (M5); kept here for the trait contract.
+#[allow(dead_code)]
 pub trait Runner {
     /// List containers.  `all` maps to `--all` flag.
     fn ps(&self, all: bool) -> anyhow::Result<Vec<Container>>;
@@ -49,6 +51,7 @@ pub trait Runner {
 // ---------------------------------------------------------------------------
 
 pub struct MacOsRunner {
+    #[allow(dead_code)]
     pub profile: String,
 }
 
