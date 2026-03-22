@@ -13,6 +13,8 @@ use crate::runner::{Container, Runner};
 pub enum Mode {
     Normal,
     ProfilePicker,
+    /// Command palette: modeline becomes a `run> <input>` text field.
+    CommandPalette,
 }
 
 // ---------------------------------------------------------------------------
@@ -40,6 +42,10 @@ pub struct App {
     pub profile_picker_selected: usize,
     /// Set to true to break the event loop.
     pub should_quit: bool,
+    /// Text being typed in the command palette.
+    pub palette_input: String,
+    /// Set by the palette on Enter; main.rs drains this to execute the run.
+    pub pending_run: Option<String>,
 }
 
 impl App {
@@ -59,6 +65,8 @@ impl App {
             refresh_interval: Duration::from_secs(2),
             profile_picker_selected: picker_idx,
             should_quit: false,
+            palette_input: String::new(),
+            pending_run: None,
         }
     }
 
@@ -96,6 +104,7 @@ impl App {
         match self.mode {
             Mode::Normal => self.on_key_normal(key, runner),
             Mode::ProfilePicker => self.on_key_profile_picker(key, runner),
+            Mode::CommandPalette => self.on_key_palette(key),
         }
     }
 
@@ -136,6 +145,12 @@ impl App {
                 self.mode = Mode::ProfilePicker;
             }
 
+            // Open command palette
+            KeyCode::Char('r') => {
+                self.palette_input.clear();
+                self.mode = Mode::CommandPalette;
+            }
+
             _ => {}
         }
     }
@@ -166,6 +181,36 @@ impl App {
             // Cancel
             KeyCode::Esc | KeyCode::Char('p') => {
                 self.mode = Mode::Normal;
+            }
+
+            _ => {}
+        }
+    }
+
+    fn on_key_palette(&mut self, key: KeyEvent) {
+        match key.code {
+            // Cancel
+            KeyCode::Esc => {
+                self.palette_input.clear();
+                self.mode = Mode::Normal;
+            }
+
+            // Execute: hand off to main.rs via pending_run
+            KeyCode::Enter => {
+                let input = self.palette_input.trim().to_string();
+                if !input.is_empty() {
+                    self.pending_run = Some(input);
+                }
+                self.palette_input.clear();
+                self.mode = Mode::Normal;
+            }
+
+            // Edit input
+            KeyCode::Backspace => {
+                self.palette_input.pop();
+            }
+            KeyCode::Char(c) => {
+                self.palette_input.push(c);
             }
 
             _ => {}
