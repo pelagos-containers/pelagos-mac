@@ -406,20 +406,45 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                             .output();
                         match out {
                             Ok(o) if o.status.success() => {
-                                writeln!(writer, "{}", name)?;
+                                send_response(
+                                    &mut writer,
+                                    &GuestResponse::Stream {
+                                        stream: StreamKind::Stdout,
+                                        data: format!("{}\n", name),
+                                    },
+                                )?;
                                 removed += 1;
                             }
                             Ok(o) => {
                                 let msg = String::from_utf8_lossy(&o.stderr);
-                                writeln!(writer, "error removing {}: {}", name, msg.trim())?;
+                                send_response(
+                                    &mut writer,
+                                    &GuestResponse::Stream {
+                                        stream: StreamKind::Stderr,
+                                        data: format!("error removing {}: {}\n", name, msg.trim()),
+                                    },
+                                )?;
                             }
                             Err(e) => {
-                                writeln!(writer, "error removing {}: {}", name, e)?;
+                                send_response(
+                                    &mut writer,
+                                    &GuestResponse::Stream {
+                                        stream: StreamKind::Stderr,
+                                        data: format!("error removing {}: {}\n", name, e),
+                                    },
+                                )?;
                             }
                         }
                     }
                 }
-                writeln!(writer, "{} container(s) removed", removed)?;
+                send_response(
+                    &mut writer,
+                    &GuestResponse::Stream {
+                        stream: StreamKind::Stdout,
+                        data: format!("{} container(s) removed\n", removed),
+                    },
+                )?;
+                send_response(&mut writer, &GuestResponse::Exit { exit: 0 })?;
             }
             GuestCommand::Start { name } => {
                 let mut cmd = Command::new(pelagos_bin());
