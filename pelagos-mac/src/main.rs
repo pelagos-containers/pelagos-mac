@@ -245,6 +245,8 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum VmCommands {
+    /// Start the persistent VM daemon (no-op if already running)
+    Start,
     /// Stop the persistent VM daemon
     Stop,
     /// Show persistent VM daemon status
@@ -449,6 +451,16 @@ fn main() {
             daemon::run(args); // -> !
         }
 
+        Commands::Vm {
+            sub: VmCommands::Start,
+        } => {
+            let daemon_args = daemon_args_from_cli(&cli);
+            if let Err(e) = daemon::ensure_running(&daemon_args) {
+                log::error!("failed to start VM daemon: {}", e);
+                process::exit(1);
+            }
+            println!("running");
+        }
         Commands::Vm {
             sub: VmCommands::Stop,
         } => vm_stop(&profile),
