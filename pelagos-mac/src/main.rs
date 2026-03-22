@@ -131,6 +131,9 @@ enum Commands {
         /// Show all containers, including exited
         #[arg(short = 'a', long)]
         all: bool,
+        /// Output as JSON array (one object per container)
+        #[arg(long)]
+        json: bool,
     },
     /// Print container logs
     Logs {
@@ -355,6 +358,8 @@ enum GuestCommand {
     Ps {
         #[serde(skip_serializing_if = "is_false")]
         all: bool,
+        #[serde(skip_serializing_if = "is_false")]
+        json: bool,
     },
     Logs {
         name: String,
@@ -774,7 +779,7 @@ fn main() {
             process::exit(ping_command(stream));
         }
 
-        Commands::Ps { all } => {
+        Commands::Ps { all, json } => {
             // `ps` must not start the daemon: if no daemon is running, there are
             // no containers.  If the daemon is alive (possibly with different
             // mounts), just connect and ask.  This allows `docker ps` (called by
@@ -792,7 +797,7 @@ fn main() {
                 process::exit(0);
             }
             let stream = connect_or_exit(&profile);
-            process::exit(passthrough_command(stream, GuestCommand::Ps { all }));
+            process::exit(passthrough_command(stream, GuestCommand::Ps { all, json }));
         }
 
         Commands::Logs { ref name, follow } => {
@@ -2548,7 +2553,10 @@ mod tests {
 
     #[test]
     fn ps_command_serializes() {
-        let cmd = GuestCommand::Ps { all: true };
+        let cmd = GuestCommand::Ps {
+            all: true,
+            json: false,
+        };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["cmd"], "ps");

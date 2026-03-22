@@ -124,6 +124,9 @@ pub enum GuestCommand {
     Ps {
         #[serde(default)]
         all: bool,
+        /// Request JSON output; maps to `pelagos ps --format json`.
+        #[serde(default)]
+        json: bool,
     },
     /// Print container logs; maps to `pelagos logs [--follow] <name>`.
     Logs {
@@ -375,12 +378,15 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 handle_exec_into(fd, &container, &args, &env, tty, workdir.as_deref())?;
                 return Ok(());
             }
-            GuestCommand::Ps { all } => {
-                log::debug!("ps all={}", all);
+            GuestCommand::Ps { all, json } => {
+                log::debug!("ps all={} json={}", all, json);
                 let mut cmd = Command::new(pelagos_bin());
                 cmd.arg("ps");
                 if all {
                     cmd.arg("--all");
+                }
+                if json {
+                    cmd.arg("--format").arg("json");
                 }
                 spawn_and_stream(&mut writer, cmd)?;
             }
@@ -496,7 +502,10 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
             }
             GuestCommand::Restart { name, time } => {
                 let mut cmd = Command::new(pelagos_bin());
-                cmd.arg("restart").arg("--time").arg(time.to_string()).arg(&name);
+                cmd.arg("restart")
+                    .arg("--time")
+                    .arg(time.to_string())
+                    .arg(&name);
                 spawn_and_stream(&mut writer, cmd)?;
             }
             GuestCommand::Rm { name, force } => {
@@ -1486,12 +1495,7 @@ fn handle_exec_into(
     tty: bool,
     workdir: Option<&str>,
 ) -> std::io::Result<()> {
-    log::info!(
-        "exec: container={} tty={} args={:?}",
-        container,
-        tty,
-        args
-    );
+    log::info!("exec: container={} tty={} args={:?}", container, tty, args);
     if args.is_empty() {
         let mut w = FdWriter(fd);
         let _ = send_response(
@@ -2143,14 +2147,39 @@ mod tests {
     fn ps_deserializes() {
         let json = r#"{"cmd":"ps","all":true}"#;
         let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
-        assert!(matches!(cmd, GuestCommand::Ps { all: true }));
+        assert!(matches!(
+            cmd,
+            GuestCommand::Ps {
+                all: true,
+                json: false
+            }
+        ));
     }
 
     #[test]
     fn ps_defaults_all_false() {
         let json = r#"{"cmd":"ps"}"#;
         let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
-        assert!(matches!(cmd, GuestCommand::Ps { all: false }));
+        assert!(matches!(
+            cmd,
+            GuestCommand::Ps {
+                all: false,
+                json: false
+            }
+        ));
+    }
+
+    #[test]
+    fn ps_json_flag_deserializes() {
+        let wire = r#"{"cmd":"ps","all":true,"json":true}"#;
+        let cmd: GuestCommand = serde_json::from_str(wire).expect("parse failed");
+        assert!(matches!(
+            cmd,
+            GuestCommand::Ps {
+                all: true,
+                json: true
+            }
+        ));
     }
 
     #[test]
