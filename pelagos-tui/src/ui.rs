@@ -10,6 +10,9 @@ use ratatui::{
 
 use crate::app::{App, Mode};
 
+// Cursor indicator appended to the palette input line.
+const CURSOR: &str = "▏";
+
 // ---------------------------------------------------------------------------
 // Top-level render entry point
 // ---------------------------------------------------------------------------
@@ -28,7 +31,7 @@ pub fn render(f: &mut Frame, app: &App) {
         .split(area);
 
     render_table(f, app, chunks[0]);
-    render_hint_bar(f, chunks[1]);
+    render_hint_bar(f, app, chunks[1]);
     render_modeline(f, app, chunks[2]);
 
     if app.mode == Mode::ProfilePicker {
@@ -126,9 +129,12 @@ fn render_table(f: &mut Frame, app: &App, area: Rect) {
 // Hint bar
 // ---------------------------------------------------------------------------
 
-fn render_hint_bar(f: &mut Frame, area: Rect) {
-    let hints = Paragraph::new("  [q]quit  [a]all  [j/k]nav  [p]profile  [?]help (M2)")
-        .style(Style::default().fg(Color::DarkGray));
+fn render_hint_bar(f: &mut Frame, app: &App, area: Rect) {
+    let text = match app.mode {
+        Mode::CommandPalette => "  [Enter]run  [Esc]cancel",
+        _ => "  [q]quit  [a]all  [j/k]nav  [p]profile  [r]run  [?]help",
+    };
+    let hints = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     f.render_widget(hints, area);
 }
 
@@ -137,6 +143,19 @@ fn render_hint_bar(f: &mut Frame, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn render_modeline(f: &mut Frame, app: &App, area: Rect) {
+    // In command palette mode the modeline becomes an input field.
+    if app.mode == Mode::CommandPalette {
+        let spans = vec![
+            Span::styled("  run> ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(app.palette_input.as_str(), Style::default().fg(Color::White)),
+            Span::styled(CURSOR, Style::default().fg(Color::Yellow)),
+        ];
+        let modeline = Paragraph::new(Line::from(spans))
+            .style(Style::default().bg(Color::Black).fg(Color::White));
+        f.render_widget(modeline, area);
+        return;
+    }
+
     let vm_text = if app.vm_running { "running" } else { "stopped" };
     let vm_color = if app.vm_running {
         Color::Cyan

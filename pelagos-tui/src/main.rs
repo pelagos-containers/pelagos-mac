@@ -104,10 +104,62 @@ fn run_loop(
             }
         }
 
+        // Command palette: execute pending run command.
+        if let Some(input) = app.pending_run.take() {
+            execute_run(terminal, app, &runner, &input)?;
+        }
+
         if app.should_quit {
             break;
         }
     }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Run command execution (suspends TUI, inherits stdio, then resumes)
+// ---------------------------------------------------------------------------
+
+/// Suspend the TUI, run `pelagos --profile <p> run <args>` with inherited
+/// stdio so the user sees any output, then re-enter the TUI and refresh.
+fn execute_run(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    runner: &impl Runner,
+    input: &str,
+) -> anyhow::Result<()> {
+    // Suspend TUI — restore a normal terminal for the subprocess.
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    // Parse the user's input into image + extra args.
+    // Input is everything after "run> ", e.g. "nginx:alpine --name web".
+    let args: Vec<&str> = input.split_whitespace().collect();
+
+    log::info!("palette run: profile={} args={:?}", app.profile, args);
+
+    let status = std::process::Command::new("pelagos")
+        .arg("--profile")
+        .arg(&app.profile)
+        .arg("run")
+        .args(&args)
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => eprintln!("\npelagos run exited with status {}", s),
+        Err(e) => eprintln!("\nFailed to run pelagos: {}", e),
+    }
+
+    // Re-enter TUI.
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    terminal.clear()?;
+
+    // Refresh so the new container (if any) appears immediately.
+    app.refresh(runner);
 
     Ok(())
 }
