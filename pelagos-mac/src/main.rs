@@ -254,6 +254,28 @@ enum VmCommands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra: Vec<String>,
     },
+    /// Initialise VM data directory — copy kernel, initrd, and disk image to
+    /// ~/.local/share/pelagos/ and write vm.conf with correct absolute paths.
+    ///
+    /// This is the first command to run after installing pelagos-mac.
+    /// Point --vm-data at the directory containing the VM build artifacts
+    /// (ubuntu-vmlinuz / vmlinuz, initramfs-custom.gz / initramfs.gz, root.img).
+    Init {
+        /// Directory containing the VM artifacts to install.
+        /// When installing via Homebrew this is set automatically.
+        /// From a source build, pass the repo's `out/` directory.
+        #[arg(long, value_name = "DIR")]
+        vm_data: PathBuf,
+        /// Overwrite existing vm.conf and VM artifacts without prompting.
+        #[arg(long)]
+        force: bool,
+        /// VM memory in MiB.
+        #[arg(long, default_value = "2048")]
+        memory: usize,
+        /// Number of vCPUs.
+        #[arg(long, default_value = "4")]
+        cpus: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +472,15 @@ fn main() {
         Commands::Vm {
             sub: VmCommands::Status,
         } => vm_status(&profile),
+        Commands::Vm {
+            sub:
+                VmCommands::Init {
+                    vm_data,
+                    force,
+                    memory,
+                    cpus,
+                },
+        } => vm_init(&vm_data, force, memory, cpus),
         Commands::Vm {
             sub: VmCommands::Shell,
         } => {
@@ -1286,6 +1317,87 @@ fn vm_status(profile: &str) {
             println!("running (pid {})", pid);
         }
     }
+}
+
+fn vm_init(vm_data: &std::path::Path, force: bool, memory: usize, cpus: usize) {
+    let base = state::pelagos_base().unwrap_or_else(|e| {
+        log::error!("cannot determine pelagos data dir: {}", e);
+        process::exit(1);
+    });
+
+    if let Err(e) = std::fs::create_dir_all(&base) {
+        log::error!("cannot create {}: {}", base.display(), e);
+        process::exit(1);
+    }
+
+    let conf_path = base.join("vm.conf");
+    if conf_path.exists() && !force {
+        eprintln!(
+            "error: vm.conf already exists at {}\n       Use --force to overwrite.",
+            conf_path.display()
+        );
+        process::exit(1);
+    }
+
+    // Each artifact: list of candidate source filenames (tried in order), destination name.
+    let artifacts: &[(&[&str], &str)] = &[
+        (&["ubuntu-vmlinuz", "vmlinuz"], "vmlinuz"),
+        (&["initramfs-custom.gz", "initramfs.gz"], "initramfs.gz"),
+        (&["root.img"], "root.img"),
+    ];
+
+    for (candidates, dest_name) in artifacts {
+        let dest = base.join(dest_name);
+        if dest.exists() && !force {
+            log::info!("{} already exists, skipping", dest.display());
+            continue;
+        }
+        let src = candidates
+            .iter()
+            .map(|n| vm_data.join(n))
+            .find(|p| p.exists())
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "error: could not find {} (tried: {}) in {}",
+                    dest_name,
+                    candidates.join(", "),
+                    vm_data.display()
+                );
+                process::exit(1);
+            });
+        log::info!("copying {} → {}", src.display(), dest.display());
+        if let Err(e) = std::fs::copy(&src, &dest) {
+            log::error!("copy failed: {}", e);
+            process::exit(1);
+        }
+    }
+
+    let conf = format!(
+        "# vm.conf — default profile\n\
+         # Written by: pelagos vm init (v{})\n\
+         disk      = {}\n\
+         kernel    = {}\n\
+         initrd    = {}\n\
+         memory    = {}\n\
+         cpus      = {}\n",
+        env!("CARGO_PKG_VERSION"),
+        base.join("root.img").display(),
+        base.join("vmlinuz").display(),
+        base.join("initramfs.gz").display(),
+        memory,
+        cpus,
+    );
+
+    if let Err(e) = std::fs::write(&conf_path, &conf) {
+        log::error!("failed to write vm.conf: {}", e);
+        process::exit(1);
+    }
+
+    println!("pelagos VM data initialised at {}", base.display());
+    println!("  kernel  : {}", base.join("vmlinuz").display());
+    println!("  initrd  : {}", base.join("initramfs.gz").display());
+    println!("  disk    : {}", base.join("root.img").display());
+    println!("  vm.conf : {}", conf_path.display());
 }
 
 // ---------------------------------------------------------------------------
