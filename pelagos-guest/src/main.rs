@@ -1459,7 +1459,7 @@ fn handle_exec_into(
     workdir: Option<&str>,
 ) -> std::io::Result<()> {
     log::info!(
-        "exec-into: container={} tty={} args={:?}",
+        "exec: container={} tty={} args={:?}",
         container,
         tty,
         args
@@ -1469,12 +1469,12 @@ fn handle_exec_into(
         let _ = send_response(
             &mut w,
             &GuestResponse::Error {
-                error: "exec-into: no command".into(),
+                error: "exec: no command specified".into(),
             },
         );
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "exec-into: no command",
+            "exec: no command specified",
         ));
     }
 
@@ -1484,7 +1484,7 @@ fn handle_exec_into(
         send_response(&mut w, &GuestResponse::Ready { ready: true })?;
     }
 
-    // Delegate to `pelagos exec-into` which correctly enters all container
+    // Delegate to `pelagos exec` which correctly enters all container
     // namespaces (net, uts, ipc, mnt, pid) as of pelagos v0.58.0.
     let pelagos = pelagos_bin();
     let mut cmd = Command::new(&pelagos);
