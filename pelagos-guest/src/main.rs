@@ -135,6 +135,8 @@ pub enum GuestCommand {
     ContainerInspect {
         name: String,
     },
+    /// Remove all exited containers by reading state files directly.
+    ContainerPrune,
     /// Restart a stopped container; maps to `pelagos start <name>`.
     Start {
         name: String,
@@ -378,6 +380,46 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 let mut cmd = Command::new(pelagos_bin());
                 cmd.arg("container").arg("inspect").arg(&name);
                 spawn_and_stream(&mut writer, cmd)?;
+            }
+            GuestCommand::ContainerPrune => {
+                // Read container state files directly — no subprocess for enumeration.
+                // Containers run as root; state lives in /run/pelagos/containers/.
+                let containers_dir = std::path::PathBuf::from("/run/pelagos/containers");
+                let mut removed = 0usize;
+                if let Ok(entries) = std::fs::read_dir(&containers_dir) {
+                    for entry in entries.flatten() {
+                        let state_path = entry.path().join("state.json");
+                        let Ok(data) = std::fs::read_to_string(&state_path) else {
+                            continue;
+                        };
+                        let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) else {
+                            continue;
+                        };
+                        if val.get("status").and_then(|s| s.as_str()) != Some("exited") {
+                            continue;
+                        }
+                        let raw = entry.file_name();
+                        let name = raw.to_string_lossy();
+                        let out = Command::new(pelagos_bin())
+                            .arg("rm")
+                            .arg(name.as_ref())
+                            .output();
+                        match out {
+                            Ok(o) if o.status.success() => {
+                                writeln!(writer, "{}", name)?;
+                                removed += 1;
+                            }
+                            Ok(o) => {
+                                let msg = String::from_utf8_lossy(&o.stderr);
+                                writeln!(writer, "error removing {}: {}", name, msg.trim())?;
+                            }
+                            Err(e) => {
+                                writeln!(writer, "error removing {}: {}", name, e)?;
+                            }
+                        }
+                    }
+                }
+                writeln!(writer, "{} container(s) removed", removed)?;
             }
             GuestCommand::Start { name } => {
                 let mut cmd = Command::new(pelagos_bin());

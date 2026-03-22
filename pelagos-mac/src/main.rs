@@ -145,6 +145,8 @@ enum Commands {
         #[arg(value_name = "CONTAINER")]
         name: String,
     },
+    /// Remove all exited containers
+    ContainerPrune,
     /// Restart a stopped container with its original parameters
     Start {
         /// Name of the container to start
@@ -335,6 +337,8 @@ enum GuestCommand {
     ContainerInspect {
         name: String,
     },
+    /// Remove all exited containers in one shot.
+    ContainerPrune,
     Start {
         name: String,
     },
@@ -785,6 +789,16 @@ fn main() {
                 stream,
                 GuestCommand::ContainerInspect { name },
             ));
+        }
+
+        Commands::ContainerPrune => {
+            let daemon_args = daemon_args_from_cli(&cli);
+            if let Err(e) = daemon::ensure_running(&daemon_args) {
+                log::error!("failed to start VM daemon: {}", e);
+                process::exit(1);
+            }
+            let stream = connect_or_exit(&profile);
+            process::exit(passthrough_command(stream, GuestCommand::ContainerPrune));
         }
 
         Commands::Start { ref name } => {
