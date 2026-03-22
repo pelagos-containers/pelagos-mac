@@ -106,7 +106,7 @@ fn run_loop(
 
         // Command palette: execute pending run command.
         if let Some(input) = app.pending_run.take() {
-            execute_run(app, &runner, &input);
+            execute_run(terminal, app, &runner, &input)?;
         }
 
         if app.should_quit {
@@ -118,46 +118,34 @@ fn run_loop(
 }
 
 // ---------------------------------------------------------------------------
-// Run command execution
+// Run command execution (suspends TUI, inherits stdio, then resumes)
 // ---------------------------------------------------------------------------
 
-/// Dispatch a palette `run` command.
+/// Run `pelagos --profile <p> run <args>` silently in the background.
 ///
-/// - Non-interactive: run silently via `.output()`; TUI never leaves alternate
-///   screen.  On success the container list refreshes immediately.
-/// - Interactive (`-i` / `--interactive` / combined flags): open the command
-///   in a new terminal window so the TUI keeps running alongside.  The terminal
-///   is chosen by `PELAGOS_TERMINAL` env var, then `$TERM_PROGRAM` auto-detect,
-///   then Apple Terminal as a fallback.
-fn execute_run(app: &mut App, runner: &impl Runner, input: &str) {
+/// Output is captured — the TUI never leaves alternate screen so there is no
+/// flash.  On failure the error is surfaced in the modeline via
+/// `app.status_message`.  On success the container list is refreshed so the
+/// new container appears immediately.
+fn execute_run(
+    _terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    runner: &impl Runner,
+    input: &str,
+) -> anyhow::Result<()> {
     let args: Vec<&str> = input.split_whitespace().collect();
     log::info!("palette run: profile={} args={:?}", app.profile, args);
 
+    // Refuse interactive flags — .output() blocks the event loop and the TUI
+    // cannot provide a usable stdin.  Use the CLI directly for interactive runs.
     let interactive = args
         .iter()
         .any(|a| *a == "-i" || *a == "--interactive" || *a == "-it" || *a == "-ti");
-
     if interactive {
-        let full_cmd = format!(
-            "pelagos --profile {} run {}",
-            shell_escape(&app.profile),
-            input
-        );
-        match open_in_terminal(&full_cmd) {
-            Ok(()) => {
-                // Refresh after a brief moment so the new container appears.
-                app.refresh(runner);
-            }
-            Err(e) => {
-                let msg = format!("terminal launch: {}", e);
-                log::warn!("{}", msg);
-                app.status_message = Some(msg);
-            }
-        }
-        return;
+        app.status_message = Some("interactive containers: use the CLI (pelagos run -i ...)".into());
+        return Ok(());
     }
 
-    // Non-interactive: run silently, capture output.
     let result = std::process::Command::new("pelagos")
         .arg("--profile")
         .arg(&app.profile)
@@ -185,89 +173,8 @@ fn execute_run(app: &mut App, runner: &impl Runner, input: &str) {
             app.status_message = Some(msg);
         }
     }
-}
 
-// ---------------------------------------------------------------------------
-// Terminal launcher
-// ---------------------------------------------------------------------------
-
-/// Open `cmd` in a new terminal window/tab.
-///
-/// Resolution order:
-/// 1. `PELAGOS_TERMINAL` env var — treated as the terminal binary name.
-///    The command is appended as `-e sh -c "<cmd>"` (works for most emulators).
-/// 2. `$TERM_PROGRAM` auto-detect — handles Apple Terminal, iTerm2, Ghostty,
-///    WarpTerminal, kitty, and Alacritty.
-/// 3. Apple Terminal via `osascript` as a last resort.
-fn open_in_terminal(cmd: &str) -> anyhow::Result<()> {
-    // 1. User override.
-    if let Ok(term_bin) = std::env::var("PELAGOS_TERMINAL") {
-        return spawn_generic(&term_bin, cmd);
-    }
-
-    // 2. Auto-detect.
-    let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
-    log::debug!("open_in_terminal: TERM_PROGRAM={:?}", term_program);
-
-    match term_program.as_str() {
-        "Apple_Terminal" => osascript_apple_terminal(cmd),
-        "iTerm.app" => osascript_iterm(cmd),
-        "ghostty" => spawn_generic("ghostty", cmd),
-        "WarpTerminal" => osascript_apple_terminal(cmd), // Warp has no CLI launcher; fall back
-        "kitty" => spawn_generic("kitty", cmd),
-        "alacritty" => spawn_generic("alacritty", cmd),
-        _ => {
-            log::debug!(
-                "open_in_terminal: unrecognised TERM_PROGRAM {:?}, falling back to Apple Terminal",
-                term_program
-            );
-            osascript_apple_terminal(cmd)
-        }
-    }
-}
-
-/// Open a new Terminal.app window/tab running `cmd`.
-fn osascript_apple_terminal(cmd: &str) -> anyhow::Result<()> {
-    let script = format!(
-        "tell application \"Terminal\" to do script \"{}\"",
-        escape_applescript(cmd)
-    );
-    std::process::Command::new("osascript")
-        .args(["-e", &script])
-        .spawn()?;
     Ok(())
-}
-
-/// Open a new iTerm2 window running `cmd`.
-fn osascript_iterm(cmd: &str) -> anyhow::Result<()> {
-    let script = format!(
-        "tell application \"iTerm\" to create window with default profile command \"{}\"",
-        escape_applescript(cmd)
-    );
-    std::process::Command::new("osascript")
-        .args(["-e", &script])
-        .spawn()?;
-    Ok(())
-}
-
-/// Open `cmd` in a generic terminal that accepts `-e sh -c <cmd>`.
-///
-/// Works for: ghostty, kitty, alacritty, and most X11/Wayland emulators.
-fn spawn_generic(term_bin: &str, cmd: &str) -> anyhow::Result<()> {
-    std::process::Command::new(term_bin)
-        .args(["-e", "sh", "-c", cmd])
-        .spawn()?;
-    Ok(())
-}
-
-/// Escape a string for embedding inside an AppleScript string literal.
-fn escape_applescript(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// Minimal shell-escape: wrap in single quotes, escaping any single quotes.
-fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 // ---------------------------------------------------------------------------
