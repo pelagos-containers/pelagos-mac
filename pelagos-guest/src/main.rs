@@ -172,6 +172,8 @@ pub enum GuestCommand {
         tty: bool,
     },
     Ping,
+    /// Return the guest daemon's version string.
+    Version,
     /// Build an OCI image from a Dockerfile-compatible Remfile.
     /// The build context is streamed as a gzipped tar immediately after the
     /// JSON command line (raw bytes, no framing; length given by context_size).
@@ -245,6 +247,22 @@ pub enum GuestResponse {
     /// Precedes a raw binary payload of `size` bytes written directly to the socket (no JSON framing).
     RawBytes {
         size: u64,
+    },
+    /// Version information for all components inside the VM.
+    /// Fields are additive — omit unknown ones with skip_serializing_if so older
+    /// mac clients ignore fields they don't recognise.
+    /// Planned future field: `vm_image: Option<String>` for a version token baked
+    /// into the disk image at build time (independent release cadence from
+    /// pelagos-guest, kernel, and runtime).
+    VersionInfo {
+        /// pelagos-guest version.
+        guest: String,
+        /// pelagos runtime version, obtained by running `pelagos --version`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        runtime: Option<String>,
+        /// VM kernel version (`uname -r`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kernel: Option<String>,
     },
 }
 
@@ -337,6 +355,43 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
             GuestCommand::Ping => {
                 log::debug!("ping");
                 send_response(&mut writer, &GuestResponse::Pong { pong: true })?;
+                return Ok(());
+            }
+            GuestCommand::Version => {
+                let guest = concat!(env!("CARGO_PKG_VERSION"), "+", env!("GIT_HASH")).to_string();
+                // Run `pelagos --version` to get the container runtime version.
+                // Output is "pelagos <version>"; strip the binary-name prefix.
+                let runtime = std::process::Command::new("pelagos")
+                    .arg("--version")
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    .map(|s| {
+                        let s = s.trim();
+                        s.strip_prefix("pelagos ").unwrap_or(s).to_string()
+                    });
+                let kernel = std::process::Command::new("uname")
+                    .arg("-r")
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    .map(|s| s.trim().to_string());
+                log::debug!(
+                    "version: guest={} runtime={:?} kernel={:?}",
+                    guest,
+                    runtime,
+                    kernel
+                );
+                send_response(
+                    &mut writer,
+                    &GuestResponse::VersionInfo {
+                        guest,
+                        runtime,
+                        kernel,
+                    },
+                )?;
                 return Ok(());
             }
             GuestCommand::Run {
