@@ -244,7 +244,7 @@ pub fn global_ssh_key_file() -> io::Result<PathBuf> {
 }
 
 /// Returns the base pelagos data dir (respects XDG_DATA_HOME).
-fn pelagos_base() -> io::Result<PathBuf> {
+pub fn pelagos_base() -> io::Result<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
         return Ok(PathBuf::from(xdg).join("pelagos"));
     }

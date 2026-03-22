@@ -1025,18 +1025,40 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
     // Load per-profile vm.conf as a fallback layer below CLI flags.
     let profile_cfg = state::VmProfileConfig::load(&cli.profile).unwrap_or_default();
 
+    // Auto-discover VM artifacts when neither CLI flags nor vm.conf supply them.
+    // This fires on a fresh install where no vm.conf has been written yet.
+    let discovered = if cli.kernel.is_none() && profile_cfg.kernel.is_none()
+        || cli.disk.is_none() && profile_cfg.disk.is_none()
+    {
+        discover_vm_artifacts()
+    } else {
+        None
+    };
+
     let kernel = cli
         .kernel
         .clone()
         .or(profile_cfg.kernel)
+        .or_else(|| discovered.as_ref().map(|d| d.kernel.clone()))
         .unwrap_or_else(|| {
-            log::error!("--kernel / PELAGOS_KERNEL is required (or set kernel= in vm.conf)");
+            log::error!(
+                "no kernel image found; install pelagos-mac via Homebrew \
+                 or pass --kernel / set kernel= in vm.conf"
+            );
             process::exit(1);
         });
-    let disk = cli.disk.clone().or(profile_cfg.disk).unwrap_or_else(|| {
-        log::error!("--disk / PELAGOS_DISK is required (or set disk= in vm.conf)");
-        process::exit(1);
-    });
+    let disk = cli
+        .disk
+        .clone()
+        .or(profile_cfg.disk)
+        .or_else(|| discovered.as_ref().map(|d| d.disk.clone()))
+        .unwrap_or_else(|| {
+            log::error!(
+                "no disk image found; install pelagos-mac via Homebrew \
+                 or pass --disk / set disk= in vm.conf"
+            );
+            process::exit(1);
+        });
 
     // Always-on volumes share: <profile-dir>/volumes → /var/lib/pelagos/volumes in VM.
     // This makes named pelagos volumes persistent across VM restarts (virtiofs-backed on host).
@@ -1104,7 +1126,11 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
 
     daemon::DaemonArgs {
         kernel,
-        initrd: cli.initrd.clone().or(profile_cfg.initrd),
+        initrd: cli
+            .initrd
+            .clone()
+            .or(profile_cfg.initrd)
+            .or_else(|| discovered.and_then(|d| d.initrd)),
         disk,
         cmdline,
         memory_mib: cli.memory.or(profile_cfg.memory).unwrap_or(4096),
@@ -1286,6 +1312,67 @@ fn vm_status(profile: &str) {
             println!("running (pid {})", pid);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// VM artifact auto-discovery
+// ---------------------------------------------------------------------------
+
+struct DiscoveredArtifacts {
+    kernel: PathBuf,
+    initrd: Option<PathBuf>,
+    disk: PathBuf,
+}
+
+/// Probe well-known locations for VM artifacts (kernel, initrd, disk image).
+///
+/// Search order:
+///   1. `~/.local/share/pelagos/`          — XDG data dir (manually placed or previously used)
+///   2. `$(binary)/../share/pelagos-mac/`  — Homebrew pkgshare
+///   3. `$(binary)/../../../../out/`        — dev build tree
+///
+/// Within each directory, both naming conventions are tried:
+///   kernel : `vmlinuz`, `ubuntu-vmlinuz`
+///   initrd : `initramfs.gz`, `initramfs-custom.gz`
+///   disk   : `root.img`
+///
+/// Returns the first directory that contains at least a kernel and a disk image.
+fn discover_vm_artifacts() -> Option<DiscoveredArtifacts> {
+    let binary = std::env::current_exe().ok()?;
+    let bin_dir = binary.parent()?;
+
+    // Collect candidate directories, skipping any that fail to resolve.
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(base) = state::pelagos_base() {
+        dirs.push(base);
+    }
+    dirs.push(bin_dir.join("../share/pelagos-mac"));
+    dirs.push(bin_dir.join("../../../../out"));
+
+    for dir in &dirs {
+        let kernel = ["vmlinuz", "ubuntu-vmlinuz"]
+            .iter()
+            .map(|n| dir.join(n))
+            .find(|p| p.exists());
+        let disk = dir.join("root.img");
+
+        let (Some(kernel), true) = (kernel, disk.exists()) else {
+            continue;
+        };
+
+        let initrd = ["initramfs.gz", "initramfs-custom.gz"]
+            .iter()
+            .map(|n| dir.join(n))
+            .find(|p| p.exists());
+
+        log::debug!("auto-discovered VM artifacts in {}", dir.display());
+        return Some(DiscoveredArtifacts {
+            kernel,
+            initrd,
+            disk,
+        });
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
