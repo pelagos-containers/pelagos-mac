@@ -663,11 +663,11 @@ fn cmd_exec(
         }
     };
 
-    // `pelagos exec-into <container> [cmd...]` — enters running container's namespaces.
-    // pelagos exec-into has no --env flag; inject env vars by prepending `env VAR=VAL …`
+    // `pelagos exec <container> [cmd...]` — enters running container's namespaces.
+    // pelagos exec has no --env flag; inject env vars by prepending `env VAR=VAL …`
     // to the command so the container shell inherits them.
     let mut sub: Vec<OsString> = Vec::new();
-    sub.push("exec-into".into());
+    sub.push("exec".into());
     if tty {
         sub.push("-t".into());
     }

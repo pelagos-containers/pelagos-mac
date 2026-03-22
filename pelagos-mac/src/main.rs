@@ -42,7 +42,7 @@ struct Cli {
     disk: Option<PathBuf>,
 
     /// Kernel command-line arguments
-    #[arg(long, env = "PELAGOS_CMDLINE", default_value = "console=hvc0")]
+    #[arg(long, env = "PELAGOS_CMDLINE", default_value = "console=hvc0 random.trust_cpu=on")]
     cmdline: String,
 
     /// Memory in MiB (default 4096; overridden by vm.conf memory= in profile)
@@ -76,7 +76,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run a container image inside the VM
+    /// Run a container image inside the VM.
+    /// Add -it for an interactive shell: pelagos run -it alpine /bin/sh
     Run {
         /// Container image name (e.g. alpine)
         image: String,
@@ -95,21 +96,18 @@ enum Commands {
         /// Label KEY=VALUE (repeatable; forwarded to pelagos run --label)
         #[arg(short = 'l', long = "label")]
         labels: Vec<String>,
-    },
-    /// Run a command interactively in a container (stdin forwarded, optional TTY)
-    Exec {
-        /// Container image name
-        image: String,
-        /// Command and arguments
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-        /// Allocate a pseudo-TTY (default: auto-detect from stdin)
+        /// Keep stdin open (interactive mode)
+        #[arg(short = 'i', long)]
+        interactive: bool,
+        /// Allocate a pseudo-TTY
         #[arg(short = 't', long)]
         tty: bool,
     },
-    /// Exec a command inside an already-running container (enters its namespaces).
-    ExecInto {
+    /// Run a command inside an already-running container (enters its namespaces).
+    /// Equivalent to `docker exec`.
+    Exec {
         /// Running container name
+        #[arg(value_name = "CONTAINER")]
         container: String,
         /// Command and arguments
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -601,11 +599,40 @@ fn main() {
             detach,
             ref env,
             ref labels,
+            interactive,
+            tty,
         } => {
             let image = image.clone();
             let args = args.clone();
             let name = name.clone();
             let labels = labels.clone();
+            // -it: route through the PTY/interactive path (GuestCommand::Exec)
+            if interactive || tty {
+                let tty = tty || unsafe { libc::isatty(libc::STDOUT_FILENO) } != 0;
+                let env_map: std::collections::HashMap<String, String> = env
+                    .iter()
+                    .filter_map(|kv| {
+                        let (k, v) = kv.split_once('=')?;
+                        Some((k.to_string(), v.to_string()))
+                    })
+                    .collect();
+                let daemon_args = daemon_args_from_cli(&cli);
+                if let Err(e) = daemon::ensure_running(&daemon_args) {
+                    log::error!("failed to start VM daemon: {}", e);
+                    process::exit(1);
+                }
+                let stream = connect_or_exit(&profile);
+                process::exit(exec_command(
+                    stream,
+                    GuestCommand::Exec {
+                        image,
+                        args,
+                        env: env_map,
+                        tty,
+                    },
+                    tty,
+                ));
+            }
             let env_map: std::collections::HashMap<String, String> = env
                 .iter()
                 .filter_map(|kv| {
@@ -675,35 +702,6 @@ fn main() {
         }
 
         Commands::Exec {
-            ref image,
-            ref args,
-            tty,
-        } => {
-            let image = image.clone();
-            let args = args.clone();
-            // Auto-detect: enable TTY only when stdout is a real terminal.
-            // Checking STDOUT (not STDIN) correctly handles `OUT=$(pelagos exec ...)`:
-            // stdout is a pipe, so TTY is skipped even when stdin is a terminal.
-            let tty = tty || unsafe { libc::isatty(libc::STDOUT_FILENO) } != 0;
-            let daemon_args = daemon_args_from_cli(&cli);
-            if let Err(e) = daemon::ensure_running(&daemon_args) {
-                log::error!("failed to start VM daemon: {}", e);
-                process::exit(1);
-            }
-            let stream = connect_or_exit(&profile);
-            process::exit(exec_command(
-                stream,
-                GuestCommand::Exec {
-                    image,
-                    args,
-                    env: std::collections::HashMap::new(),
-                    tty,
-                },
-                tty,
-            ));
-        }
-
-        Commands::ExecInto {
             ref container,
             ref args,
             tty,
@@ -713,11 +711,8 @@ fn main() {
             let container = container.clone();
             let args = args.clone();
             let workdir = workdir.clone();
+            // Auto-detect: enable TTY only when stdout is a real terminal.
             let tty = tty || unsafe { libc::isatty(libc::STDOUT_FILENO) } != 0;
-            // Fix A ensures all commands start the daemon with the same virtiofs
-            // shares ($HOME as share0), so ensure_running is safe here — no
-            // mount-mismatch risk. Auto-start the VM if it has shut down since
-            // the last container run (e.g. between probe exit and docker exec).
             let daemon_args = daemon_args_from_cli(&cli);
             if let Err(e) = daemon::ensure_running(&daemon_args) {
                 log::error!("failed to start VM daemon: {}", e);

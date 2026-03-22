@@ -1394,7 +1394,15 @@ fn handle_exec(
     }
 
     let mut cmd = Command::new(&pelagos);
-    cmd.arg("run").arg(image);
+    cmd.arg("run");
+    // --interactive tells pelagos to allocate a PTY for the container process
+    // and relay raw bytes through its own stdin/stdout.  We then use the piped
+    // (non-PTY-wrapper) path here because pelagos manages the PTY internally —
+    // adding another PTY layer on top would double-process terminal escapes.
+    if tty {
+        cmd.arg("--interactive");
+    }
+    cmd.arg(image);
     if !args.is_empty() {
         cmd.args(args);
     }
@@ -1402,11 +1410,9 @@ fn handle_exec(
         cmd.env(k, v);
     }
 
-    if tty {
-        handle_exec_tty(fd, cmd)
-    } else {
-        handle_exec_piped(fd, cmd)
-    }
+    // Always use the piped path: for tty=true, pelagos run --interactive owns
+    // the PTY; for tty=false, plain pipes are correct.
+    handle_exec_piped(fd, cmd)
 }
 
 /// Exec into a running container by joining all its Linux namespaces natively.
