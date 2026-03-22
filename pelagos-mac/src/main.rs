@@ -153,6 +153,13 @@ enum Commands {
         /// Name of the container to start
         #[arg(value_name = "CONTAINER")]
         name: String,
+        /// Run interactively with a PTY (like `pelagos run -it`)
+        #[arg(long, short = 'i')]
+        interactive: bool,
+        /// Override the command for this run only; pass after --
+        /// Example: pelagos start -i myapp -- /bin/sh
+        #[arg(last = true, value_name = "CMD")]
+        cmd: Vec<String>,
     },
     /// Stop a running container
     Stop {
@@ -358,6 +365,10 @@ enum GuestCommand {
     ContainerPrune,
     Start {
         name: String,
+        #[serde(skip_serializing_if = "is_false")]
+        interactive: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cmd_override: Vec<String>,
     },
     Stop {
         name: String,
@@ -821,15 +832,30 @@ fn main() {
             process::exit(passthrough_command(stream, GuestCommand::ContainerPrune));
         }
 
-        Commands::Start { ref name } => {
+        Commands::Start {
+            ref name,
+            interactive,
+            ref cmd,
+        } => {
             let name = name.clone();
+            let cmd_override = cmd.clone();
             let daemon_args = daemon_args_from_cli(&cli);
             if let Err(e) = daemon::ensure_running(&daemon_args) {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
             let stream = connect_or_exit(&profile);
-            process::exit(passthrough_command(stream, GuestCommand::Start { name }));
+            let guest_cmd = GuestCommand::Start {
+                name,
+                interactive,
+                cmd_override,
+            };
+            if interactive {
+                let tty = unsafe { libc::isatty(libc::STDOUT_FILENO) } != 0;
+                process::exit(exec_command(stream, guest_cmd, tty));
+            } else {
+                process::exit(passthrough_command(stream, guest_cmd));
+            }
         }
 
         Commands::Stop { ref name } => {
