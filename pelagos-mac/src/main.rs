@@ -22,7 +22,11 @@ mod state;
 // ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "pelagos", about = "pelagos container runtime for macOS")]
+#[command(
+    name = "pelagos",
+    about = "pelagos container runtime for macOS",
+    version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("GIT_HASH")),
+)]
 struct Cli {
     /// VM profile name (default: "default"). Named profiles use isolated state
     /// directories at ~/.local/share/pelagos/profiles/<name>/.
@@ -194,6 +198,8 @@ enum Commands {
     },
     /// Ping the guest daemon (readiness check)
     Ping,
+    /// Print version information for pelagos-mac and (if the VM is running) pelagos-guest
+    Version,
     /// Build an OCI image from a Dockerfile (Remfile) inside the VM
     Build {
         /// Image tag (e.g. myapp:latest)
@@ -391,6 +397,7 @@ enum GuestCommand {
         force: bool,
     },
     Ping,
+    Version,
     Build {
         tag: String,
         dockerfile: String,
@@ -447,6 +454,22 @@ enum GuestResponse {
     /// Precedes `size` raw bytes written directly to the socket.
     RawBytes {
         size: u64,
+    },
+    /// Version information returned by the guest daemon.
+    /// Fields are additive — new fields arrive as Option so older guests remain
+    /// wire-compatible.  Planned future field: `vm_image: Option<String>` for
+    /// a version token baked into the VM disk image at build time (independent
+    /// of pelagos-guest, kernel, and runtime release cadences).
+    VersionInfo {
+        /// pelagos-guest version (always present).
+        #[serde(default)]
+        guest: String,
+        /// pelagos runtime version (`pelagos --version` inside the VM).
+        #[serde(default)]
+        runtime: Option<String>,
+        /// VM kernel version (`uname -r`).
+        #[serde(default)]
+        kernel: Option<String>,
     },
 }
 
@@ -777,6 +800,20 @@ fn main() {
             }
             let stream = connect_or_exit(&profile);
             process::exit(ping_command(stream));
+        }
+
+        Commands::Version => {
+            let mac_version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("GIT_HASH"));
+            println!("pelagos-mac  {}", mac_version);
+            // Query the guest for its version if the daemon is already running.
+            let daemon_alive = state::StateDir::open_profile(&profile)
+                .map(|s| s.is_daemon_alive())
+                .unwrap_or(false);
+            if daemon_alive {
+                if let Ok(stream) = daemon::connect(&profile) {
+                    version_command(stream);
+                }
+            }
         }
 
         Commands::Ps { all, json } => {
@@ -1966,6 +2003,46 @@ fn ping_command(stream: UnixStream) -> i32 {
         other => {
             log::error!("unexpected ping response: {:?}", other);
             1
+        }
+    }
+}
+
+/// Query the guest daemon for its version and print it to stdout.
+fn version_command(stream: UnixStream) {
+    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+    let mut writer = stream;
+
+    let mut msg = serde_json::to_string(&GuestCommand::Version).unwrap();
+    msg.push('\n');
+    if let Err(e) = writer.write_all(msg.as_bytes()) {
+        log::warn!("version query write error: {}", e);
+        return;
+    }
+
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) | Err(_) => {
+            log::warn!("no version response from guest");
+            return;
+        }
+        Ok(_) => {}
+    }
+    match serde_json::from_str::<GuestResponse>(line.trim_end()) {
+        Ok(GuestResponse::VersionInfo {
+            guest,
+            runtime,
+            kernel,
+        }) => {
+            println!("pelagos-guest  {}", guest);
+            if let Some(v) = runtime {
+                println!("pelagos        {}", v);
+            }
+            if let Some(k) = kernel {
+                println!("kernel         {}", k);
+            }
+        }
+        other => {
+            log::warn!("unexpected version response: {:?}", other);
         }
     }
 }
