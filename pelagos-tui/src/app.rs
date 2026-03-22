@@ -46,6 +46,9 @@ pub struct App {
     pub palette_input: String,
     /// Set by the palette on Enter; main.rs drains this to execute the run.
     pub pending_run: Option<String>,
+    /// Transient status message shown in the modeline (e.g. run errors).
+    /// Cleared on the next keypress or after the next auto-refresh.
+    pub status_message: Option<String>,
 }
 
 impl App {
@@ -67,6 +70,7 @@ impl App {
             should_quit: false,
             palette_input: String::new(),
             pending_run: None,
+            status_message: None,
         }
     }
 
@@ -94,6 +98,7 @@ impl App {
         }
 
         self.last_refresh = Instant::now();
+        self.status_message = None;
     }
 
     // -----------------------------------------------------------------------
