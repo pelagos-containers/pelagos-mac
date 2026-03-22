@@ -42,7 +42,7 @@ struct Cli {
     disk: Option<PathBuf>,
 
     /// Kernel command-line arguments
-    #[arg(long, env = "PELAGOS_CMDLINE", default_value = "console=hvc0")]
+    #[arg(long, env = "PELAGOS_CMDLINE", default_value = "console=hvc0 random.trust_cpu=on")]
     cmdline: String,
 
     /// Memory in MiB (default 4096; overridden by vm.conf memory= in profile)

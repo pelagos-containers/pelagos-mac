@@ -70,7 +70,7 @@ impl Config {
         let kernel = PathBuf::from(parse_toml_str(&src, "kernel")?);
         let initrd = PathBuf::from(parse_toml_str(&src, "initrd")?);
         let disk = PathBuf::from(parse_toml_str(&src, "disk")?);
-        let cmdline = parse_toml_str(&src, "cmdline").unwrap_or_else(|| "console=hvc0".into());
+        let cmdline = parse_toml_str(&src, "cmdline").unwrap_or_else(|| "console=hvc0 random.trust_cpu=on".into());
         let memory_mib = parse_toml_str(&src, "memory_mib")
             .and_then(|s| s.parse().ok())
             .unwrap_or(4096);
@@ -96,7 +96,7 @@ impl Config {
         let kernel = PathBuf::from(std::env::var("PELAGOS_KERNEL").ok()?);
         let initrd = PathBuf::from(std::env::var("PELAGOS_INITRD").ok()?);
         let disk = PathBuf::from(std::env::var("PELAGOS_DISK").ok()?);
-        let cmdline = std::env::var("PELAGOS_CMDLINE").unwrap_or_else(|_| "console=hvc0".into());
+        let cmdline = std::env::var("PELAGOS_CMDLINE").unwrap_or_else(|_| "console=hvc0 random.trust_cpu=on".into());
         let memory_mib = std::env::var("PELAGOS_MEMORY_MIB")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -131,7 +131,7 @@ impl Config {
                 kernel,
                 initrd,
                 disk,
-                cmdline: "console=hvc0".into(),
+                cmdline: "console=hvc0 random.trust_cpu=on".into(),
                 memory_mib,
             })
         } else {
@@ -164,7 +164,7 @@ impl Config {
                 kernel,
                 initrd,
                 disk,
-                cmdline: "console=hvc0".into(),
+                cmdline: "console=hvc0 random.trust_cpu=on".into(),
                 memory_mib,
             })
         } else {
@@ -225,13 +225,13 @@ mod tests {
         let src = r#"
 kernel  = "/usr/local/share/pelagos/vmlinuz"
 initrd  = "/usr/local/share/pelagos/initramfs-custom.gz"
-cmdline = "console=hvc0"
+cmdline = "console=hvc0 random.trust_cpu=on"
 "#;
         assert_eq!(
             parse_toml_str(src, "kernel"),
             Some("/usr/local/share/pelagos/vmlinuz".into())
         );
-        assert_eq!(parse_toml_str(src, "cmdline"), Some("console=hvc0".into()));
+        assert_eq!(parse_toml_str(src, "cmdline"), Some("console=hvc0 random.trust_cpu=on".into()));
         assert_eq!(parse_toml_str(src, "missing"), None);
     }
 }
