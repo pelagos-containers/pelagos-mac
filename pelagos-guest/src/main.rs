@@ -145,6 +145,12 @@ pub enum GuestCommand {
     Stop {
         name: String,
     },
+    /// Stop then restart a container; maps to `pelagos restart <name>`.
+    Restart {
+        name: String,
+        #[serde(default = "default_restart_time")]
+        time: u64,
+    },
     /// Remove a container; maps to `pelagos rm [--force] <name>`.
     Rm {
         name: String,
@@ -202,6 +208,10 @@ pub enum GuestCommand {
 
 fn default_dockerfile() -> String {
     "Dockerfile".to_string()
+}
+
+fn default_restart_time() -> u64 {
+    10
 }
 
 #[derive(Debug, Serialize)]
@@ -454,6 +464,11 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
             GuestCommand::Stop { name } => {
                 let mut cmd = Command::new(pelagos_bin());
                 cmd.arg("stop").arg(&name);
+                spawn_and_stream(&mut writer, cmd)?;
+            }
+            GuestCommand::Restart { name, time } => {
+                let mut cmd = Command::new(pelagos_bin());
+                cmd.arg("restart").arg("--time").arg(time.to_string()).arg(&name);
                 spawn_and_stream(&mut writer, cmd)?;
             }
             GuestCommand::Rm { name, force } => {
