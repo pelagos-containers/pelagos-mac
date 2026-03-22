@@ -6,8 +6,9 @@ via Apple's Virtualization Framework.
 
 ## Status
 
-**v0.2.0 — functional.** VS Code devcontainer support works end-to-end. 27/27
-devcontainer e2e tests pass (suites A–F).
+**v0.4.0 — functional.** VS Code devcontainer support works end-to-end. 27/27
+devcontainer e2e tests pass (suites A–F). Build VM boots clean in ~16s via Ubuntu
+6.8 HWE kernel; `pelagos vm console` replays full boot log.
 
 ## Architecture
 
@@ -134,6 +135,7 @@ bash scripts/test-devcontainer-e2e.sh --suite D   # postCreateCommand
 | [docs/DEVCONTAINER_REQUIREMENTS.md](docs/DEVCONTAINER_REQUIREMENTS.md) | devcontainer requirements and test matrix |
 | [docs/VSCODE_ATTACH_SPEC.md](docs/VSCODE_ATTACH_SPEC.md) | VS Code attach protocol — layer-by-layer spec |
 | [docs/GUEST_CONTAINER_EXEC.md](docs/GUEST_CONTAINER_EXEC.md) | Container namespace joining implementation |
+| [docs/ALPINE_VS_UBUNTU_KERNEL.md](docs/ALPINE_VS_UBUNTU_KERNEL.md) | Alpine vs Ubuntu kernel — RCU stall mechanism, hvc0 console buffer fix |
 
 ## License
 
