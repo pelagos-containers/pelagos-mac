@@ -160,6 +160,15 @@ enum Commands {
         #[arg(value_name = "CONTAINER")]
         name: String,
     },
+    /// Stop then start a container (running or exited)
+    Restart {
+        /// Name of the container
+        #[arg(value_name = "CONTAINER")]
+        name: String,
+        /// Seconds to wait for clean exit before sending SIGKILL (default: 10)
+        #[arg(long, short = 't', default_value = "10")]
+        time: u64,
+    },
     /// Remove a container
     Rm {
         /// Name of the container to remove
@@ -293,6 +302,7 @@ fn is_false(b: &bool) -> bool {
     !b
 }
 
+
 #[derive(Serialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 enum GuestCommand {
@@ -351,6 +361,10 @@ enum GuestCommand {
     },
     Stop {
         name: String,
+    },
+    Restart {
+        name: String,
+        time: u64,
     },
     Rm {
         name: String,
@@ -827,6 +841,17 @@ fn main() {
             }
             let stream = connect_or_exit(&profile);
             process::exit(passthrough_command(stream, GuestCommand::Stop { name }));
+        }
+
+        Commands::Restart { ref name, time } => {
+            let name = name.clone();
+            let daemon_args = daemon_args_from_cli(&cli);
+            if let Err(e) = daemon::ensure_running(&daemon_args) {
+                log::error!("failed to start VM daemon: {}", e);
+                process::exit(1);
+            }
+            let stream = connect_or_exit(&profile);
+            process::exit(passthrough_command(stream, GuestCommand::Restart { name, time }));
         }
 
         Commands::Rm { ref name, force } => {
