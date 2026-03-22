@@ -136,16 +136,6 @@ fn execute_run(
     let args: Vec<&str> = input.split_whitespace().collect();
     log::info!("palette run: profile={} args={:?}", app.profile, args);
 
-    // Refuse interactive flags — .output() blocks the event loop and the TUI
-    // cannot provide a usable stdin.  Use the CLI directly for interactive runs.
-    let interactive = args
-        .iter()
-        .any(|a| *a == "-i" || *a == "--interactive" || *a == "-it" || *a == "-ti");
-    if interactive {
-        app.status_message = Some("interactive containers: use the CLI (pelagos run -i ...)".into());
-        return Ok(());
-    }
-
     let result = std::process::Command::new("pelagos")
         .arg("--profile")
         .arg(&app.profile)
