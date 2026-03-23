@@ -28,10 +28,24 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::io::OwnedFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
 pub const VSOCK_PORT: u32 = 1024;
+
+// ---------------------------------------------------------------------------
+// Global subscriber registry (Subscribe command support)
+// ---------------------------------------------------------------------------
+
+/// Each active Subscribe connection holds a sender in this list.
+/// The poller thread broadcasts events to all senders and prunes dead ones.
+type SubscriberList = Arc<Mutex<Vec<std::sync::mpsc::SyncSender<GuestEvent>>>>;
+
+fn subscriber_list() -> &'static SubscriberList {
+    static LIST: std::sync::OnceLock<SubscriberList> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| Arc::new(Mutex::new(Vec::new())))
+}
 
 // ---------------------------------------------------------------------------
 // Framed binary protocol constants
@@ -215,6 +229,52 @@ pub enum GuestCommand {
         dst: String,
         data_size: u64,
     },
+    /// Subscribe to container lifecycle events.
+    ///
+    /// The guest immediately sends a `GuestEvent::Snapshot`, then streams
+    /// `GuestEvent::ContainerStarted` / `GuestEvent::ContainerExited` lines
+    /// (NDJSON, one per line) until the client disconnects.  This connection
+    /// is held open indefinitely — it does not produce a `GuestResponse`.
+    Subscribe,
+}
+
+// ---------------------------------------------------------------------------
+// Push event types (used by the Subscribe command)
+// ---------------------------------------------------------------------------
+
+/// A container state record read directly from `/run/pelagos/containers/`.
+/// Intentionally flat so it serializes identically to `pelagos ps --json` output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContainerSnapshot {
+    pub name: String,
+    pub status: String,
+    #[serde(default)]
+    pub pid: i32,
+    pub rootfs: String,
+    pub started_at: String,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+}
+
+/// Events streamed over a Subscribe connection (NDJSON, one per line).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GuestEvent {
+    /// Initial snapshot sent immediately on subscribe.
+    Snapshot {
+        containers: Vec<ContainerSnapshot>,
+        vm_running: bool,
+    },
+    /// A container transitioned to running.
+    ContainerStarted { container: ContainerSnapshot },
+    /// A container exited or was removed.
+    ContainerExited {
+        name: String,
+        exit_code: Option<i32>,
+    },
+    /// Periodic liveness ping.  Clients that receive no message for > 15s
+    /// should reconnect.  Sent every 5s when no other events are queued.
+    Heartbeat { ts: u64 },
 }
 
 fn default_dockerfile() -> String {
@@ -281,6 +341,10 @@ fn main() {
     env_logger::init();
     let listener = create_vsock_listener(VSOCK_PORT).expect("failed to create vsock listener");
     log::info!("pelagos-guest listening on vsock port {}", VSOCK_PORT);
+
+    // Launch the container state poller.  Reads /run/pelagos/containers/ every
+    // second — no pelagos CLI involved, so no global runtime lock contention.
+    start_event_poller();
 
     loop {
         let conn_fd = match accept_vsock(&listener) {
@@ -622,6 +686,11 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 data_size,
             } => {
                 handle_cp_to(&mut writer, reader, &container, &dst, data_size)?;
+                return Ok(());
+            }
+            GuestCommand::Subscribe => {
+                // Holds connection open; does not participate in the read loop.
+                handle_subscribe(&mut writer)?;
                 return Ok(());
             }
         }
@@ -2016,6 +2085,218 @@ impl Write for FdWriter {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Container state reader (for the event poller — no pelagos CLI needed)
+// ---------------------------------------------------------------------------
+
+/// Read container state directly from `/run/pelagos/containers/*/state.json`.
+/// Returns an empty vec on any I/O error so the poller stays alive regardless.
+fn read_container_states() -> Vec<ContainerSnapshot> {
+    let dir = std::path::Path::new("/run/pelagos/containers");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let state_path = entry.path().join("state.json");
+        let Ok(data) = std::fs::read_to_string(&state_path) else {
+            continue;
+        };
+        // Parse only the fields we need; ignore unknown keys.
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) else {
+            continue;
+        };
+        let name = val
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let status = val
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let pid = val.get("pid").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let rootfs = val
+            .get("rootfs")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let started_at = val
+            .get("started_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let exit_code = val
+            .get("exit_code")
+            .and_then(|v| v.as_i64())
+            .map(|c| c as i32);
+        out.push(ContainerSnapshot {
+            name,
+            status,
+            pid,
+            rootfs,
+            started_at,
+            exit_code,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Event poller (broadcasts container diffs to all Subscribe connections)
+// ---------------------------------------------------------------------------
+
+fn start_event_poller() {
+    std::thread::Builder::new()
+        .name("event-poller".into())
+        .spawn(event_poller_loop)
+        .expect("failed to spawn event poller");
+}
+
+fn event_poller_loop() {
+    let mut prev: Vec<ContainerSnapshot> = read_container_states();
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let current = read_container_states();
+        let events = diff_container_states(&prev, &current);
+        if !events.is_empty() {
+            broadcast_events(&events);
+        }
+        prev = current;
+    }
+}
+
+fn diff_container_states(
+    prev: &[ContainerSnapshot],
+    current: &[ContainerSnapshot],
+) -> Vec<GuestEvent> {
+    let mut events = Vec::new();
+
+    // Containers that appeared or transitioned to running.
+    for c in current {
+        match prev.iter().find(|p| p.name == c.name) {
+            None => {
+                events.push(GuestEvent::ContainerStarted {
+                    container: c.clone(),
+                });
+                // Container was never seen while running (exited between polls).
+                // Immediately emit ContainerExited so the TUI can track its
+                // final state rather than leaving it stuck in ContainerStarted.
+                if c.status != "running" {
+                    events.push(GuestEvent::ContainerExited {
+                        name: c.name.clone(),
+                        exit_code: c.exit_code,
+                    });
+                }
+            }
+            Some(p) if p.status != "running" && c.status == "running" => {
+                events.push(GuestEvent::ContainerStarted {
+                    container: c.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Containers that disappeared or transitioned away from running.
+    for p in prev {
+        match current.iter().find(|c| c.name == p.name) {
+            None => {
+                events.push(GuestEvent::ContainerExited {
+                    name: p.name.clone(),
+                    exit_code: p.exit_code,
+                });
+            }
+            Some(c) if p.status == "running" && c.status != "running" => {
+                events.push(GuestEvent::ContainerExited {
+                    name: c.name.clone(),
+                    exit_code: c.exit_code,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    events
+}
+
+fn broadcast_events(events: &[GuestEvent]) {
+    let mut subs = subscriber_list().lock().unwrap();
+    subs.retain(|tx| {
+        for e in events {
+            match tx.try_send(e.clone()) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    // Channel temporarily full: drop this event batch but keep
+                    // the subscriber alive.  It is still connected; head-of-line
+                    // blocking should resolve on the next broadcast cycle.
+                    log::warn!("subscriber channel full — dropping event batch");
+                    return true;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    return false; // subscriber gone; remove from list
+                }
+            }
+        }
+        true
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Subscribe command handler
+// ---------------------------------------------------------------------------
+
+fn handle_subscribe(writer: &mut FdWriter) -> std::io::Result<()> {
+    // Register subscriber before reading snapshot to avoid missing an event
+    // between snapshot and registration.
+    let (tx, rx) = std::sync::mpsc::sync_channel(256);
+    subscriber_list().lock().unwrap().push(tx);
+
+    // Send initial snapshot.
+    let snapshot = GuestEvent::Snapshot {
+        containers: read_container_states(),
+        vm_running: true,
+    };
+    send_event(writer, &snapshot)?;
+
+    // Stream events until the client disconnects.  Use recv_timeout so we can
+    // send a Heartbeat every ~5s even when no container events are occurring.
+    // Heartbeats allow TUI clients to detect a silently-dead connection.
+    let heartbeat_interval = std::time::Duration::from_secs(5);
+    loop {
+        match rx.recv_timeout(heartbeat_interval) {
+            Ok(event) => {
+                if send_event(writer, &event).is_err() {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if send_event(writer, &GuestEvent::Heartbeat { ts }).is_err() {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    Ok(())
+}
+
+fn send_event(writer: &mut impl Write, event: &GuestEvent) -> std::io::Result<()> {
+    let mut json = serde_json::to_string(event).map_err(std::io::Error::other)?;
+    json.push('\n');
+    writer.write_all(json.as_bytes())?;
+    writer.flush()
 }
 
 fn send_response(writer: &mut impl Write, resp: &GuestResponse) -> std::io::Result<()> {
