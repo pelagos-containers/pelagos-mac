@@ -2160,7 +2160,7 @@ fn start_event_poller() {
 fn event_poller_loop() {
     let mut prev: Vec<ContainerSnapshot> = read_container_states();
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(std::time::Duration::from_millis(250));
         let current = read_container_states();
         let events = diff_container_states(&prev, &current);
         if !events.is_empty() {
