@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, Mode};
+use crate::app::{App, ConfirmAction, Mode};
 
 // Cursor indicator appended to the palette input line.
 const CURSOR: &str = "▏";
@@ -63,8 +63,19 @@ fn render_table(f: &mut Frame, app: &App, area: Rect) {
 
             let uptime = format_uptime(&c.started_at);
 
+            // Prefix the name with a selection marker when Space-selected.
+            let name_cell = if app.selected_names.contains(&c.name) {
+                Cell::from(format!("■ {}", c.name)).style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Cell::from(c.name.as_str())
+            };
+
             Row::new(vec![
-                Cell::from(c.name.as_str()),
+                name_cell,
                 Cell::from(c.status.as_str()).style(status_style),
                 Cell::from(c.rootfs.as_str()),
                 Cell::from(uptime),
@@ -132,7 +143,8 @@ fn render_table(f: &mut Frame, app: &App, area: Rect) {
 fn render_hint_bar(f: &mut Frame, app: &App, area: Rect) {
     let text = match app.mode {
         Mode::CommandPalette => "  [Enter]run  [Esc]cancel",
-        _ => "  [q]quit  [a]all  [j/k]nav  [p]profile  [r]run  [?]help",
+        Mode::Confirm => "  confirm action: [y]yes  [any]cancel",
+        _ => "  [q]quit  [a]all  [j/k]nav  [Space]sel  [s]stop  [S]restart  [d]rm  [P]prune  [r]run  [p]profile",
     };
     let hints = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     f.render_widget(hints, area);
@@ -156,6 +168,40 @@ fn render_modeline(f: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().bg(Color::Black).fg(Color::White));
         f.render_widget(modeline, area);
         return;
+    }
+
+    // In confirm mode the modeline shows the action + target count prompt.
+    if app.mode == Mode::Confirm {
+        if let Some(action) = &app.confirm_action {
+            let count = app.confirm_targets.len();
+            let noun = if count == 1 {
+                "container"
+            } else {
+                "containers"
+            };
+            let action_color = match action {
+                ConfirmAction::Remove => Color::Red,
+                ConfirmAction::Stop => Color::Yellow,
+                ConfirmAction::Restart => Color::Cyan,
+            };
+            let spans = vec![
+                Span::styled(
+                    format!("  {} ", action.verb()),
+                    Style::default()
+                        .fg(action_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{} {}?  ", count, noun),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled("[y/N] ", Style::default().fg(Color::Yellow)),
+            ];
+            let modeline = Paragraph::new(Line::from(spans))
+                .style(Style::default().bg(Color::Black).fg(Color::White));
+            f.render_widget(modeline, area);
+            return;
+        }
     }
 
     // In command palette mode the modeline becomes an input field.

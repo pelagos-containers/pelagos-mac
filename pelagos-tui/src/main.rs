@@ -28,7 +28,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use app::{App, SubscriptionMsg};
+use app::{App, ConfirmAction, SubscriptionMsg};
 use runner::{MacOsRunner, Runner};
 
 /// Shared state that the subscription thread reads before each (re)connect.
@@ -282,6 +282,25 @@ fn run_loop(
             });
         }
 
+        // Confirmed container action: run `pelagos stop/restart/rm` for each target.
+        if let Some((action, targets)) = app.pending_action.take() {
+            let profile = app.profile.clone();
+            let status_tx = app.status_tx.clone();
+            // For Remove: pass sub_config so the background thread can bump the
+            // generation *after* all rm commands finish.  Bumping before would
+            // race the rm commands: the snapshot would arrive mid-delete and some
+            // containers would reappear.  stop/restart rely on ContainerExited /
+            // ContainerStarted subscription events and don't need a forced reconnect.
+            let sub_config_for_rm = if action == ConfirmAction::Remove {
+                app.sub_config.clone()
+            } else {
+                None
+            };
+            std::thread::spawn(move || {
+                execute_action_bg(&profile, &action, &targets, status_tx, sub_config_for_rm);
+            });
+        }
+
         // Liveness check: if the subscription has been silent for > 15s,
         // force a reconnect (handles silently-dead vsock connections).
         if app.subscription_stale() {
@@ -345,6 +364,73 @@ fn execute_run_bg(profile: &str, input: &str, status_tx: Option<mpsc::SyncSender
         Err(e) => {
             send_status(&status_tx, format!("run: {}", e));
         }
+    }
+}
+
+/// Execute a container action (`stop`, `restart`, or `rm`) for a list of targets.
+/// Each target is run as a separate `pelagos <cmd> <name>` invocation.  Errors
+/// are reported back via `status_tx`; the subscription thread delivers the
+/// ContainerExited / ContainerStarted events that update the table.
+fn execute_action_bg(
+    profile: &str,
+    action: &ConfirmAction,
+    targets: &[String],
+    status_tx: Option<mpsc::SyncSender<String>>,
+    sub_config: Option<std::sync::Arc<std::sync::Mutex<SubConfig>>>,
+) {
+    let subcmd = action.pelagos_cmd();
+    let mut errors: Vec<String> = Vec::new();
+
+    for name in targets {
+        log::info!("action: profile={} {} {}", profile, subcmd, name);
+        let result = std::process::Command::new("pelagos")
+            .arg("--profile")
+            .arg(profile)
+            .arg(subcmd)
+            .arg(name)
+            .stdin(std::process::Stdio::null())
+            .output();
+
+        match result {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                // "no container named" means it was already removed — not an error.
+                if stderr.contains("no container named") {
+                    log::debug!("{} {}: already gone", subcmd, name);
+                    continue;
+                }
+                // Strip verbose debug lines from the display message; keep only
+                // lines that look like actual errors.
+                let error_line = stderr
+                    .lines()
+                    .find(|l| l.contains("error:") || l.contains("Error"))
+                    .unwrap_or_else(|| stderr.trim())
+                    .trim()
+                    .to_string();
+                let msg = if error_line.is_empty() {
+                    format!("{} {}: exit {}", subcmd, name, out.status)
+                } else {
+                    format!("{} {}: {}", subcmd, name, error_line)
+                };
+                log::warn!("{}", msg);
+                errors.push(msg);
+            }
+            Err(e) => {
+                errors.push(format!("{} {}: {}", subcmd, name, e));
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        send_status(&status_tx, errors.join("; "));
+    }
+
+    // After all removes complete, force a fresh subscription snapshot so the
+    // UI reflects the true post-delete state.
+    if let Some(cfg) = sub_config {
+        let mut c = cfg.lock().unwrap();
+        c.generation = c.generation.wrapping_add(1);
     }
 }
 
