@@ -272,6 +272,9 @@ pub enum GuestEvent {
         name: String,
         exit_code: Option<i32>,
     },
+    /// Periodic liveness ping.  Clients that receive no message for > 15s
+    /// should reconnect.  Sent every 5s when no other events are queued.
+    Heartbeat { ts: u64 },
 }
 
 fn default_dockerfile() -> String {
@@ -2183,6 +2186,15 @@ fn diff_container_states(
                 events.push(GuestEvent::ContainerStarted {
                     container: c.clone(),
                 });
+                // Container was never seen while running (exited between polls).
+                // Immediately emit ContainerExited so the TUI can track its
+                // final state rather than leaving it stuck in ContainerStarted.
+                if c.status != "running" {
+                    events.push(GuestEvent::ContainerExited {
+                        name: c.name.clone(),
+                        exit_code: c.exit_code,
+                    });
+                }
             }
             Some(p) if p.status != "running" && c.status == "running" => {
                 events.push(GuestEvent::ContainerStarted {
@@ -2217,7 +2229,24 @@ fn diff_container_states(
 
 fn broadcast_events(events: &[GuestEvent]) {
     let mut subs = subscriber_list().lock().unwrap();
-    subs.retain(|tx| events.iter().all(|e| tx.try_send(e.clone()).is_ok()));
+    subs.retain(|tx| {
+        for e in events {
+            match tx.try_send(e.clone()) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    // Channel temporarily full: drop this event batch but keep
+                    // the subscriber alive.  It is still connected; head-of-line
+                    // blocking should resolve on the next broadcast cycle.
+                    log::warn!("subscriber channel full — dropping event batch");
+                    return true;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    return false; // subscriber gone; remove from list
+                }
+            }
+        }
+        true
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -2237,10 +2266,27 @@ fn handle_subscribe(writer: &mut FdWriter) -> std::io::Result<()> {
     };
     send_event(writer, &snapshot)?;
 
-    // Stream events until the client disconnects.
-    for event in rx.iter() {
-        if send_event(writer, &event).is_err() {
-            break;
+    // Stream events until the client disconnects.  Use recv_timeout so we can
+    // send a Heartbeat every ~5s even when no container events are occurring.
+    // Heartbeats allow TUI clients to detect a silently-dead connection.
+    let heartbeat_interval = std::time::Duration::from_secs(5);
+    loop {
+        match rx.recv_timeout(heartbeat_interval) {
+            Ok(event) => {
+                if send_event(writer, &event).is_err() {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if send_event(writer, &GuestEvent::Heartbeat { ts }).is_err() {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     Ok(())

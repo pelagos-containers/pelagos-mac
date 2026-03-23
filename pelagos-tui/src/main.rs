@@ -118,7 +118,9 @@ fn start_subscription_thread(
 
                 match run_subscription(&profile, &tx, &config, gen) {
                     Ok(()) => {
-                        backoff = Duration::from_secs(1);
+                        if !reconnect_forced {
+                            backoff = Duration::from_secs(1);
+                        }
                     }
                     Err(e) => {
                         log::debug!("subscription ended: {}", e);
@@ -139,6 +141,11 @@ fn start_subscription_thread(
 
 /// Run `pelagos subscribe` and forward each parsed event to `tx`.
 /// Returns when the subprocess exits, the pipe breaks, or the generation changes.
+///
+/// A dedicated reader thread owns the child stdout pipe and sends raw lines
+/// over an internal channel.  The main body of this function uses
+/// `recv_timeout(100ms)` so it can notice a generation change within 100ms
+/// even when no events are arriving (fixes the F3 blocking issue).
 fn run_subscription(
     profile: &str,
     tx: &mpsc::Sender<SubscriptionMsg>,
@@ -156,29 +163,69 @@ fn run_subscription(
         .spawn()?;
 
     let stdout = child.stdout.take().expect("piped stdout");
-    let reader = std::io::BufReader::new(stdout);
 
-    for line in reader.lines() {
-        // Abort early if profile/show_all changed while we were reading.
+    // Spawn a reader thread that owns the BufReader.  It sends each line (or
+    // a None to signal EOF/error) over `line_rx`.  Keeping the BufReader in a
+    // dedicated thread means the main loop below can use recv_timeout to
+    // regularly check whether the generation has changed.
+    let (line_tx, line_rx) = mpsc::sync_channel::<Option<String>>(64);
+    std::thread::Builder::new()
+        .name("sub-reader".into())
+        .spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => {
+                        let _ = line_tx.send(None); // signal EOF/error
+                        break;
+                    }
+                    Ok(_) => {
+                        if line_tx.send(Some(line.clone())).is_err() {
+                            break; // receiver gone
+                        }
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn sub-reader thread");
+
+    let check_interval = Duration::from_millis(100);
+    loop {
+        // Check for generation change before blocking on recv_timeout.
         if config.lock().unwrap().generation != gen {
             break;
         }
-        let line = line?;
-        if line.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<SubscriptionMsg>(&line) {
-            Ok(msg) => {
-                if tx.send(msg).is_err() {
-                    break; // main thread gone
+
+        match line_rx.recv_timeout(check_interval) {
+            Ok(Some(line)) => {
+                let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<SubscriptionMsg>(trimmed) {
+                    Ok(msg) => {
+                        if tx.send(msg).is_err() {
+                            break; // main thread gone
+                        }
+                    }
+                    Err(e) => {
+                        log::debug!("subscription: parse error: {} (line: {:?})", e, trimmed);
+                    }
                 }
             }
-            Err(e) => {
-                log::debug!("subscription: parse error: {} (line: {:?})", e, line);
-            }
+            Ok(None) => break,                         // EOF — subprocess exited
+            Err(mpsc::RecvTimeoutError::Timeout) => {} // re-check generation
+            Err(mpsc::RecvTimeoutError::Disconnected) => break, // reader thread gone
         }
     }
 
+    // Kill the subprocess so its next stdout write triggers SIGPIPE and the
+    // reader thread unblocks.  The child may be blocked in vsock read and
+    // never write to stdout, so it would never notice the closed pipe on its
+    // own.
+    child.kill().ok();
     let _ = child.wait();
     Ok(())
 }
@@ -235,6 +282,16 @@ fn run_loop(
             });
         }
 
+        // Liveness check: if the subscription has been silent for > 15s,
+        // force a reconnect (handles silently-dead vsock connections).
+        if app.subscription_stale() {
+            log::warn!("subscription silent for >15s — forcing reconnect");
+            if let Some(cfg) = &app.sub_config {
+                let mut c = cfg.lock().unwrap();
+                c.generation = c.generation.wrapping_add(1);
+            }
+        }
+
         if app.should_quit {
             break;
         }
@@ -270,6 +327,7 @@ fn execute_run_bg(profile: &str, input: &str, status_tx: Option<mpsc::SyncSender
         .arg(profile)
         .arg("run")
         .args(&args)
+        .stdin(std::process::Stdio::null())
         .output();
 
     match result {
