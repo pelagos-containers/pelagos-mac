@@ -343,6 +343,9 @@ enum GuestCommand {
         env: std::collections::HashMap<String, String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         labels: Vec<String>,
+        /// Port mappings HOST:CONTAINER forwarded to `pelagos run --publish`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        publish: Vec<String>,
     },
     Exec {
         image: String,
@@ -748,6 +751,21 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
+            // Start host-side port proxies for foreground runs so that
+            // localhost:HOST_PORT is forwarded to VM:HOST_PORT via the relay.
+            // These threads are tied to the CLI process lifetime — they stop
+            // when the container exits and the CLI process exits.
+            // For detached runs the daemon-level port_forwards handle host-side
+            // forwarding (configured at daemon startup via -p global flag).
+            if !cli.ports.is_empty() && !detach {
+                for spec in &cli.ports {
+                    if let Some(pf) = daemon::parse_port_spec(spec) {
+                        let hp = pf.host_port;
+                        let cp = pf.host_port; // relay to VM host_port (pelagos proxy listens there)
+                        std::thread::spawn(move || daemon::port_forward_loop(hp, cp));
+                    }
+                }
+            }
             let stream = connect_or_exit(&profile);
             process::exit(passthrough_command(
                 stream,
@@ -759,6 +777,7 @@ fn main() {
                     detach,
                     env: env_map,
                     labels,
+                    publish: cli.ports.clone(),
                 },
             ));
         }
@@ -2627,6 +2646,7 @@ mod tests {
             detach: false,
             env: std::collections::HashMap::new(),
             labels: vec![],
+            publish: vec![],
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2648,6 +2668,7 @@ mod tests {
             detach: true,
             env: std::collections::HashMap::new(),
             labels: vec![],
+            publish: vec![],
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2670,6 +2691,7 @@ mod tests {
             detach: false,
             env: std::collections::HashMap::new(),
             labels: vec![],
+            publish: vec![],
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

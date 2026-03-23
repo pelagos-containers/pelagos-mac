@@ -17,8 +17,11 @@ mod app;
 mod runner;
 mod ui;
 
+use std::collections::HashMap;
 use std::io;
-use std::sync::mpsc;
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use crossterm::{
@@ -240,12 +243,16 @@ fn run_loop(
     sub_rx: mpsc::Receiver<SubscriptionMsg>,
 ) -> anyhow::Result<()> {
     let tick = Duration::from_millis(250);
+    let mut proxy_mgr = PortProxyManager::new();
 
     loop {
         // Drain all pending subscription events (non-blocking).
         loop {
             match sub_rx.try_recv() {
-                Ok(msg) => app.apply_subscription(msg),
+                Ok(msg) => {
+                    proxy_mgr.handle(&msg);
+                    app.apply_subscription(msg);
+                }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => break,
             }
@@ -312,6 +319,7 @@ fn run_loop(
         }
 
         if app.should_quit {
+            proxy_mgr.stop_all();
             break;
         }
     }
@@ -536,6 +544,216 @@ fn send_status(tx: &Option<mpsc::SyncSender<String>>, msg: String) {
     if let Some(tx) = tx {
         let _ = tx.try_send(msg);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Port proxy manager (TUI lifecycle)
+// ---------------------------------------------------------------------------
+
+/// Manages host-side TCP proxies for container port mappings.
+///
+/// Proxies are started when a container with ports appears in the subscription
+/// stream and stopped when that container exits or is removed.  Each proxy
+/// uses a non-blocking accept loop so it can be signalled to stop without
+/// blocking the caller.
+struct PortProxyManager {
+    /// host_port → stop token
+    proxies: HashMap<u16, Arc<AtomicBool>>,
+}
+
+/// Relay proxy port (must match `pelagos_vz::nat_relay::RELAY_PROXY_PORT`).
+const RELAY_PROXY_PORT: u16 = 17900;
+
+impl PortProxyManager {
+    fn new() -> Self {
+        Self {
+            proxies: HashMap::new(),
+        }
+    }
+
+    /// Apply a subscription event: start/stop proxies to match container state.
+    fn handle(&mut self, msg: &SubscriptionMsg) {
+        match msg {
+            SubscriptionMsg::Snapshot {
+                containers,
+                vm_running,
+                ..
+            } => {
+                if !vm_running {
+                    self.stop_all();
+                    return;
+                }
+                // Collect ports of currently-running containers.
+                let mut wanted: HashMap<u16, u16> = HashMap::new();
+                for c in containers {
+                    if c.status == "running" {
+                        for spec in &c.ports {
+                            if let Some(pf) = parse_port_spec(spec) {
+                                wanted.insert(pf.0, pf.1);
+
+                            }
+                        }
+                    }
+                }
+                // Stop proxies no longer wanted.
+                let stale: Vec<u16> = self
+                    .proxies
+                    .keys()
+                    .filter(|p| !wanted.contains_key(p))
+                    .copied()
+                    .collect();
+                for port in stale {
+                    self.stop_proxy(port);
+                }
+                // Start new proxies.
+                for (host_port, container_port) in wanted {
+                    self.start(host_port, container_port);
+                }
+            }
+            SubscriptionMsg::ContainerStarted { container } => {
+                for spec in &container.ports {
+                    if let Some(pf) = parse_port_spec(spec) {
+                        self.start(pf.0, pf.1);
+                    }
+                }
+            }
+            SubscriptionMsg::ContainerExited { .. } => {
+                // The next Snapshot will clean up stale proxies.
+            }
+            SubscriptionMsg::Disconnected => {
+                self.stop_all();
+            }
+            _ => {}
+        }
+    }
+
+    fn start(&mut self, host_port: u16, container_port: u16) {
+        if self.proxies.contains_key(&host_port) {
+            return;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        self.proxies.insert(host_port, stop.clone());
+        std::thread::Builder::new()
+            .name(format!("port-proxy-{}", host_port))
+            .spawn(move || {
+                port_forward_loop_stoppable(host_port, container_port, stop);
+            })
+            .expect("spawn port proxy");
+        log::info!("port proxy started: {}→{}", host_port, container_port);
+    }
+
+    fn stop_proxy(&mut self, host_port: u16) {
+        if let Some(stop) = self.proxies.remove(&host_port) {
+            stop.store(true, Ordering::Relaxed);
+            log::info!("port proxy stopped: {}", host_port);
+        }
+    }
+
+    fn stop_all(&mut self) {
+        for (_, stop) in self.proxies.drain() {
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Parse `"host:container"` or `"port"` into `(host_port, container_port)`.
+fn parse_port_spec(spec: &str) -> Option<(u16, u16)> {
+    let parts: Vec<&str> = spec.splitn(2, ':').collect();
+    if parts.len() == 2 {
+        let h = parts[0].parse::<u16>().ok()?;
+        let c = parts[1].parse::<u16>().ok()?;
+        Some((h, c))
+    } else {
+        let p = spec.parse::<u16>().ok()?;
+        Some((p, p))
+    }
+}
+
+/// Accept TCP connections on `host_port`, relay each to `container_port` via
+/// the smoltcp NAT relay at `127.0.0.1:RELAY_PROXY_PORT`.  Returns when
+/// `stop` is set to true.
+fn port_forward_loop_stoppable(host_port: u16, container_port: u16, stop: Arc<AtomicBool>) {
+    use std::io::Write;
+
+    let listener = match TcpListener::bind(("0.0.0.0", host_port)) {
+        Ok(l) => l,
+        Err(e) => {
+            log::error!("port forward bind 0.0.0.0:{}: {}", host_port, e);
+            return;
+        }
+    };
+    listener
+        .set_nonblocking(true)
+        .expect("set_nonblocking on port forward listener");
+
+    log::info!(
+        "port forward active: 0.0.0.0:{} → VM:{} (relay :{})",
+        host_port,
+        container_port,
+        RELAY_PROXY_PORT
+    );
+
+    while !stop.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((client, _)) => {
+                // Client connections must be blocking for io::copy.
+                client.set_nonblocking(false).ok();
+                let stop2 = stop.clone();
+                std::thread::Builder::new()
+                    .name(format!("port-fwd-conn-{}", host_port))
+                    .spawn(move || {
+                        let relay_addr =
+                            std::net::SocketAddr::from(([127, 0, 0, 1], RELAY_PROXY_PORT));
+                        let mut server = match TcpStream::connect_timeout(
+                            &relay_addr,
+                            Duration::from_secs(5),
+                        ) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                log::warn!(
+                                    "port forward connect relay:{}: {}",
+                                    RELAY_PROXY_PORT,
+                                    e
+                                );
+                                return;
+                            }
+                        };
+                        if server.write_all(&container_port.to_be_bytes()).is_err() {
+                            return;
+                        }
+                        drop(stop2);
+                        tcp_proxy_tui(client, server);
+                    })
+                    .ok();
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                log::warn!("port forward accept: {}", e);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    log::info!("port forward loop exited: 0.0.0.0:{}", host_port);
+}
+
+fn tcp_proxy_tui(client: TcpStream, server: TcpStream) {
+    let mut client_read = client;
+    let mut server_read = server;
+    let mut client_write = client_read.try_clone().expect("tcp clone");
+    let mut server_write = server_read.try_clone().expect("tcp clone");
+
+    let t1 = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut client_read, &mut server_write);
+        let _ = server_write.shutdown(std::net::Shutdown::Write);
+    });
+    let t2 = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut server_read, &mut client_write);
+        let _ = client_write.shutdown(std::net::Shutdown::Write);
+    });
+    let _ = t1.join();
+    let _ = t2.join();
 }
 
 // ---------------------------------------------------------------------------

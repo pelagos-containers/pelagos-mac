@@ -29,6 +29,9 @@ pub struct Container {
     #[serde(default)]
     #[allow(dead_code)]
     pub command: Vec<String>,
+    /// Port mappings from `pelagos run -p HOST:CONTAINER` (e.g. `["8080:80"]`).
+    #[serde(default)]
+    pub ports: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
