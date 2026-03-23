@@ -326,6 +326,9 @@ fn osascript_apple_terminal(cmd: &str) -> anyhow::Result<()> {
     );
     std::process::Command::new("osascript")
         .args(["-e", &script])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()?;
     Ok(())
 }
@@ -337,6 +340,9 @@ fn osascript_iterm(cmd: &str) -> anyhow::Result<()> {
     );
     std::process::Command::new("osascript")
         .args(["-e", &script])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()?;
     Ok(())
 }
@@ -344,6 +350,9 @@ fn osascript_iterm(cmd: &str) -> anyhow::Result<()> {
 fn spawn_generic(term_bin: &str, cmd: &str) -> anyhow::Result<()> {
     std::process::Command::new(term_bin)
         .args(["-e", "sh", "-c", cmd])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()?;
     Ok(())
 }
