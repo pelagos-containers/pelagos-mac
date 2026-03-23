@@ -12,7 +12,7 @@ LIFETIME=2   # seconds each container runs
 echo "Stress test: $N containers, ${LIFETIME}s lifetime, ${INTERVAL}s interval"
 echo ""
 
-LOG=$(mktemp /tmp/stress-events-XXXXXX.log)
+LOG=$(mktemp /tmp/stress-eventsXXXXXX)
 cleanup() { kill "$SUB_PID" 2>/dev/null || true; wait "$SUB_PID" 2>/dev/null || true; rm -f "$LOG"; }
 trap cleanup EXIT
 
@@ -27,7 +27,7 @@ EXPECTED_EXITS=0
 for i in $(seq 1 "$N"); do
     NAME="stress-$i"
     echo "Starting $NAME ($i/$N)..."
-    pelagos run --detach --name "$NAME" alpine sleep "$LIFETIME" 2>/dev/null
+    pelagos run --detach --name "$NAME" public.ecr.aws/docker/library/alpine sleep "$LIFETIME" 2>/dev/null
     ((EXPECTED_STARTS++)) || true
     ((EXPECTED_EXITS++)) || true
     sleep "$INTERVAL"

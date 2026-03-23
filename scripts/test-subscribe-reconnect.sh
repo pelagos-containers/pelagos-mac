@@ -13,7 +13,7 @@ fail() { echo "FAIL: $1"; ((FAIL++)) || true; }
 
 # --- T1: Long-running container visible in snapshot ---
 echo "=== T1: Container visible in fresh snapshot ==="
-pelagos run --detach --name test-reconnect-1 alpine sleep 30
+pelagos run --detach --name test-reconnect-1 public.ecr.aws/docker/library/alpine sleep 30
 
 sleep 1
 SNAP=$(timeout 4 pelagos subscribe 2>/dev/null | head -1)
@@ -53,7 +53,7 @@ fi
 # --- T3: Heartbeat arrives within 8s on idle connection ---
 echo ""
 echo "=== T3: Heartbeat arrives within 8s ==="
-HBLOG=$(mktemp /tmp/hb-XXXXXX.log)
+HBLOG=$(mktemp /tmp/hbXXXXXX)
 pelagos subscribe > "$HBLOG" &
 HBPID=$!
 sleep 8

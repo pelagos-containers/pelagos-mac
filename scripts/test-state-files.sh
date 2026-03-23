@@ -13,7 +13,7 @@ ls -la "$STATE_DIR/" 2>/dev/null || echo "(empty or absent)"
 echo ""
 
 echo "--- [1] Starting 2s container in background ---"
-pelagos run alpine sh -c 'echo STARTED; sleep 2; echo DONE' &
+pelagos run public.ecr.aws/docker/library/alpine sh -c 'echo STARTED; sleep 2; echo DONE' &
 RUN_PID=$!
 
 # Poll every 100ms for 4 seconds
@@ -41,7 +41,7 @@ done
 echo ""
 
 echo "--- [3] Instant container (echo hello) ---"
-pelagos run alpine echo hello
+pelagos run public.ecr.aws/docker/library/alpine echo hello
 sleep 0.5
 
 echo "State files 500ms after instant container:"
@@ -52,7 +52,7 @@ done
 echo ""
 
 echo "--- [4] Instant container (true) ---"
-pelagos run alpine true
+pelagos run public.ecr.aws/docker/library/alpine true
 sleep 0.5
 
 echo "State files 500ms after 'true':"

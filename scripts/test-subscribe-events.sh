@@ -7,7 +7,7 @@ set -uo pipefail
 
 PASS=0
 FAIL=0
-LOG=$(mktemp /tmp/subscribe-events-XXXXXX.log)
+LOG=$(mktemp /tmp/subscribe-eventsXXXXXX)
 
 cleanup() {
     kill "$SUB_PID" 2>/dev/null || true
@@ -37,9 +37,9 @@ run_test() {
     echo "=== $label ==="
 
     if [ "$lifetime" = "instant" ]; then
-        pelagos run alpine echo hello
+        pelagos run public.ecr.aws/docker/library/alpine echo hello
     else
-        pelagos run alpine sh -c "sleep $lifetime"
+        pelagos run public.ecr.aws/docker/library/alpine sh -c "sleep $lifetime"
     fi
 
     sleep "$timeout_s"
