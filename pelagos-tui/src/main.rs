@@ -59,6 +59,14 @@ fn main() -> anyhow::Result<()> {
     start_subscription_thread(sub_config.clone(), sub_tx);
     app.sub_config = Some(sub_config);
 
+    // Install a panic hook that restores the terminal before printing the panic
+    // message. Without this, a panic leaves raw mode + alternate screen active.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = restore_terminal();
+        default_hook(info);
+    }));
+
     // Set up terminal.
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -68,11 +76,16 @@ fn main() -> anyhow::Result<()> {
 
     let result = run_loop(&mut terminal, &mut app, sub_rx);
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    restore_terminal()?;
 
     result
+}
+
+fn restore_terminal() -> anyhow::Result<()> {
+    disable_raw_mode()?;
+    crossterm::execute!(io::stdout(), LeaveAlternateScreen)?;
+    crossterm::execute!(io::stdout(), crossterm::cursor::Show)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
