@@ -327,7 +327,8 @@ fn run_loop(
 /// message back to the main loop via `status_tx` for display in the modeline.
 /// On success, the subscription thread will deliver a ContainerStarted event.
 fn execute_run_bg(profile: &str, input: &str, status_tx: Option<mpsc::SyncSender<String>>) {
-    let args: Vec<&str> = input.split_whitespace().collect();
+    let raw: Vec<&str> = input.split_whitespace().collect();
+    let args = normalise_run_args(&raw);
     log::info!("palette run: profile={} args={:?}", profile, args);
 
     // Interactive flags: open in a new terminal window so the TUI is unaffected.
@@ -434,6 +435,103 @@ fn execute_action_bg(
     }
 }
 
+/// Normalise palette `run` args so that flags like `--name` can appear
+/// anywhere — before or after the image — and are always moved ahead of it.
+///
+/// `pelagos run` uses `trailing_var_arg`, so once clap sees the image
+/// (first non-flag token) every subsequent token is treated as the container
+/// command, not as a pelagos flag.  Users accustomed to Docker often write
+/// `alpine --name foo sleep 30` where `--name` ends up after the image and
+/// is silently ignored.
+///
+/// The normaliser separates known pelagos flags from the image+command and
+/// reconstructs the slice as `[flags…] <image> [cmd…]`.
+fn normalise_run_args<'a>(tokens: &[&'a str]) -> Vec<&'a str> {
+    // Flags that consume the next token as their value.
+    const VALUE_FLAGS: &[&str] = &[
+        "--name",
+        "--network",
+        "--net",
+        "--hostname",
+        "--env",
+        "-e",
+        "--volume",
+        "-v",
+        "--mount",
+        "--publish",
+        "-p",
+        "--memory",
+        "--cpus",
+        "--user",
+        "-u",
+        "--workdir",
+        "-w",
+        "--entrypoint",
+        "--cap-add",
+        "--cap-drop",
+        "--label",
+        "-l",
+        "--dns",
+        "--dns-search",
+        "--dns-option",
+    ];
+    // Boolean flags (no value token).
+    const BOOL_FLAGS: &[&str] = &[
+        "--detach",
+        "-d",
+        "--rm",
+        "--tty",
+        "-t",
+        "--interactive",
+        "-i",
+        "--privileged",
+    ];
+
+    let mut flags: Vec<&'a str> = Vec::new();
+    let mut image: Option<&'a str> = None;
+    let mut cmd: Vec<&'a str> = Vec::new();
+
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i];
+
+        if BOOL_FLAGS.contains(&tok) {
+            flags.push(tok);
+            i += 1;
+        } else if VALUE_FLAGS.contains(&tok) {
+            flags.push(tok);
+            if let Some(val) = tokens.get(i + 1) {
+                flags.push(val);
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else if tok.starts_with('-') {
+            // Unknown flag — pass through as-is (may be a value flag whose
+            // value is embedded, e.g. `--env=FOO=bar`).
+            flags.push(tok);
+            i += 1;
+        } else if image.is_none() {
+            // First non-flag token is the image; keep scanning for flags
+            // that may follow (e.g. `alpine --name foo sleep 30`).
+            image = Some(tok);
+            i += 1;
+        } else {
+            // Non-flag token after the image: this is where the container
+            // command starts; everything from here goes to cmd verbatim.
+            cmd.extend_from_slice(&tokens[i..]);
+            break;
+        }
+    }
+
+    let mut result = flags;
+    if let Some(img) = image {
+        result.push(img);
+    }
+    result.extend(cmd);
+    result
+}
+
 fn send_status(tx: &Option<mpsc::SyncSender<String>>, msg: String) {
     if let Some(tx) = tx {
         let _ = tx.try_send(msg);
@@ -526,4 +624,52 @@ fn resolve_profile() -> String {
         }
     }
     std::env::var("PELAGOS_PROFILE").unwrap_or_else(|_| "default".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn norm(input: &str) -> Vec<&str> {
+        let tokens: Vec<&str> = input.split_whitespace().collect();
+        normalise_run_args(&tokens)
+    }
+
+    #[test]
+    fn name_before_image_unchanged() {
+        assert_eq!(
+            norm("--name foo alpine sleep 30"),
+            vec!["--name", "foo", "alpine", "sleep", "30"]
+        );
+    }
+
+    #[test]
+    fn name_after_image_moved_to_front() {
+        assert_eq!(
+            norm("alpine --name foo sleep 30"),
+            vec!["--name", "foo", "alpine", "sleep", "30"]
+        );
+    }
+
+    #[test]
+    fn detach_flag_hoisted() {
+        assert_eq!(
+            norm("alpine -d --name foo sleep 30"),
+            vec!["-d", "--name", "foo", "alpine", "sleep", "30"]
+        );
+    }
+
+    #[test]
+    fn no_flags_passthrough() {
+        assert_eq!(norm("alpine sleep 30"), vec!["alpine", "sleep", "30"]);
+    }
+
+    #[test]
+    fn empty_input() {
+        assert_eq!(norm(""), Vec::<&str>::new());
+    }
 }

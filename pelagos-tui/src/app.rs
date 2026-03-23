@@ -82,6 +82,8 @@ pub enum Mode {
     CommandPalette,
     /// Waiting for y/N confirmation before executing an action on containers.
     Confirm,
+    /// Waiting for y/N/q confirmation before quitting.
+    ConfirmQuit,
 }
 
 // ---------------------------------------------------------------------------
@@ -235,12 +237,13 @@ impl App {
             Mode::ProfilePicker => self.on_key_profile_picker(key),
             Mode::CommandPalette => self.on_key_palette(key),
             Mode::Confirm => self.on_key_confirm(key),
+            Mode::ConfirmQuit => self.on_key_confirm_quit(key),
         }
     }
 
     fn on_key_normal(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.mode = Mode::ConfirmQuit,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
             }
@@ -390,6 +393,17 @@ impl App {
                 // Any key other than 'y' cancels.
                 self.confirm_action = None;
                 self.confirm_targets.clear();
+                self.mode = Mode::Normal;
+            }
+        }
+    }
+
+    fn on_key_confirm_quit(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('q') => {
+                self.should_quit = true;
+            }
+            _ => {
                 self.mode = Mode::Normal;
             }
         }

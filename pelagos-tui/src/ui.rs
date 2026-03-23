@@ -144,6 +144,7 @@ fn render_hint_bar(f: &mut Frame, app: &App, area: Rect) {
     let text = match app.mode {
         Mode::CommandPalette => "  [Enter]run  [Esc]cancel",
         Mode::Confirm => "  confirm action: [y]yes  [any]cancel",
+        Mode::ConfirmQuit => "  quit pelagos-tui: [y/q]yes  [any]cancel",
         _ => "  [q]quit  [a]all  [j/k]nav  [Space]sel  [s]stop  [S]restart  [d]rm  [P]prune  [r]run  [p]profile",
     };
     let hints = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
@@ -163,6 +164,23 @@ fn render_modeline(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
             Span::styled(msg.as_str(), Style::default().fg(Color::Yellow)),
+        ];
+        let modeline = Paragraph::new(Line::from(spans))
+            .style(Style::default().bg(Color::Black).fg(Color::White));
+        f.render_widget(modeline, area);
+        return;
+    }
+
+    // Quit confirmation prompt.
+    if app.mode == Mode::ConfirmQuit {
+        let spans = vec![
+            Span::styled(
+                "  quit pelagos-tui?  ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("[y/q/N] ", Style::default().fg(Color::Yellow)),
         ];
         let modeline = Paragraph::new(Line::from(spans))
             .style(Style::default().bg(Color::Black).fg(Color::White));
