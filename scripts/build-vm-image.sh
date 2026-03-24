@@ -397,8 +397,8 @@ fi
 
 # Detect which kernel version string to embed in the initramfs module tree.
 # If the Ubuntu 6.8 modules are available (produced by build-build-image.sh),
-# use their version and source vsock/overlay from there; all other virtio
-# drivers are built-in (=y) in Ubuntu 6.8 HWE and need no modules.
+# use their version and source vsock/overlay/bridge/nftables from there; all
+# virtio drivers are =y (built-in) in Ubuntu 6.8 HWE and need no modules.
 # On first-time setup (before build-build-image.sh), fall back to Alpine lts.
 USE_UBUNTU_MODULES=0
 if [[ -f "$UBUNTU_VMLINUZ" && -d "$UBUNTU_MODULES" ]]; then
@@ -460,12 +460,23 @@ if [ ! -f "$INITRAMFS_OUT" ] \
 
     if [[ "$USE_UBUNTU_MODULES" -eq 1 ]]; then
         # Ubuntu 6.8 HWE: virtio_net, virtio_blk, virtio_pci, ext4, tun, virtio_console
-        # are all CONFIG_xxx=y (built-in).  Only vsock and overlayfs are =m.
-        # Stage exactly those two from the Ubuntu module tree extracted by
+        # are all CONFIG_xxx=y (built-in).  Modules that are =m and required:
+        #   vsock        — pelagos-guest comms
+        #   overlayfs    — container layer stacking
+        #   bridge+deps  — pelagos bridge networking (NetworkMode::Bridge / -p)
+        #   nftables     — port-forward DNAT rules
+        # Stage all of the above from the Ubuntu module tree extracted by
         # build-build-image.sh; no Alpine modules needed.
-        mkdir -p \
-            "$INITRD_TMP/lib/modules/$KVER/kernel/net/vmw_vsock" \
-            "$INITRD_TMP/lib/modules/$KVER/kernel/fs/overlayfs"
+        for rel_dir in \
+            net/vmw_vsock \
+            fs/overlayfs \
+            net/llc \
+            net/802 \
+            net/bridge \
+            net/netfilter
+        do
+            mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/$rel_dir"
+        done
         for ko in vsock.ko vmw_vsock_virtio_transport_common.ko vmw_vsock_virtio_transport.ko; do
             src="$UBUNTU_MODULES/net/vmw_vsock/$ko"
             if [ -f "$src" ]; then
@@ -482,7 +493,27 @@ if [ ! -f "$INITRAMFS_OUT" ] \
         else
             echo "  WARNING: overlay.ko not found in $UBUNTU_MODULES" >&2
         fi
-        # Use the Ubuntu modules.dep so modprobe resolves vsock dependencies correctly.
+        # bridge + nftables modules (optional — warn but don't abort if missing,
+        # since they are only absent on old ubuntu-modules trees built before #172)
+        for rel_ko in \
+            net/llc/llc.ko \
+            net/802/stp.ko \
+            net/bridge/bridge.ko \
+            net/netfilter/nfnetlink.ko \
+            net/netfilter/nf_tables.ko \
+            net/netfilter/nf_conntrack.ko \
+            net/netfilter/nf_nat.ko
+        do
+            src="$UBUNTU_MODULES/$rel_ko"
+            dst="$INITRD_TMP/lib/modules/$KVER/kernel/$rel_ko"
+            if [ -f "$src" ]; then
+                cp "$src" "$dst"
+                echo "  staged (Ubuntu) $(basename $rel_ko)"
+            else
+                echo "  INFO: $(basename $rel_ko) not in ubuntu-modules (rebuild with build-build-image.sh to enable bridge/nftables)" >&2
+            fi
+        done
+        # Use the Ubuntu modules.dep so modprobe resolves all dependency chains.
         cp "$UBUNTU_MODULES/modules.dep"     "$INITRD_TMP/lib/modules/$KVER/modules.dep"     2>/dev/null || true
         cp "$UBUNTU_MODULES/modules.dep.bin" "$INITRD_TMP/lib/modules/$KVER/modules.dep.bin" 2>/dev/null || true
         echo "  updated modules.dep from Ubuntu modules"
@@ -707,6 +738,16 @@ if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
     modprobe tun                 2>/dev/null || true
     modprobe jbd2                2>/dev/null || true
     modprobe ext4                2>/dev/null || true
+    # Bridge networking + nftables for pelagos container networking (-p / bridge mode).
+    # These are =m in Ubuntu 6.8 HWE; loaded here so pelagos run works immediately
+    # after boot.  Silently skipped on old images that predate #172.
+    modprobe llc                 2>/dev/null || true
+    modprobe stp                 2>/dev/null || true
+    modprobe bridge              2>/dev/null || true
+    modprobe nfnetlink           2>/dev/null || true
+    modprobe nf_conntrack        2>/dev/null || true
+    modprobe nf_nat              2>/dev/null || true
+    modprobe nf_tables           2>/dev/null || true
     # Create /dev/net/tun device node.  The tun kernel module registers
     # the device (char major 10, minor 200) but does not create the node
     # automatically without udevd/mdev.  pasta requires /dev/net/tun to

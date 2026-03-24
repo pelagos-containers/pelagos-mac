@@ -377,13 +377,24 @@ if [ -n "\$KVER" ]; then
     echo "  kernel: vmlinuz-\$KVER (\$(du -sh /var/lib/pelagos/volumes/ubuntu-vmlinuz | cut -f1) decompressed)"
     echo "  initrd: initrd.img-\$KVER (\$(du -sh /var/lib/pelagos/volumes/ubuntu-initrd.img | cut -f1))"
 
-    # Extract the two kernel modules that are =m in Ubuntu 6.8 HWE and are
-    # required by the container VM initramfs: vsock (pelagos-guest comms) and
-    # overlayfs (container layer stacking).  All other virtio drivers are =y
-    # (built-in) so no modules are needed for them.
+    # Extract kernel modules that are =m in Ubuntu 6.8 HWE and are required
+    # by the container VM initramfs.  All virtio drivers are =y (built-in).
+    #
+    # Modules extracted:
+    #   vsock          — pelagos-guest ↔ host comms
+    #   overlayfs      — container layer stacking
+    #   bridge + deps  — pelagos bridge networking (NetworkMode::Bridge, -p flag)
+    #   nftables       — port-forward DNAT rules (pelagos network.rs)
     MODDIR="\$MNT/lib/modules/\$KVER/kernel"
     VOLS=/var/lib/pelagos/volumes
-    mkdir -p "\$VOLS/ubuntu-modules/net/vmw_vsock" "\$VOLS/ubuntu-modules/fs/overlayfs"
+    mkdir -p \
+        "\$VOLS/ubuntu-modules/net/vmw_vsock" \
+        "\$VOLS/ubuntu-modules/fs/overlayfs" \
+        "\$VOLS/ubuntu-modules/net/bridge" \
+        "\$VOLS/ubuntu-modules/net/802" \
+        "\$VOLS/ubuntu-modules/net/llc" \
+        "\$VOLS/ubuntu-modules/net/netfilter"
+    # vsock
     for ko in \
         "\$MODDIR/net/vmw_vsock/vsock.ko" \
         "\$MODDIR/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko" \
@@ -392,10 +403,32 @@ if [ -n "\$KVER" ]; then
         [ -f "\$ko" ] && cp "\$ko" "\$VOLS/ubuntu-modules/net/vmw_vsock/" \
             && echo "  module: \$(basename \$ko)"
     done
+    # overlayfs
     [ -f "\$MODDIR/fs/overlayfs/overlay.ko" ] \
         && cp "\$MODDIR/fs/overlayfs/overlay.ko" "\$VOLS/ubuntu-modules/fs/overlayfs/" \
         && echo "  module: overlay.ko"
-    # Also copy modules.dep so modprobe can resolve the vsock dependency chain.
+    # bridge + dependency chain (llc → stp → bridge)
+    for ko in \
+        "\$MODDIR/net/llc/llc.ko" \
+        "\$MODDIR/net/802/stp.ko" \
+        "\$MODDIR/net/bridge/bridge.ko"
+    do
+        dir="\$VOLS/ubuntu-modules/\$(dirname \${ko#\$MODDIR/})"
+        mkdir -p "\$dir"
+        [ -f "\$ko" ] && cp "\$ko" "\$dir/" && echo "  module: \$(basename \$ko)"
+    done
+    # nftables / netfilter (required for port-forward DNAT rules)
+    for ko in \
+        "\$MODDIR/net/netfilter/nfnetlink.ko" \
+        "\$MODDIR/net/netfilter/nf_tables.ko" \
+        "\$MODDIR/net/netfilter/nf_conntrack.ko" \
+        "\$MODDIR/net/netfilter/nf_nat.ko"
+    do
+        dir="\$VOLS/ubuntu-modules/\$(dirname \${ko#\$MODDIR/})"
+        mkdir -p "\$dir"
+        [ -f "\$ko" ] && cp "\$ko" "\$dir/" && echo "  module: \$(basename \$ko)"
+    done
+    # modules.dep so modprobe can resolve the full dependency chain.
     cp "\$MNT/lib/modules/\$KVER/modules.dep" "\$VOLS/ubuntu-modules/" 2>/dev/null || true
     cp "\$MNT/lib/modules/\$KVER/modules.dep.bin" "\$VOLS/ubuntu-modules/" 2>/dev/null || true
     # Write kver.txt so build-vm-image.sh can detect the kernel version without
