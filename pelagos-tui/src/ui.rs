@@ -48,6 +48,7 @@ fn render_table(f: &mut Frame, app: &App, area: Rect) {
         Cell::from("NAME").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("STATUS").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("IMAGE").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("PORTS").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("UPTIME").style(Style::default().add_modifier(Modifier::BOLD)),
     ])
     .height(1);
@@ -74,10 +75,19 @@ fn render_table(f: &mut Frame, app: &App, area: Rect) {
                 Cell::from(c.name.as_str())
             };
 
+            // Format ports as "8080→80, 443→443".
+            let ports_str = c
+                .ports
+                .iter()
+                .map(|s| s.replacen(':', "→", 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+
             Row::new(vec![
                 name_cell,
                 Cell::from(c.status.as_str()).style(status_style),
                 Cell::from(c.rootfs.as_str()),
+                Cell::from(ports_str).style(Style::default().fg(Color::Cyan)),
                 Cell::from(uptime),
             ])
             .height(1)
@@ -99,10 +109,11 @@ fn render_table(f: &mut Frame, app: &App, area: Rect) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(25), // NAME
-            Constraint::Percentage(12), // STATUS
-            Constraint::Percentage(43), // IMAGE
-            Constraint::Percentage(20), // UPTIME
+            Constraint::Percentage(23), // NAME
+            Constraint::Percentage(10), // STATUS
+            Constraint::Percentage(37), // IMAGE
+            Constraint::Percentage(15), // PORTS
+            Constraint::Percentage(15), // UPTIME
         ],
     )
     .header(header)

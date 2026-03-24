@@ -1,6 +1,6 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-03-22 — **v0.4.0 released** (SHA f6433d3); build VM full test suite verified*
+*Last updated: 2026-03-24 — port forwarding e2e verified; ip_forward fix shipped; pelagos bugs documented*
 
 ---
 
@@ -22,6 +22,7 @@ in ~16s; full console replay works.
 | `pelagos exec` (piped + PTY) | ✅ | PR #38 |
 | `pelagos ps / logs / stop / rm` | ✅ | PR #37 |
 | `pelagos run --detach --name` | ✅ | PR #37 |
+| `pelagos run -p HOST:CONTAINER` (port forwarding) | ✅ | PR #146 + this session |
 | `pelagos vm shell` | ✅ | PR #45 |
 | Busybox applet symlinks in VM | ✅ | PR #47 |
 | Persistent OCI image cache (`/dev/vda` ext4) | ✅ | PR #50/#107 |
@@ -96,8 +97,17 @@ to any client connecting at any time. `pelagos vm console [--profile build]` wor
 
 - **Epic #135 — pelagos-ui** — Tauri + Svelte macOS management GUI (new). M1: container list. Blocked on #98 (JSON ps output).
 - **Release CI workflow (#118)** — self-hosted runner + `release.yml` to build, sign, and publish binaries on tag push.
-- **Port forwarding** — container port → VM port → macOS `localhost`. Currently
-  workaround: direct VM IP is routable from macOS host via smoltcp NAT.
+- **Port forwarding** ✅ — `pelagos run -p 8080:80 nginx:alpine` + `curl http://localhost:8080/`
+  works end-to-end via smoltcp relay + DNAT. Two **pelagos bugs** remain that prevent it
+  from working cleanly out of the box without manual intervention:
+  - **pelagos#bug: ip_forward not set** — `enable_port_forwards` installs DNAT rules but
+    does not enable `ip_forward`. DNAT'd packets can't traverse eth0→pelagos0 bridge
+    without it. Workaround in pelagos-mac: init script sets `ip_forward=1` unconditionally.
+  - **pelagos#bug: stale DNAT rules accumulate** — `enable_port_forwards` evicts stale
+    entries by checking if `/run/netns/{name}` exists, but pelagos doesn't remove the
+    netns file when a container dies uncleanly. Result: stale IPs from prior runs stay in
+    PREROUTING and match before the current container's rule. Fix needed in pelagos:
+    eviction should check if the container watcher process is alive, not just the netns file.
 - **`docker volume inspect`** — `create/ls/rm` works; `inspect` not implemented.
 - **Dynamic virtiofs shares** (#74) — current per-path shares require knowing all
   paths at VM start time.
