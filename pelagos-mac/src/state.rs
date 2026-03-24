@@ -201,27 +201,6 @@ impl StateDir {
         }
     }
 
-    /// Write the current daemon's port forward configuration as JSON.
-    pub fn write_ports(&self, ports: &[crate::daemon::PortForward]) -> io::Result<()> {
-        let json = serde_json::to_string(ports)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let tmp = self.ports_file.with_extension("ports.tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, &self.ports_file)
-    }
-
-    /// Read the running daemon's port forward configuration.  Returns an empty
-    /// Vec if the file does not exist.
-    pub fn read_ports(&self) -> io::Result<Vec<crate::daemon::PortForward>> {
-        match std::fs::read_to_string(&self.ports_file) {
-            Ok(s) => {
-                serde_json::from_str(&s).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(e),
-        }
-    }
-
     /// Remove PID, socket, console socket, mounts, ports, and extra_disks files. Best-effort.
     pub fn clear(&self) {
         let _ = std::fs::remove_file(&self.pid_file);
@@ -358,31 +337,6 @@ mod tests {
         let s = temp_state();
         std::fs::write(&s.pid_file, b"not-a-pid").expect("write garbage");
         assert_eq!(s.running_pid(), None);
-    }
-
-    #[test]
-    fn write_and_read_ports() {
-        let s = temp_state();
-        let ports = vec![
-            crate::daemon::PortForward {
-                host_port: 8080,
-                container_port: 80,
-            },
-            crate::daemon::PortForward {
-                host_port: 3000,
-                container_port: 3000,
-            },
-        ];
-        s.write_ports(&ports).expect("write_ports");
-        let read_back = s.read_ports().expect("read_ports");
-        assert_eq!(ports, read_back);
-    }
-
-    #[test]
-    fn read_ports_absent_file() {
-        let s = temp_state();
-        let ports = s.read_ports().expect("read_ports on missing file");
-        assert!(ports.is_empty());
     }
 
     /// Verify that the field paths are computed relative to the supplied base.

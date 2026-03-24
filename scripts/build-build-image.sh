@@ -36,7 +36,7 @@
 #   bash scripts/vm-restart.sh --profile <name>
 #   pelagos --profile <name> vm ssh
 
-set -uo pipefail
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
@@ -185,15 +185,18 @@ echo "ok"
 echo ""
 
 # ---------------------------------------------------------------------------
-# Write the provisioning script to the volumes dir (virtiofs, small file only).
-# The script itself is tiny; only the build.img I/O avoids virtiofs.
+# Write the provisioning script to a local temp file.
+# It is executed inside the Alpine VM via SSH stdin, avoiding any virtiofs
+# dependency (virtiofs.ko is not loaded until after the first successful
+# provisioning run extracts it from the Ubuntu modules package).
 # ---------------------------------------------------------------------------
 
 PUB_KEY_CONTENT="$(cat "${SSH_KEY_FILE}.pub")"
 
-mkdir -p "$ALPINE_VOLUMES_DIR"
+PROVISION_SCRIPT="$(mktemp /tmp/provision-build.XXXXXX.sh)"
+trap 'rm -f "$PROVISION_SCRIPT"' EXIT
 
-cat > "$ALPINE_VOLUMES_DIR/provision-build.sh" << OUTER_EOF
+cat > "$PROVISION_SCRIPT" << OUTER_EOF
 #!/bin/sh
 # Provisioning script — runs inside the Alpine VM as root.
 # build.img is presented as /dev/vdb (virtio-blk); no loop device required.
@@ -262,7 +265,18 @@ chroot "\$MNT" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-instal
     build-essential git curl wget ca-certificates \
     iproute2 nftables openssh-server sudo \
     systemd systemd-sysv systemd-timesyncd \
-    pkg-config libssl-dev
+    pkg-config libssl-dev \
+    initramfs-tools \
+    linux-image-6.8.0-106-generic linux-modules-6.8.0-106-generic
+
+# Explicitly generate the initrd — apt's post-install hook is blocked by the
+# flash-kernel removal above, so initramfs-tools never runs automatically.
+# The bind-mounts (proc/sys/dev) are already in place, so this works cleanly.
+KVER_PKG=\$(chroot "\$MNT" dpkg-query -W -f '\${Version}\n' linux-image-6.8.0-106-generic 2>/dev/null | head -1)
+if [ -n "\$KVER_PKG" ] && [ ! -f "\$MNT/boot/initrd.img-6.8.0-106-generic" ]; then
+    echo "[provision] generating initrd for 6.8.0-106-generic"
+    chroot "\$MNT" update-initramfs -c -k 6.8.0-106-generic
+fi
 
 # ---- networking: systemd-networkd with static IP ----
 
@@ -372,36 +386,107 @@ ln -sf /lib/systemd/system/systemd-timesyncd.service \
 echo "[provision] extracting Ubuntu kernel, initrd, and modules for host AVF boot"
 KVER=\$(ls "\$MNT/boot/vmlinuz-"* 2>/dev/null | sort -V | tail -1 | sed 's|.*/vmlinuz-||')
 if [ -n "\$KVER" ]; then
-    zcat "\$MNT/boot/vmlinuz-\$KVER" > /var/lib/pelagos/volumes/ubuntu-vmlinuz
-    cp "\$MNT/boot/initrd.img-\$KVER" /var/lib/pelagos/volumes/ubuntu-initrd.img
-    echo "  kernel: vmlinuz-\$KVER (\$(du -sh /var/lib/pelagos/volumes/ubuntu-vmlinuz | cut -f1) decompressed)"
-    echo "  initrd: initrd.img-\$KVER (\$(du -sh /var/lib/pelagos/volumes/ubuntu-initrd.img | cut -f1))"
+    # Write outputs to a local Alpine path — NOT the virtiofs volumes dir.
+    # virtiofs.ko is not yet loaded on a fresh provisioning run; the outer
+    # script pulls these files back via SSH after this script completes.
+    OUTDIR=/root/build-outputs
+    mkdir -p "\$OUTDIR"
 
-    # Extract the two kernel modules that are =m in Ubuntu 6.8 HWE and are
-    # required by the container VM initramfs: vsock (pelagos-guest comms) and
-    # overlayfs (container layer stacking).  All other virtio drivers are =y
-    # (built-in) so no modules are needed for them.
+    zcat "\$MNT/boot/vmlinuz-\$KVER" > "\$OUTDIR/ubuntu-vmlinuz"
+    cp "\$MNT/boot/initrd.img-\$KVER" "\$OUTDIR/ubuntu-initrd.img"
+    echo "  kernel: vmlinuz-\$KVER (\$(du -sh \$OUTDIR/ubuntu-vmlinuz | cut -f1) decompressed)"
+    echo "  initrd: initrd.img-\$KVER (\$(du -sh \$OUTDIR/ubuntu-initrd.img | cut -f1))"
+
+    # Extract kernel modules that are =m in Ubuntu 6.8 HWE and are required
+    # by the container VM initramfs.  All core virtio drivers are =y (built-in).
+    #
+    # Modules extracted:
+    #   vsock          — pelagos-guest ↔ host comms
+    #   overlayfs      — container layer stacking
+    #   virtiofs       — AVF host directory sharing (needed for vm volumes)
+    #   bridge + deps  — pelagos bridge networking (NetworkMode::Bridge, -p flag)
+    #   nftables       — port-forward DNAT rules (pelagos network.rs)
     MODDIR="\$MNT/lib/modules/\$KVER/kernel"
-    VOLS=/var/lib/pelagos/volumes
-    mkdir -p "\$VOLS/ubuntu-modules/net/vmw_vsock" "\$VOLS/ubuntu-modules/fs/overlayfs"
+    mkdir -p \
+        "\$OUTDIR/ubuntu-modules/net/vmw_vsock" \
+        "\$OUTDIR/ubuntu-modules/fs/overlayfs" \
+        "\$OUTDIR/ubuntu-modules/fs/fuse" \
+        "\$OUTDIR/ubuntu-modules/net/bridge" \
+        "\$OUTDIR/ubuntu-modules/net/802" \
+        "\$OUTDIR/ubuntu-modules/net/llc" \
+        "\$OUTDIR/ubuntu-modules/net/netfilter"
+    # vsock
     for ko in \
         "\$MODDIR/net/vmw_vsock/vsock.ko" \
         "\$MODDIR/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko" \
         "\$MODDIR/net/vmw_vsock/vmw_vsock_virtio_transport.ko"
     do
-        [ -f "\$ko" ] && cp "\$ko" "\$VOLS/ubuntu-modules/net/vmw_vsock/" \
+        [ -f "\$ko" ] && cp "\$ko" "\$OUTDIR/ubuntu-modules/net/vmw_vsock/" \
             && echo "  module: \$(basename \$ko)"
     done
+    # overlayfs
     [ -f "\$MODDIR/fs/overlayfs/overlay.ko" ] \
-        && cp "\$MODDIR/fs/overlayfs/overlay.ko" "\$VOLS/ubuntu-modules/fs/overlayfs/" \
+        && cp "\$MODDIR/fs/overlayfs/overlay.ko" "\$OUTDIR/ubuntu-modules/fs/overlayfs/" \
         && echo "  module: overlay.ko"
-    # Also copy modules.dep so modprobe can resolve the vsock dependency chain.
-    cp "\$MNT/lib/modules/\$KVER/modules.dep" "\$VOLS/ubuntu-modules/" 2>/dev/null || true
-    cp "\$MNT/lib/modules/\$KVER/modules.dep.bin" "\$VOLS/ubuntu-modules/" 2>/dev/null || true
+    # virtiofs (AVF host directory sharing — fs/fuse/virtiofs.ko in Ubuntu 6.8)
+    [ -f "\$MODDIR/fs/fuse/virtiofs.ko" ] \
+        && cp "\$MODDIR/fs/fuse/virtiofs.ko" "\$OUTDIR/ubuntu-modules/fs/fuse/" \
+        && echo "  module: virtiofs.ko"
+    # bridge + dependency chain (llc → stp → bridge)
+    for ko in \
+        "\$MODDIR/net/llc/llc.ko" \
+        "\$MODDIR/net/802/stp.ko" \
+        "\$MODDIR/net/bridge/bridge.ko"
+    do
+        dir="\$OUTDIR/ubuntu-modules/\$(dirname \${ko#\$MODDIR/})"
+        mkdir -p "\$dir"
+        [ -f "\$ko" ] && cp "\$ko" "\$dir/" && echo "  module: \$(basename \$ko)"
+    done
+    # nftables / netfilter (required for port-forward DNAT rules)
+    for ko in \
+        "\$MODDIR/net/netfilter/nfnetlink.ko" \
+        "\$MODDIR/net/netfilter/nf_tables.ko" \
+        "\$MODDIR/net/netfilter/nf_conntrack.ko" \
+        "\$MODDIR/net/netfilter/nf_nat.ko" \
+        "\$MODDIR/net/netfilter/nft_nat.ko" \
+        "\$MODDIR/net/netfilter/nft_chain_nat.ko"
+    do
+        dir="\$OUTDIR/ubuntu-modules/\$(dirname \${ko#\$MODDIR/})"
+        mkdir -p "\$dir"
+        [ -f "\$ko" ] && cp "\$ko" "\$dir/" && echo "  module: \$(basename \$ko)"
+    done
+    # veth — virtual ethernet pairs for container bridge networking
+    for ko in \
+        "\$MODDIR/drivers/net/veth.ko"
+    do
+        dir="\$OUTDIR/ubuntu-modules/\$(dirname \${ko#\$MODDIR/})"
+        mkdir -p "\$dir"
+        [ -f "\$ko" ] && cp "\$ko" "\$dir/" && echo "  module: \$(basename \$ko)"
+    done
+    # libcrc32c — required by nf_conntrack (dependency for nf_nat DNAT rules)
+    for ko in \
+        "\$MODDIR/lib/libcrc32c.ko"
+    do
+        dir="\$OUTDIR/ubuntu-modules/\$(dirname \${ko#\$MODDIR/})"
+        mkdir -p "\$dir"
+        [ -f "\$ko" ] && cp "\$ko" "\$dir/" && echo "  module: \$(basename \$ko)"
+    done
+    # nf_defrag_ipv4/ipv6 — required by nf_conntrack (missing these causes symbol errors)
+    for ko in \
+        "\$MODDIR/net/ipv4/netfilter/nf_defrag_ipv4.ko" \
+        "\$MODDIR/net/ipv6/netfilter/nf_defrag_ipv6.ko"
+    do
+        dir="\$OUTDIR/ubuntu-modules/\$(dirname \${ko#\$MODDIR/})"
+        mkdir -p "\$dir"
+        [ -f "\$ko" ] && cp "\$ko" "\$dir/" && echo "  module: \$(basename \$ko)"
+    done
+    # modules.dep so modprobe can resolve the full dependency chain.
+    cp "\$MNT/lib/modules/\$KVER/modules.dep" "\$OUTDIR/ubuntu-modules/" 2>/dev/null || true
+    cp "\$MNT/lib/modules/\$KVER/modules.dep.bin" "\$OUTDIR/ubuntu-modules/" 2>/dev/null || true
     # Write kver.txt so build-vm-image.sh can detect the kernel version without
     # parsing modules.dep (which uses relative paths, not absolute paths).
-    echo "\$KVER" > "\$VOLS/ubuntu-modules/kver.txt"
-    echo "  stored Ubuntu modules in volumes/ubuntu-modules/ (kver: \$KVER)"
+    echo "\$KVER" > "\$OUTDIR/ubuntu-modules/kver.txt"
+    echo "  stored Ubuntu modules in /root/build-outputs/ubuntu-modules/ (kver: \$KVER)"
 else
     echo "WARNING: no vmlinuz found in \$MNT/boot — cannot extract kernel" >&2
 fi
@@ -420,12 +505,13 @@ rmdir  "\$MNT" 2>/dev/null || true
 echo "[provision] done"
 OUTER_EOF
 
-chmod +x "$ALPINE_VOLUMES_DIR/provision-build.sh"
-echo "--- wrote provisioning script ---"
+chmod +x "$PROVISION_SCRIPT"
+echo "--- wrote provisioning script (local, stdin delivery) ---"
 echo ""
 
 # ---------------------------------------------------------------------------
-# Execute the provisioning script inside the Alpine VM.
+# Execute the provisioning script inside the Alpine VM via SSH stdin.
+# This avoids any virtiofs dependency: the script is piped directly to sh.
 # ---------------------------------------------------------------------------
 
 echo "--- running provisioning script in Alpine VM ---"
@@ -433,13 +519,38 @@ echo "    waiting for VM SSH to become available (~30s cold start)..."
 echo "    once connected, [provision] log lines will stream in real-time"
 echo ""
 
-pelagos_provision vm ssh -- sh /var/lib/pelagos/volumes/provision-build.sh
+pelagos_provision vm ssh -- "sh -s" < "$PROVISION_SCRIPT"
 
 echo ""
 echo "--- provisioning complete ---"
 
-# Clean up the provisioning script from the volumes dir.
-rm -f "$ALPINE_VOLUMES_DIR/provision-build.sh"
+# ---------------------------------------------------------------------------
+# Pull build outputs back to the host via SSH (no virtiofs needed).
+# The provisioning script wrote them to /root/build-outputs/ on the Alpine disk.
+# ---------------------------------------------------------------------------
+
+echo "--- pulling build outputs from Alpine VM via SSH ---"
+
+UBUNTU_VMLINUZ="$REPO_ROOT/out/ubuntu-vmlinuz"
+UBUNTU_INITRD="$REPO_ROOT/out/ubuntu-initrd.img"
+UBUNTU_MODULES_DST="$REPO_ROOT/out/ubuntu-modules"
+
+if pelagos_provision vm ssh -- "test -f /root/build-outputs/ubuntu-vmlinuz" 2>/dev/null; then
+    echo "  pulling ubuntu-vmlinuz..."
+    pelagos_provision vm ssh -- "cat /root/build-outputs/ubuntu-vmlinuz" > "$UBUNTU_VMLINUZ"
+    echo "  pulling ubuntu-initrd.img..."
+    pelagos_provision vm ssh -- "cat /root/build-outputs/ubuntu-initrd.img" > "$UBUNTU_INITRD"
+    echo "  pulling ubuntu-modules/ (tar)..."
+    rm -rf "$UBUNTU_MODULES_DST"
+    mkdir -p "$UBUNTU_MODULES_DST"
+    pelagos_provision vm ssh -- "tar -C /root/build-outputs/ubuntu-modules -czf - ." \
+        | tar -C "$UBUNTU_MODULES_DST" -xzf -
+    echo "  pulled ubuntu-vmlinuz  ($(du -sh "$UBUNTU_VMLINUZ" | cut -f1))"
+    echo "  pulled ubuntu-initrd   ($(du -sh "$UBUNTU_INITRD"  | cut -f1))"
+    echo "  pulled ubuntu-modules/ ($(find "$UBUNTU_MODULES_DST" -name "*.ko" | wc -l) modules)"
+else
+    echo "WARNING: /root/build-outputs/ubuntu-vmlinuz not found — kernel extraction may have failed" >&2
+fi
 
 # ---------------------------------------------------------------------------
 # Stop the provisioning VM and restart the normal Alpine VM.
@@ -466,28 +577,15 @@ echo ""
 # Write vm.conf for the build profile.
 # ---------------------------------------------------------------------------
 
-# Move the Ubuntu kernel and initrd from the Alpine volumes dir to out/.
-# These were extracted from the provisioned build.img by the provisioning
-# script and staged on the virtiofs share.
-UBUNTU_VMLINUZ="$REPO_ROOT/out/ubuntu-vmlinuz"
-UBUNTU_INITRD="$REPO_ROOT/out/ubuntu-initrd.img"
-if [[ -f "$ALPINE_VOLUMES_DIR/ubuntu-vmlinuz" ]]; then
-    mv "$ALPINE_VOLUMES_DIR/ubuntu-vmlinuz"   "$UBUNTU_VMLINUZ"
-    mv "$ALPINE_VOLUMES_DIR/ubuntu-initrd.img" "$UBUNTU_INITRD"
-    echo "--- extracted Ubuntu kernel to out/ubuntu-vmlinuz ($(du -sh "$UBUNTU_VMLINUZ" | cut -f1)) ---"
-    echo "--- extracted Ubuntu initrd  to out/ubuntu-initrd.img ($(du -sh "$UBUNTU_INITRD" | cut -f1)) ---"
-    # Move kernel modules needed by the container VM initramfs.
-    UBUNTU_MODULES_SRC="$ALPINE_VOLUMES_DIR/ubuntu-modules"
-    UBUNTU_MODULES_DST="$REPO_ROOT/out/ubuntu-modules"
-    if [[ -d "$UBUNTU_MODULES_SRC" ]]; then
-        rm -rf "$UBUNTU_MODULES_DST"
-        mv "$UBUNTU_MODULES_SRC" "$UBUNTU_MODULES_DST"
-        echo "--- extracted Ubuntu kernel modules to out/ubuntu-modules/ ---"
-    fi
-else
-    echo "ERROR: ubuntu-vmlinuz not found in Alpine volumes dir — kernel extraction failed" >&2
+# ubuntu-vmlinuz, ubuntu-initrd.img, and ubuntu-modules were already pulled
+# back from the provisioning VM via SSH above.  Verify they are present.
+if [[ ! -f "$UBUNTU_VMLINUZ" ]]; then
+    echo "ERROR: out/ubuntu-vmlinuz not found — kernel extraction failed" >&2
     exit 1
 fi
+echo "--- Ubuntu kernel:  out/ubuntu-vmlinuz  ($(du -sh "$UBUNTU_VMLINUZ" | cut -f1)) ---"
+echo "--- Ubuntu initrd:  out/ubuntu-initrd.img ($(du -sh "$UBUNTU_INITRD" | cut -f1)) ---"
+echo "--- Ubuntu modules: out/ubuntu-modules/ ($(find "$UBUNTU_MODULES_DST" -name "*.ko" | wc -l) modules) ---"
 echo ""
 
 echo "--- writing vm.conf for profile '$PROFILE' ---"

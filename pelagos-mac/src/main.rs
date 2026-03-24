@@ -15,6 +15,7 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 mod daemon;
+mod port_dispatcher;
 mod state;
 
 // ---------------------------------------------------------------------------
@@ -343,6 +344,9 @@ enum GuestCommand {
         env: std::collections::HashMap<String, String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         labels: Vec<String>,
+        /// Port mappings HOST:CONTAINER forwarded to `pelagos run --publish`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        publish: Vec<String>,
     },
     Exec {
         image: String,
@@ -748,8 +752,25 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
+            // Register port forwards with the daemon.  The daemon's
+            // PortDispatcher (one listener thread for all ports) manages TCP
+            // listeners; conflict detection returns an error immediately.
+            for spec in &cli.ports {
+                if let Some(pf) = daemon::parse_port_spec(spec) {
+                    if let Err(e) = send_daemon_cmd(
+                        &profile,
+                        daemon::DaemonCmd::RegisterPort {
+                            host_port: pf.host_port,
+                            container_port: pf.container_port,
+                        },
+                    ) {
+                        log::error!("port registration failed: {}", e);
+                        process::exit(1);
+                    }
+                }
+            }
             let stream = connect_or_exit(&profile);
-            process::exit(passthrough_command(
+            let exit_code = passthrough_command(
                 stream,
                 GuestCommand::Run {
                     image,
@@ -759,8 +780,27 @@ fn main() {
                     detach,
                     env: env_map,
                     labels,
+                    publish: cli.ports.clone(),
                 },
-            ));
+            );
+            // For foreground containers the CLI process stays alive until the
+            // container exits; deregister ports now.  For detached containers
+            // the caller has already returned (passthrough exits immediately)
+            // and deregistration will be handled by the subscription watcher
+            // (issue #169).
+            if !detach {
+                for spec in &cli.ports {
+                    if let Some(pf) = daemon::parse_port_spec(spec) {
+                        let _ = send_daemon_cmd(
+                            &profile,
+                            daemon::DaemonCmd::UnregisterPort {
+                                host_port: pf.host_port,
+                            },
+                        );
+                    }
+                }
+            }
+            process::exit(exit_code);
         }
 
         Commands::Exec {
@@ -1098,15 +1138,20 @@ fn main() {
 /// macOS and forwards each accepted connection to `192.168.105.2:VM`.
 /// Runs until the process is killed (SIGTERM from the shim on container stop/rm).
 fn cmd_port_proxy(ports: &[String]) {
+    use port_dispatcher::{DispatchCmd, PortDispatcher};
+
     if ports.is_empty() {
         log::warn!("port-proxy: no ports specified, exiting immediately");
         return;
     }
+    let dispatcher = PortDispatcher::spawn();
     for spec in ports {
         match daemon::parse_port_spec(spec) {
             Some(pf) => {
-                let (hp, cp) = (pf.host_port, pf.container_port);
-                std::thread::spawn(move || daemon::port_forward_loop(hp, cp));
+                dispatcher.send(DispatchCmd::Add {
+                    host_port: pf.host_port,
+                    container_port: pf.container_port,
+                });
             }
             None => {
                 log::error!("port-proxy: invalid port spec {:?}", spec);
@@ -1420,6 +1465,32 @@ fn connect_or_exit(profile: &str) -> UnixStream {
         log::error!("connect to VM daemon: {}", e);
         process::exit(1);
     })
+}
+
+/// Send a `DaemonCmd` to the running daemon and return the response.
+///
+/// Connects to `vm.sock`, writes one JSON line, reads one JSON response line,
+/// then closes.  Returns `Err` if the daemon reports a port conflict or the
+/// connection fails.
+fn send_daemon_cmd(profile: &str, cmd: daemon::DaemonCmd) -> io::Result<()> {
+    let mut stream = daemon::connect(profile)?;
+    let mut msg =
+        serde_json::to_string(&cmd).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    msg.push('\n');
+    stream.write_all(msg.as_bytes())?;
+
+    // Read the one-line response.
+    let mut line = String::new();
+    let mut reader = BufReader::new(stream);
+    reader.read_line(&mut line)?;
+
+    match serde_json::from_str::<daemon::DaemonResponse>(line.trim()) {
+        Ok(daemon::DaemonResponse::Ok) => Ok(()),
+        Ok(daemon::DaemonResponse::Err { message }) => {
+            Err(io::Error::new(io::ErrorKind::AlreadyExists, message))
+        }
+        Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2627,6 +2698,7 @@ mod tests {
             detach: false,
             env: std::collections::HashMap::new(),
             labels: vec![],
+            publish: vec![],
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2648,6 +2720,7 @@ mod tests {
             detach: true,
             env: std::collections::HashMap::new(),
             labels: vec![],
+            publish: vec![],
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2670,6 +2743,7 @@ mod tests {
             detach: false,
             env: std::collections::HashMap::new(),
             labels: vec![],
+            publish: vec![],
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

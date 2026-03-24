@@ -112,6 +112,9 @@ pub enum GuestCommand {
         /// Labels KEY=VALUE forwarded to `pelagos run --label`.
         #[serde(default)]
         labels: Vec<String>,
+        /// Port mappings HOST:CONTAINER forwarded to `pelagos run --publish`.
+        #[serde(default)]
+        publish: Vec<String>,
     },
     Exec {
         image: String,
@@ -254,6 +257,9 @@ pub struct ContainerSnapshot {
     pub started_at: String,
     #[serde(default)]
     pub exit_code: Option<i32>,
+    /// Port mappings from `pelagos run -p HOST:CONTAINER` (e.g. `["8080:80"]`).
+    #[serde(default)]
+    pub ports: Vec<String>,
 }
 
 /// Events streamed over a Subscribe connection (NDJSON, one per line).
@@ -466,6 +472,7 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 name,
                 detach,
                 labels,
+                publish,
             } => {
                 run_container(
                     &mut writer,
@@ -476,6 +483,7 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                     name.as_deref(),
                     detach,
                     &labels,
+                    &publish,
                 )?;
             }
             GuestCommand::Exec {
@@ -860,6 +868,7 @@ fn run_container(
     name: Option<&str>,
     detach: bool,
     labels: &[String],
+    publish: &[String],
 ) -> std::io::Result<()> {
     let pelagos = pelagos_bin();
 
@@ -905,6 +914,9 @@ fn run_container(
     }
     for label in labels {
         cmd.arg("--label").arg(label);
+    }
+    for port_spec in publish {
+        cmd.arg("--publish").arg(port_spec);
     }
     cmd.arg(image);
     if !args.is_empty() {
@@ -2136,6 +2148,17 @@ fn read_container_states() -> Vec<ContainerSnapshot> {
             .get("exit_code")
             .and_then(|v| v.as_i64())
             .map(|c| c as i32);
+        // publish is nested under spawn_config in state.json.
+        let ports: Vec<String> = val
+            .get("spawn_config")
+            .and_then(|sc| sc.get("publish"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
         out.push(ContainerSnapshot {
             name,
             status,
@@ -2143,6 +2166,7 @@ fn read_container_states() -> Vec<ContainerSnapshot> {
             rootfs,
             started_at,
             exit_code,
+            ports,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -2416,6 +2440,19 @@ mod tests {
                 assert!(mounts.is_empty());
                 assert!(name.is_none());
                 assert!(!detach);
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn run_with_publish_deserializes() {
+        let json = r#"{"cmd":"run","image":"nginx","args":[],"publish":["8080:80","443:443"]}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        match cmd {
+            GuestCommand::Run { image, publish, .. } => {
+                assert_eq!(image, "nginx");
+                assert_eq!(publish, vec!["8080:80", "443:443"]);
             }
             other => panic!("unexpected: {:?}", other),
         }
