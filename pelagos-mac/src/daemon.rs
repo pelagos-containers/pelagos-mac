@@ -164,24 +164,8 @@ pub fn ensure_running(args: &DaemonArgs) -> io::Result<()> {
                  run 'pelagos vm stop' first, then retry",
             ));
         }
-        // Verify that any explicitly requested port forwards are active.
-        // Requesting no ports (-p not given) always succeeds even if the daemon
-        // has active forwards (the proxies are already running).
-        if !args.port_forwards.is_empty() {
-            let running_ports = state.read_ports()?;
-            for pf in &args.port_forwards {
-                if !running_ports.contains(pf) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!(
-                            "port {}:{} is not forwarded by the running daemon; \
-                             run 'pelagos vm stop' first, then retry",
-                            pf.host_port, pf.container_port
-                        ),
-                    ));
-                }
-            }
-        }
+        // Ports are managed dynamically via DaemonCmd::RegisterPort; no
+        // static port-list validation is needed here (issue #170).
         return Ok(());
     }
 
@@ -276,15 +260,13 @@ pub fn run(args: DaemonArgs) -> ! {
         log::error!("write pid: {}", e);
     });
 
-    // Persist mount, port, and extra-disk configuration.
+    // Persist mount and extra-disk configuration (validated on reconnect).
+    // Port forwards are managed dynamically via DaemonCmd — no static list to persist.
     state
         .write_mounts(&args.virtiofs_shares)
         .unwrap_or_else(|e| {
             log::error!("write mounts: {}", e);
         });
-    state.write_ports(&args.port_forwards).unwrap_or_else(|e| {
-        log::error!("write ports: {}", e);
-    });
     state
         .write_extra_disks(&args.extra_disks)
         .unwrap_or_else(|e| {
@@ -309,6 +291,13 @@ pub fn run(args: DaemonArgs) -> ! {
     }
 
     log::info!("daemon listening on {}", state.sock_file.display());
+
+    // Spawn the subscription watcher: auto-deregisters ports when containers exit.
+    start_subscription_watcher(
+        Arc::clone(&vm),
+        Arc::clone(&dispatcher),
+        Arc::clone(&port_state),
+    );
 
     // Install SIGTERM handler: sets flag, SIGINT terminates immediately.
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -551,6 +540,160 @@ fn handle_daemon_cmd(
     let mut resp_str = serde_json::to_string(&response).unwrap_or_default();
     resp_str.push('\n');
     let _ = unix.write_all(resp_str.as_bytes());
+}
+
+// ---------------------------------------------------------------------------
+// Subscription watcher — auto-deregisters ports when containers exit (#169)
+// ---------------------------------------------------------------------------
+
+/// Minimal wire-format types for the `pelagos subscribe` NDJSON stream.
+/// Must match `GuestEvent` in pelagos-guest (`#[serde(tag = "type", rename_all = "snake_case")]`).
+#[derive(serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WatchEvent {
+    Snapshot {
+        containers: Vec<WatchContainer>,
+    },
+    ContainerStarted {
+        container: WatchContainer,
+    },
+    ContainerExited {
+        name: String,
+    },
+    /// Catch-all for heartbeats and any future event types.
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(serde::Deserialize)]
+struct WatchContainer {
+    name: String,
+    #[serde(default)]
+    ports: Vec<String>,
+}
+
+/// Spawn the subscription watcher thread.  The thread connects to vsock,
+/// subscribes to container lifecycle events, and automatically removes port
+/// forwards from `PortDispatcher` / `PortState` when a container exits.
+fn start_subscription_watcher(
+    vm: Arc<Vm>,
+    dispatcher: Arc<PortDispatcher>,
+    port_state: Arc<Mutex<PortState>>,
+) {
+    std::thread::Builder::new()
+        .name("port-sub-watcher".into())
+        .spawn(move || subscription_watcher_loop(vm, dispatcher, port_state))
+        .expect("spawn port-sub-watcher");
+}
+
+fn subscription_watcher_loop(
+    vm: Arc<Vm>,
+    dispatcher: Arc<PortDispatcher>,
+    port_state: Arc<Mutex<PortState>>,
+) {
+    use std::io::BufRead;
+
+    // Local map: container name → port specs (e.g. ["8080:80"]).
+    // Updated on every Snapshot and ContainerStarted event so that a later
+    // ContainerExited can look up which ports belong to that container.
+    let mut container_ports: HashMap<String, Vec<String>> = HashMap::new();
+
+    loop {
+        // Connect to vsock (retry until the VM guest is ready).
+        let vsock_fd = loop {
+            match vm.connect_vsock() {
+                Ok(fd) => break fd,
+                Err(_) => {
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            }
+        };
+
+        // Send {"cmd":"subscribe"}\n — the GuestCommand::Subscribe wire format.
+        const SUBSCRIBE_LINE: &[u8] = b"{\"cmd\":\"subscribe\"}\n";
+        let vsock_raw = vsock_fd.into_raw_fd();
+        {
+            // SAFETY: vsock_raw is valid; mem::forget prevents double-close.
+            let mut f = unsafe { std::fs::File::from_raw_fd(vsock_raw) };
+            let ok = f.write_all(SUBSCRIBE_LINE).is_ok();
+            std::mem::forget(f);
+            if !ok {
+                // SAFETY: we prevented the File from closing it; close manually.
+                unsafe { libc::close(vsock_raw) };
+                log::warn!("port-sub-watcher: failed to send subscribe command");
+                std::thread::sleep(Duration::from_secs(5));
+                continue;
+            }
+        }
+
+        // Read NDJSON events until the connection closes.
+        let f = unsafe { std::fs::File::from_raw_fd(vsock_raw) };
+        let mut reader = std::io::BufReader::new(f);
+        let mut line = String::new();
+        log::info!("port-sub-watcher: subscribed to container events");
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<WatchEvent>(trimmed) {
+                Ok(WatchEvent::Snapshot { containers }) => {
+                    container_ports.clear();
+                    for c in containers {
+                        if !c.ports.is_empty() {
+                            container_ports.insert(c.name, c.ports);
+                        }
+                    }
+                    log::debug!(
+                        "port-sub-watcher: snapshot — tracking {} containers with ports",
+                        container_ports.len()
+                    );
+                }
+                Ok(WatchEvent::ContainerStarted { container }) => {
+                    if !container.ports.is_empty() {
+                        log::debug!(
+                            "port-sub-watcher: {} started with ports {:?}",
+                            container.name,
+                            container.ports
+                        );
+                        container_ports.insert(container.name, container.ports);
+                    }
+                }
+                Ok(WatchEvent::ContainerExited { name }) => {
+                    if let Some(ports) = container_ports.remove(&name) {
+                        let mut ps = port_state.lock().unwrap();
+                        for spec in &ports {
+                            if let Some(pf) = parse_port_spec(spec) {
+                                if ps.active.remove(&pf.host_port).is_some() {
+                                    dispatcher.send(DispatchCmd::Remove {
+                                        host_port: pf.host_port,
+                                    });
+                                    log::info!(
+                                        "port-sub-watcher: {} exited — unregistered port {}",
+                                        name,
+                                        pf.host_port
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(WatchEvent::Unknown) => {}
+                Err(_) => {
+                    log::trace!("port-sub-watcher: unparseable line: {}", trimmed);
+                }
+            }
+        }
+
+        log::info!("port-sub-watcher: subscribe connection closed — reconnecting in 5s");
+        std::thread::sleep(Duration::from_secs(5));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1182,5 +1325,109 @@ mod tests {
             .position(|a| a == "--profile")
             .expect("--profile missing");
         assert_eq!(v[idx + 1], std::ffi::OsStr::new("build"));
+    }
+
+    // -----------------------------------------------------------------------
+    // DaemonCmd / DaemonResponse serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn daemon_cmd_register_port_roundtrip() {
+        use super::{DaemonCmd, DaemonResponse};
+        let cmd = DaemonCmd::RegisterPort {
+            host_port: 8080,
+            container_port: 80,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["RegisterPort"]["host_port"], 8080);
+        assert_eq!(v["RegisterPort"]["container_port"], 80);
+
+        let resp_ok = DaemonResponse::Ok;
+        let r = serde_json::to_string(&resp_ok).unwrap();
+        assert!(r.contains("\"ok\""));
+
+        let resp_err = DaemonResponse::Err {
+            message: "port 8080 is already registered".into(),
+        };
+        let e = serde_json::to_string(&resp_err).unwrap();
+        assert!(e.contains("\"err\""));
+        assert!(e.contains("already registered"));
+    }
+
+    #[test]
+    fn daemon_cmd_unregister_port_roundtrip() {
+        use super::DaemonCmd;
+        let cmd = DaemonCmd::UnregisterPort { host_port: 8080 };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["UnregisterPort"]["host_port"], 8080);
+    }
+
+    // -----------------------------------------------------------------------
+    // WatchEvent deserialization (validates wire-format match with pelagos-guest)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn watch_event_snapshot_deserializes() {
+        use super::WatchEvent;
+        let json = r#"{"type":"snapshot","containers":[{"name":"nginx","status":"running","rootfs":"alpine","pid":1,"started_at":"2024-01-01","ports":["8080:80"]}],"vm_running":true}"#;
+        match serde_json::from_str::<WatchEvent>(json).unwrap() {
+            WatchEvent::Snapshot { containers } => {
+                assert_eq!(containers.len(), 1);
+                assert_eq!(containers[0].name, "nginx");
+                assert_eq!(containers[0].ports, vec!["8080:80"]);
+            }
+            other => panic!("unexpected: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn watch_event_container_started_deserializes() {
+        use super::WatchEvent;
+        let json = r#"{"type":"container_started","container":{"name":"redis","status":"running","rootfs":"redis","pid":2,"started_at":"2024-01-01","ports":["6379:6379"]}}"#;
+        match serde_json::from_str::<WatchEvent>(json).unwrap() {
+            WatchEvent::ContainerStarted { container } => {
+                assert_eq!(container.name, "redis");
+                assert_eq!(container.ports, vec!["6379:6379"]);
+            }
+            other => panic!("unexpected: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn watch_event_container_exited_deserializes() {
+        use super::WatchEvent;
+        let json = r#"{"type":"container_exited","name":"nginx","exit_code":0}"#;
+        match serde_json::from_str::<WatchEvent>(json).unwrap() {
+            WatchEvent::ContainerExited { name } => {
+                assert_eq!(name, "nginx");
+            }
+            other => panic!("unexpected: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn watch_event_heartbeat_is_unknown() {
+        use super::WatchEvent;
+        let json = r#"{"type":"heartbeat","ts":1234567890}"#;
+        // heartbeats are caught by the Unknown variant
+        assert!(matches!(
+            serde_json::from_str::<WatchEvent>(json).unwrap(),
+            WatchEvent::Unknown
+        ));
+    }
+
+    #[test]
+    fn watch_event_snapshot_no_ports_ignored() {
+        use super::WatchEvent;
+        // containers without ports → empty ports vec
+        let json = r#"{"type":"snapshot","containers":[{"name":"busybox","status":"running","rootfs":"busybox","pid":3,"started_at":"2024-01-01"}],"vm_running":true}"#;
+        match serde_json::from_str::<WatchEvent>(json).unwrap() {
+            WatchEvent::Snapshot { containers } => {
+                assert_eq!(containers[0].ports, Vec::<String>::new());
+            }
+            _ => panic!("expected Snapshot"),
+        }
     }
 }
