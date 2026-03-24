@@ -132,6 +132,9 @@ pub struct DaemonArgs {
     /// Secondary disk images: first → /dev/vdb, second → /dev/vdc, etc.
     /// Used during build-VM provisioning to avoid virtiofs I/O overhead.
     pub extra_disks: Vec<std::path::PathBuf>,
+    /// Loopback TCP port for the NAT relay proxy.  Distinct per profile so
+    /// multiple profiles can run simultaneously without relay conflicts.
+    pub relay_proxy_port: u16,
 }
 
 /// Ensure the daemon is running, starting it if necessary.
@@ -275,7 +278,7 @@ pub fn run(args: DaemonArgs) -> ! {
 
     // Spawn the single-threaded port-forward dispatcher (O(1) listener threads
     // regardless of how many ports or containers are active).
-    let dispatcher = Arc::new(PortDispatcher::spawn());
+    let dispatcher = Arc::new(PortDispatcher::spawn(args.relay_proxy_port));
     let port_state = Arc::new(Mutex::new(PortState::new()));
 
     // Pre-register any ports requested at daemon startup via `vm start -p`.
@@ -751,7 +754,8 @@ fn build_vm_config(args: &DaemonArgs) -> VmConfig {
         .disk(&args.disk)
         .cmdline(build_cmdline(args))
         .memory_mib(args.memory_mib)
-        .cpus(args.cpus);
+        .cpus(args.cpus)
+        .relay_proxy_port(args.relay_proxy_port);
     if let Some(ref initrd) = args.initrd {
         b = b.initrd(initrd);
     }
@@ -1269,6 +1273,7 @@ mod tests {
             port_forwards: vec![],
             profile: "default".into(),
             extra_disks: vec![],
+            relay_proxy_port: pelagos_vz::nat_relay::RELAY_PROXY_PORT,
         }
     }
 

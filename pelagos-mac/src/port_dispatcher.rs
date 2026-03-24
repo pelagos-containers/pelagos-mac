@@ -29,8 +29,6 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use pelagos_vz::nat_relay::RELAY_PROXY_PORT;
-
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -58,7 +56,10 @@ pub struct PortDispatcher {
 
 impl PortDispatcher {
     /// Spawn the dispatcher thread and return a handle.
-    pub fn spawn() -> Self {
+    ///
+    /// `relay_proxy_port` is the per-profile smoltcp NAT relay port that this
+    /// dispatcher will connect to when forwarding accepted connections into the VM.
+    pub fn spawn(relay_proxy_port: u16) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<DispatchCmd>(64);
         let mut pipe_fds: [libc::c_int; 2] = [-1; 2];
         // SAFETY: pipe() is a safe, well-defined syscall.
@@ -74,7 +75,7 @@ impl PortDispatcher {
 
         std::thread::Builder::new()
             .name("port-dispatcher".into())
-            .spawn(move || dispatcher_loop(cmd_rx, wake_rx))
+            .spawn(move || dispatcher_loop(cmd_rx, wake_rx, relay_proxy_port))
             .expect("spawn port-dispatcher");
 
         Self { cmd_tx, wake_tx }
@@ -112,7 +113,7 @@ struct ListenerEntry {
     container_port: u16,
 }
 
-fn dispatcher_loop(cmd_rx: mpsc::Receiver<DispatchCmd>, wake_rx: RawFd) {
+fn dispatcher_loop(cmd_rx: mpsc::Receiver<DispatchCmd>, wake_rx: RawFd, relay_proxy_port: u16) {
     // host_port → entry
     let mut listeners: HashMap<u16, ListenerEntry> = HashMap::new();
     // Reusable poll-fds vec; rebuilt each iteration.
@@ -166,7 +167,7 @@ fn dispatcher_loop(cmd_rx: mpsc::Receiver<DispatchCmd>, wake_rx: RawFd) {
                         host_port,
                         container_port,
                     }) => {
-                        add_listener(&mut listeners, host_port, container_port);
+                        add_listener(&mut listeners, host_port, container_port, relay_proxy_port);
                     }
                     Ok(DispatchCmd::Remove { host_port }) => {
                         if listeners.remove(&host_port).is_some() {
@@ -210,7 +211,12 @@ fn dispatcher_loop(cmd_rx: mpsc::Receiver<DispatchCmd>, wake_rx: RawFd) {
                     Ok((client, peer)) => {
                         log::debug!("port-dispatcher: accepted {} → 0.0.0.0:{}", peer, host_port);
                         let container_port = entry.container_port;
-                        spawn_connection_handler(client, host_port, container_port);
+                        spawn_connection_handler(
+                            client,
+                            host_port,
+                            container_port,
+                            relay_proxy_port,
+                        );
                     }
                     Err(e) => {
                         log::warn!("port-dispatcher: accept on {}: {}", host_port, e);
@@ -221,7 +227,12 @@ fn dispatcher_loop(cmd_rx: mpsc::Receiver<DispatchCmd>, wake_rx: RawFd) {
     }
 }
 
-fn add_listener(listeners: &mut HashMap<u16, ListenerEntry>, host_port: u16, container_port: u16) {
+fn add_listener(
+    listeners: &mut HashMap<u16, ListenerEntry>,
+    host_port: u16,
+    container_port: u16,
+    relay_proxy_port: u16,
+) {
     if listeners.contains_key(&host_port) {
         log::debug!("port-dispatcher: listener already active on {}", host_port);
         return;
@@ -232,7 +243,7 @@ fn add_listener(listeners: &mut HashMap<u16, ListenerEntry>, host_port: u16, con
                 "port-dispatcher: listening 0.0.0.0:{} → VM:{} (relay :{})",
                 host_port,
                 container_port,
-                RELAY_PROXY_PORT
+                relay_proxy_port
             );
             listeners.insert(
                 host_port,
@@ -248,15 +259,20 @@ fn add_listener(listeners: &mut HashMap<u16, ListenerEntry>, host_port: u16, con
     }
 }
 
-fn spawn_connection_handler(client: TcpStream, host_port: u16, _container_port: u16) {
+fn spawn_connection_handler(
+    client: TcpStream,
+    host_port: u16,
+    _container_port: u16,
+    relay_proxy_port: u16,
+) {
     std::thread::Builder::new()
         .name(format!("port-conn-{}", host_port))
         .spawn(move || {
-            let relay_addr = std::net::SocketAddr::from(([127, 0, 0, 1], RELAY_PROXY_PORT));
+            let relay_addr = std::net::SocketAddr::from(([127, 0, 0, 1], relay_proxy_port));
             let mut server = match TcpStream::connect_timeout(&relay_addr, Duration::from_secs(5)) {
                 Ok(s) => s,
                 Err(e) => {
-                    log::warn!("port-dispatcher: connect relay:{}: {}", RELAY_PROXY_PORT, e);
+                    log::warn!("port-dispatcher: connect relay:{}: {}", relay_proxy_port, e);
                     return;
                 }
             };
@@ -307,7 +323,7 @@ mod tests {
 
     #[test]
     fn dispatcher_binds_on_add() {
-        let d = PortDispatcher::spawn();
+        let d = PortDispatcher::spawn(17900);
         let port = free_port();
         d.send(DispatchCmd::Add {
             host_port: port,
@@ -326,7 +342,7 @@ mod tests {
 
     #[test]
     fn dispatcher_unbinds_on_remove() {
-        let d = PortDispatcher::spawn();
+        let d = PortDispatcher::spawn(17900);
         let port = free_port();
         d.send(DispatchCmd::Add {
             host_port: port,
@@ -343,7 +359,7 @@ mod tests {
 
     #[test]
     fn dispatcher_shutdown_closes_all() {
-        let d = PortDispatcher::spawn();
+        let d = PortDispatcher::spawn(17900);
         let port = free_port();
         d.send(DispatchCmd::Add {
             host_port: port,
