@@ -59,11 +59,17 @@ use std::time::Duration;
 
 /// Start the NAT relay.
 ///
+/// `relay_proxy_port` is the loopback TCP port this relay will bind on macOS.
+/// Each VM profile must use a distinct port so that multiple profiles can run
+/// simultaneously without one hijacking the other's port-forward connections.
+/// Use [`relay_proxy_port_for_profile`] in `pelagos-mac` to derive the port
+/// from the profile name, or pass [`RELAY_PROXY_PORT`] for the default profile.
+///
 /// Returns `(avf_fd, relay)`:
 /// - `avf_fd` is one end of a `socketpair(AF_UNIX, SOCK_DGRAM)` ready to be
 ///   wrapped in `NSFileHandle` and passed to `VZFileHandleNetworkDeviceAttachment`.
 /// - `relay` holds the relay thread. Drop it to initiate shutdown.
-pub fn start() -> Result<(RawFd, RelayHandle), crate::Error> {
+pub fn start(relay_proxy_port: u16) -> Result<(RawFd, RelayHandle), crate::Error> {
     let (avf_fd, relay_fd) = create_socketpair()?;
 
     // Buffer sizes: 128 KB send / 512 KB recv per AVF documentation.
@@ -75,21 +81,21 @@ pub fn start() -> Result<(RawFd, RelayHandle), crate::Error> {
     // Channel for inbound port-forward requests from the relay proxy port.
     let (inbound_tx, inbound_rx) = mpsc::channel::<(TcpStream, u16)>();
 
-    // Spawn the inbound proxy listener (macOS 127.0.0.1:RELAY_PROXY_PORT).
+    // Spawn the inbound proxy listener on the per-profile relay port.
     std::thread::Builder::new()
         .name("nat-relay-proxy-listener".into())
-        .spawn(move || inbound_proxy_listener(inbound_tx))
+        .spawn(move || inbound_proxy_listener(relay_proxy_port, inbound_tx))
         .expect("spawn nat-relay-proxy-listener");
 
     let thread = std::thread::Builder::new()
         .name("nat-relay".into())
-        .spawn(move || run_relay(relay_fd, inbound_rx))
+        .spawn(move || run_relay(relay_fd, relay_proxy_port, inbound_rx))
         .expect("spawn nat-relay");
 
     log::info!(
         "nat_relay: started (avf_fd={}, proxy_port={})",
         avf_fd,
-        RELAY_PROXY_PORT
+        relay_proxy_port
     );
     Ok((avf_fd, RelayHandle { _thread: thread }))
 }
@@ -356,7 +362,7 @@ fn send_arp_keepalive(relay_fd: RawFd) {
     log::debug!("nat_relay: sent ARP keepalive for 192.168.105.2");
 }
 
-fn run_relay(relay_fd: RawFd, inbound_rx: Receiver<(TcpStream, u16)>) {
+fn run_relay(relay_fd: RawFd, relay_proxy_port: u16, inbound_rx: Receiver<(TcpStream, u16)>) {
     let mut device = AvfDevice::new(relay_fd);
 
     // Configure the smoltcp interface as the gateway (192.168.105.1).
@@ -410,7 +416,7 @@ fn run_relay(relay_fd: RawFd, inbound_rx: Receiver<(TcpStream, u16)>) {
 
     log::info!(
         "nat_relay: poll loop started (proxy_port={})",
-        RELAY_PROXY_PORT
+        relay_proxy_port
     );
 
     loop {
@@ -738,23 +744,26 @@ fn tcp_proxy_thread(dest: SocketAddr, from_smol: Receiver<Vec<u8>>, to_smol: Sen
     let _ = s.shutdown(std::net::Shutdown::Write);
 }
 
-/// Listen on 127.0.0.1:RELAY_PROXY_PORT for inbound port-forward requests.
-fn inbound_proxy_listener(tx: Sender<(TcpStream, u16)>) {
-    let listener = match TcpListener::bind(("127.0.0.1", RELAY_PROXY_PORT)) {
+/// Listen on `127.0.0.1:port` for inbound port-forward requests.
+///
+/// Each VM profile binds its own port so that multiple profiles can run
+/// simultaneously.  If the bind fails with EADDRINUSE, another pelagos daemon
+/// (possibly a different profile) is already holding that port.
+fn inbound_proxy_listener(port: u16, tx: Sender<(TcpStream, u16)>) {
+    let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
         Err(e) => {
             log::error!(
-                "nat_relay: failed to bind relay proxy port {}: {}",
-                RELAY_PROXY_PORT,
+                "nat_relay: failed to bind relay proxy port {}: {} \
+                 — another pelagos daemon may already be using this port; \
+                 run 'pelagos vm stop' for the conflicting profile first",
+                port,
                 e
             );
             return;
         }
     };
-    log::info!(
-        "nat_relay: inbound proxy listening on 127.0.0.1:{}",
-        RELAY_PROXY_PORT
-    );
+    log::info!("nat_relay: inbound proxy listening on 127.0.0.1:{}", port);
     for incoming in listener.incoming() {
         let mut sock = match incoming {
             Ok(s) => s,

@@ -54,6 +54,9 @@ pub struct VmConfig {
     pub virtiofs_shares: Vec<(PathBuf, String, bool)>,
     /// Enable Rosetta for x86_64 Linux binaries (macOS 13+).
     pub rosetta: bool,
+    /// Loopback TCP port the NAT relay proxy binds on the host.
+    /// Distinct per profile so multiple profiles can run simultaneously.
+    pub relay_proxy_port: u16,
 }
 
 impl VmConfig {
@@ -74,6 +77,7 @@ pub struct VmConfigBuilder {
     vsock_port: Option<u32>,
     virtiofs_shares: Vec<(PathBuf, String, bool)>,
     rosetta: bool,
+    relay_proxy_port: Option<u16>,
 }
 
 impl VmConfigBuilder {
@@ -123,6 +127,10 @@ impl VmConfigBuilder {
         self.rosetta = enabled;
         self
     }
+    pub fn relay_proxy_port(mut self, port: u16) -> Self {
+        self.relay_proxy_port = Some(port);
+        self
+    }
 
     pub fn build(self) -> Result<VmConfig, &'static str> {
         Ok(VmConfig {
@@ -138,6 +146,9 @@ impl VmConfigBuilder {
             vsock_port: self.vsock_port.unwrap_or(1024),
             virtiofs_shares: self.virtiofs_shares,
             rosetta: self.rosetta,
+            relay_proxy_port: self
+                .relay_proxy_port
+                .unwrap_or(crate::nat_relay::RELAY_PROXY_PORT),
         })
     }
 }
@@ -417,7 +428,7 @@ unsafe fn start_vm(config: VmConfig) -> Result<(Vm, std::os::unix::io::OwnedFd),
     // 5. Userspace NAT relay via VZFileHandleNetworkDeviceAttachment.
     //    Starts the smoltcp-based NAT relay (replaces socket_vmnet / vmnet.framework).
     //    Returns a SOCK_DGRAM fd that AVF consumes directly as raw Ethernet frames.
-    let (vmnet_fd, relay) = crate::nat_relay::start()
+    let (vmnet_fd, relay) = crate::nat_relay::start(config.relay_proxy_port)
         .map_err(|e| crate::Error::Runtime(format!("nat_relay: {}", e)))?;
     let vmnet_fh = NSFileHandle::initWithFileDescriptor(NSFileHandle::alloc(), vmnet_fd);
     let net_attach = VZFileHandleNetworkDeviceAttachment::initWithFileHandle(

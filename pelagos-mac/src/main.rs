@@ -631,7 +631,14 @@ fn main() {
                 eprintln!("error: cannot determine current executable path");
                 process::exit(1);
             });
-            let proxy_cmd = format!("{} ssh-relay-proxy {}", exe.display(), VM_SSH_PORT);
+            // Include --profile so the subprocess derives the same per-profile
+            // relay port without any extra IPC.
+            let proxy_cmd = format!(
+                "{} --profile {} ssh-relay-proxy {}",
+                exe.display(),
+                cli.profile,
+                VM_SSH_PORT
+            );
             let mut cmd = std::process::Command::new("ssh");
             cmd.arg("-i")
                 .arg(&ssh_key)
@@ -1085,11 +1092,13 @@ fn main() {
         }
 
         Commands::PortProxy { ref ports } => {
-            cmd_port_proxy(ports);
+            let relay_port = relay_proxy_port_for_profile(&cli.profile);
+            cmd_port_proxy(ports, relay_port);
         }
 
         Commands::SshRelayProxy { port } => {
-            ssh_relay_proxy(port);
+            let relay_port = relay_proxy_port_for_profile(&cli.profile);
+            ssh_relay_proxy(port, relay_port);
         }
     }
 }
@@ -1097,7 +1106,7 @@ fn main() {
 /// Start a TCP port-proxy for each `HOST:VM` spec.  Binds `0.0.0.0:HOST` on
 /// macOS and forwards each accepted connection to `192.168.105.2:VM`.
 /// Runs until the process is killed (SIGTERM from the shim on container stop/rm).
-fn cmd_port_proxy(ports: &[String]) {
+fn cmd_port_proxy(ports: &[String], relay_proxy_port: u16) {
     if ports.is_empty() {
         log::warn!("port-proxy: no ports specified, exiting immediately");
         return;
@@ -1106,7 +1115,7 @@ fn cmd_port_proxy(ports: &[String]) {
         match daemon::parse_port_spec(spec) {
             Some(pf) => {
                 let (hp, cp) = (pf.host_port, pf.container_port);
-                std::thread::spawn(move || daemon::port_forward_loop(hp, cp));
+                std::thread::spawn(move || daemon::port_forward_loop(hp, cp, relay_proxy_port));
             }
             None => {
                 log::error!("port-proxy: invalid port spec {:?}", spec);
@@ -1121,18 +1130,20 @@ fn cmd_port_proxy(ports: &[String]) {
 }
 
 /// SSH ProxyCommand helper: connect stdin/stdout to a VM port via the smoltcp
-/// NAT relay proxy at 127.0.0.1:RELAY_PROXY_PORT.
+/// NAT relay proxy at `127.0.0.1:relay_port`.
+///
+/// `relay_port` is the per-profile relay proxy port derived from the active
+/// profile name via [`relay_proxy_port_for_profile`].
 ///
 /// Protocol: connect → write 2-byte big-endian port number → raw stream.
 /// SSH invokes this as a subprocess and speaks SSH protocol over its stdio.
-fn ssh_relay_proxy(port: u16) -> ! {
+fn ssh_relay_proxy(port: u16, relay_port: u16) -> ! {
     use std::fs::File;
     use std::io::Write;
     use std::net::TcpStream;
     use std::os::unix::io::FromRawFd;
 
-    const RELAY_PROXY_PORT: u16 = pelagos_vz::nat_relay::RELAY_PROXY_PORT;
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], RELAY_PROXY_PORT));
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], relay_port));
     let mut relay = TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5))
         .unwrap_or_else(|e| {
             eprintln!("ssh-relay-proxy: connect relay: {}", e);
@@ -1295,6 +1306,7 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
         port_forwards,
         profile: cli.profile.clone(),
         extra_disks: cli.extra_disks.clone(),
+        relay_proxy_port: relay_proxy_port_for_profile(&cli.profile),
     }
 }
 
@@ -1389,6 +1401,31 @@ fn build_virtiofs_shares(volumes: &[String]) -> Vec<daemon::VirtiofsShare> {
 /// Parse a slice of `/host:/container[:ro]` strings into `VirtiofsShare`s.
 /// Tags are assigned as `share0`, `share1`, etc. based on index.
 /// For home-aware share building, call `build_virtiofs_shares` instead.
+/// Returns the NAT relay proxy port for a given profile.
+///
+/// Each profile binds its own loopback port so that the default (Alpine
+/// container) VM and named profiles (e.g. "build" Ubuntu VM) can run
+/// simultaneously without one profile's `ssh-relay-proxy` or port-dispatcher
+/// accidentally connecting to the wrong daemon's relay.
+///
+/// "default" → [`pelagos_vz::nat_relay::RELAY_PROXY_PORT`] (17900) for
+/// backward compatibility.  Named profiles get a deterministic port derived
+/// from the profile name via FNV-1a hash, clamped to 17901..=18899 (well
+/// below the ephemeral port range and away from common service ports).
+fn relay_proxy_port_for_profile(profile: &str) -> u16 {
+    if profile == "default" {
+        return pelagos_vz::nat_relay::RELAY_PROXY_PORT;
+    }
+    // FNV-1a 32-bit: deterministic, zero-dependency, good distribution.
+    let mut hash: u32 = 2166136261;
+    for b in profile.bytes() {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    // 999 slots: 17901..=18899.  No collision with 17900 (default).
+    17901 + (hash % 999) as u16
+}
+
 fn parse_volumes(volumes: &[String]) -> Vec<daemon::VirtiofsShare> {
     volumes
         .iter()
@@ -2583,12 +2620,42 @@ fn read_winsize() -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        recv_frame, send_frame, Cli, Commands, GuestCommand, GuestMount, GuestResponse, FRAME_EXIT,
-        FRAME_RESIZE, FRAME_STDIN, FRAME_STDOUT,
+        recv_frame, relay_proxy_port_for_profile, send_frame, Cli, Commands, GuestCommand,
+        GuestMount, GuestResponse, FRAME_EXIT, FRAME_RESIZE, FRAME_STDIN, FRAME_STDOUT,
     };
     use clap::Parser as _;
     use std::io::Cursor;
     use std::path::PathBuf;
+
+    #[test]
+    fn relay_port_default_is_canonical() {
+        assert_eq!(
+            relay_proxy_port_for_profile("default"),
+            pelagos_vz::nat_relay::RELAY_PROXY_PORT
+        );
+    }
+
+    #[test]
+    fn relay_port_named_differs_from_default() {
+        let build_port = relay_proxy_port_for_profile("build");
+        assert_ne!(build_port, pelagos_vz::nat_relay::RELAY_PROXY_PORT);
+        assert!(build_port >= 17901 && build_port <= 18899);
+    }
+
+    #[test]
+    fn relay_port_named_is_deterministic() {
+        assert_eq!(
+            relay_proxy_port_for_profile("build"),
+            relay_proxy_port_for_profile("build")
+        );
+    }
+
+    #[test]
+    fn relay_port_distinct_profiles_differ() {
+        let a = relay_proxy_port_for_profile("build");
+        let b = relay_proxy_port_for_profile("staging");
+        assert_ne!(a, b, "different profile names should produce different ports");
+    }
 
     #[test]
     fn pong_deserializes() {

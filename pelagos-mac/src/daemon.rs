@@ -96,6 +96,9 @@ pub struct DaemonArgs {
     /// Secondary disk images: first → /dev/vdb, second → /dev/vdc, etc.
     /// Used during build-VM provisioning to avoid virtiofs I/O overhead.
     pub extra_disks: Vec<std::path::PathBuf>,
+    /// Loopback TCP port for the NAT relay proxy.  Distinct per profile so
+    /// multiple profiles can run simultaneously without relay conflicts.
+    pub relay_proxy_port: u16,
 }
 
 /// Ensure the daemon is running, starting it if necessary.
@@ -256,11 +259,12 @@ pub fn run(args: DaemonArgs) -> ! {
         });
 
     // Start a TCP proxy thread for each requested port forward.
+    let relay_proxy_port = args.relay_proxy_port;
     for pf in &args.port_forwards {
         let host_port = pf.host_port;
         let container_port = pf.container_port;
         std::thread::spawn(move || {
-            port_forward_loop(host_port, container_port);
+            port_forward_loop(host_port, container_port, relay_proxy_port);
         });
     }
 
@@ -394,14 +398,13 @@ fn proxy(unix: UnixStream, vsock: OwnedFd, conn_id: std::thread::ThreadId) {
 // ---------------------------------------------------------------------------
 
 /// Accept TCP connections on `host_port` and proxy each one to the VM container
-/// port via the smoltcp NAT relay proxy (127.0.0.1:RELAY_PROXY_PORT).
+/// port via the smoltcp NAT relay proxy at `127.0.0.1:relay_proxy_port`.
 ///
 /// Protocol: connect to relay, send 2-byte big-endian container_port, then
 /// use the socket as a bidirectional stream into the VM.  This avoids needing
 /// a macOS route to 192.168.105.2 (which no longer exists without vmnet).
-pub(crate) fn port_forward_loop(host_port: u16, container_port: u16) {
+pub(crate) fn port_forward_loop(host_port: u16, container_port: u16, relay_proxy_port: u16) {
     use std::io::Write;
-    const RELAY_PROXY_PORT: u16 = pelagos_vz::nat_relay::RELAY_PROXY_PORT;
 
     let listener = match TcpListener::bind(("0.0.0.0", host_port)) {
         Ok(l) => l,
@@ -414,7 +417,7 @@ pub(crate) fn port_forward_loop(host_port: u16, container_port: u16) {
         "port forward active: 0.0.0.0:{} → VM:{}  (via relay :{})",
         host_port,
         container_port,
-        RELAY_PROXY_PORT
+        relay_proxy_port
     );
     for incoming in listener.incoming() {
         let client = match incoming {
@@ -425,12 +428,12 @@ pub(crate) fn port_forward_loop(host_port: u16, container_port: u16) {
             }
         };
         std::thread::spawn(move || {
-            let relay_addr = std::net::SocketAddr::from(([127, 0, 0, 1], RELAY_PROXY_PORT));
+            let relay_addr = std::net::SocketAddr::from(([127, 0, 0, 1], relay_proxy_port));
             let mut server =
                 match TcpStream::connect_timeout(&relay_addr, std::time::Duration::from_secs(5)) {
                     Ok(s) => s,
                     Err(e) => {
-                        log::warn!("port forward connect relay:{}: {}", RELAY_PROXY_PORT, e);
+                        log::warn!("port forward connect relay:{}: {}", relay_proxy_port, e);
                         return;
                     }
                 };
@@ -522,7 +525,8 @@ fn build_vm_config(args: &DaemonArgs) -> VmConfig {
         .disk(&args.disk)
         .cmdline(build_cmdline(args))
         .memory_mib(args.memory_mib)
-        .cpus(args.cpus);
+        .cpus(args.cpus)
+        .relay_proxy_port(args.relay_proxy_port);
     if let Some(ref initrd) = args.initrd {
         b = b.initrd(initrd);
     }
@@ -1040,6 +1044,7 @@ mod tests {
             port_forwards: vec![],
             profile: "default".into(),
             extra_disks: vec![],
+            relay_proxy_port: pelagos_vz::nat_relay::RELAY_PROXY_PORT,
         }
     }
 
