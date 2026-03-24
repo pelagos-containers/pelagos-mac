@@ -210,6 +210,7 @@ fn render_modeline(f: &mut Frame, app: &App, area: Rect) {
             };
             let action_color = match action {
                 ConfirmAction::Remove => Color::Red,
+                ConfirmAction::StopAndRemove => Color::Red,
                 ConfirmAction::Stop => Color::Yellow,
                 ConfirmAction::Restart => Color::Cyan,
             };

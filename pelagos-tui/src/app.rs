@@ -48,6 +48,8 @@ pub enum ConfirmAction {
     Stop,
     Restart,
     Remove,
+    /// Stop then remove: used when at least one target is currently running.
+    StopAndRemove,
 }
 
 impl ConfirmAction {
@@ -57,15 +59,18 @@ impl ConfirmAction {
             ConfirmAction::Stop => "stop",
             ConfirmAction::Restart => "restart",
             ConfirmAction::Remove => "remove",
+            ConfirmAction::StopAndRemove => "stop and remove",
         }
     }
 
-    /// The `pelagos` subcommand name.
+    /// The `pelagos` subcommand name.  `StopAndRemove` is handled specially in
+    /// `execute_action_bg` and should not be used directly as a subcommand.
     pub fn pelagos_cmd(&self) -> &'static str {
         match self {
             ConfirmAction::Stop => "stop",
             ConfirmAction::Restart => "restart",
             ConfirmAction::Remove => "rm",
+            ConfirmAction::StopAndRemove => "rm",
         }
     }
 }
@@ -432,11 +437,28 @@ impl App {
 
     fn begin_action(&mut self, action: ConfirmAction) {
         let targets = self.action_targets();
-        if !targets.is_empty() {
-            self.confirm_action = Some(action);
-            self.confirm_targets = targets;
-            self.mode = Mode::Confirm;
+        if targets.is_empty() {
+            return;
         }
+        // If the user asks to remove a container that is still running, upgrade
+        // to StopAndRemove so they get a clear prompt and the stop happens first.
+        let action = if action == ConfirmAction::Remove {
+            let any_running = self
+                .containers
+                .iter()
+                .filter(|c| targets.contains(&c.name))
+                .any(|c| c.status == "running");
+            if any_running {
+                ConfirmAction::StopAndRemove
+            } else {
+                action
+            }
+        } else {
+            action
+        };
+        self.confirm_action = Some(action);
+        self.confirm_targets = targets;
+        self.mode = Mode::Confirm;
     }
 
     #[allow(dead_code)]
