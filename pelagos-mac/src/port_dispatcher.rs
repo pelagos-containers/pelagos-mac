@@ -248,7 +248,7 @@ fn add_listener(listeners: &mut HashMap<u16, ListenerEntry>, host_port: u16, con
     }
 }
 
-fn spawn_connection_handler(client: TcpStream, host_port: u16, container_port: u16) {
+fn spawn_connection_handler(client: TcpStream, host_port: u16, _container_port: u16) {
     std::thread::Builder::new()
         .name(format!("port-conn-{}", host_port))
         .spawn(move || {
@@ -260,8 +260,10 @@ fn spawn_connection_handler(client: TcpStream, host_port: u16, container_port: u
                     return;
                 }
             };
-            // Send 2-byte big-endian container port to the relay.
-            if server.write_all(&container_port.to_be_bytes()).is_err() {
+            // Send 2-byte big-endian host port to the relay.
+            // The relay connects to VM:host_port where pelagos's TCP proxy
+            // is listening (bound on host_port, not container_port).
+            if server.write_all(&host_port.to_be_bytes()).is_err() {
                 return;
             }
             proxy_bidirectional(client, server);

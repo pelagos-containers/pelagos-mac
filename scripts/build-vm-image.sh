@@ -96,6 +96,52 @@ LIBCOM_ERR_PKG="libcom_err-1.47.1-r1"
 LIBCOM_ERR_APK="$WORK/${LIBCOM_ERR_PKG}.apk"
 LIBCOM_ERR_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${LIBCOM_ERR_PKG}.apk"
 
+# iproute2-minimal: provides /sbin/ip — required by pelagos bridge networking (-p flag).
+IPROUTE2_MIN_PKG="iproute2-minimal-6.11.0-r0"
+IPROUTE2_MIN_APK="$WORK/${IPROUTE2_MIN_PKG}.apk"
+IPROUTE2_MIN_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${IPROUTE2_MIN_PKG}.apk"
+IP_BIN="$WORK/ip-bin"
+
+# nftables: provides /usr/sbin/nft — required for DNAT port-forward rules.
+NFTABLES_PKG="nftables-1.1.1-r0"
+NFTABLES_APK="$WORK/${NFTABLES_PKG}.apk"
+NFTABLES_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${NFTABLES_PKG}.apk"
+NFT_BIN="$WORK/nft-bin"
+
+# Shared library dependencies for ip and nft.
+# All paths are usr/lib/ inside the APK (Alpine 3.21+ moved libs there).
+LIBCAP2_PKG="libcap2-2.71-r0"
+LIBCAP2_APK="$WORK/${LIBCAP2_PKG}.apk"
+LIBCAP2_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${LIBCAP2_PKG}.apk"
+
+LIBELF_PKG="libelf-0.191-r0"
+LIBELF_APK="$WORK/${LIBELF_PKG}.apk"
+LIBELF_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${LIBELF_PKG}.apk"
+
+LIBMNL_PKG="libmnl-1.0.5-r2"
+LIBMNL_APK="$WORK/${LIBMNL_PKG}.apk"
+LIBMNL_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${LIBMNL_PKG}.apk"
+
+LIBNFTNL_PKG="libnftnl-1.2.8-r0"
+LIBNFTNL_APK="$WORK/${LIBNFTNL_PKG}.apk"
+LIBNFTNL_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${LIBNFTNL_PKG}.apk"
+
+LIBGMP_PKG="gmp-6.3.0-r2"
+LIBGMP_APK="$WORK/${LIBGMP_PKG}.apk"
+LIBGMP_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${LIBGMP_PKG}.apk"
+
+LIBJANSSON_PKG="jansson-2.14-r4"
+LIBJANSSON_APK="$WORK/${LIBJANSSON_PKG}.apk"
+LIBJANSSON_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${LIBJANSSON_PKG}.apk"
+
+LIBREADLINE_PKG="readline-8.2.13-r0"
+LIBREADLINE_APK="$WORK/${LIBREADLINE_PKG}.apk"
+LIBREADLINE_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${LIBREADLINE_PKG}.apk"
+
+LIBNCURSESW_PKG="libncursesw-6.5_p20241006-r3"
+LIBNCURSESW_APK="$WORK/${LIBNCURSESW_PKG}.apk"
+LIBNCURSESW_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${LIBNCURSESW_PKG}.apk"
+
 # SSH key for 'pelagos vm ssh': generated once per user, baked into the initramfs.
 PELAGOS_STATE_DIR="$HOME/.local/share/pelagos"
 SSH_KEY_FILE="$PELAGOS_STATE_DIR/vm_key"
@@ -373,6 +419,69 @@ else
     echo "  (cached: e2fsprogs libs)"
 fi
 
+# ---------------------------------------------------------------------------
+echo "[5f/8] Downloading iproute2-minimal + nftables (for pelagos bridge networking)"
+# ---------------------------------------------------------------------------
+extract_bin() {
+    # Usage: extract_bin <apk> <src-path-in-apk> <dest>
+    local apk="$1" src="$2" dest="$3"
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    bsdtar -xf "$apk" -C "$tmpdir" 2>/dev/null || true
+    if [ -f "$tmpdir/$src" ]; then
+        cp "$tmpdir/$src" "$dest"
+        chmod 755 "$dest"
+        rm -rf "$tmpdir"
+        return 0
+    fi
+    rm -rf "$tmpdir"
+    return 1
+}
+
+if [ ! -f "$IP_BIN" ]; then
+    [ ! -f "$IPROUTE2_MIN_APK" ] && curl -L --progress-bar -o "$IPROUTE2_MIN_APK" "$IPROUTE2_MIN_URL"
+    extract_bin "$IPROUTE2_MIN_APK" "sbin/ip" "$IP_BIN" || \
+        { echo "ERROR: ip not found in $IPROUTE2_MIN_APK" >&2; exit 1; }
+    echo "  Extracted ip binary"
+else
+    echo "  (cached: ip-bin)"
+fi
+
+if [ ! -f "$NFT_BIN" ]; then
+    [ ! -f "$NFTABLES_APK" ] && curl -L --progress-bar -o "$NFTABLES_APK" "$NFTABLES_URL"
+    extract_bin "$NFTABLES_APK" "usr/sbin/nft" "$NFT_BIN" || \
+        { echo "ERROR: nft not found in $NFTABLES_APK" >&2; exit 1; }
+    echo "  Extracted nft binary"
+else
+    echo "  (cached: nft-bin)"
+fi
+
+# Shared libs needed by ip and nft.
+# ip  needs: libcap.so.2, libelf.so.1, libmnl.so.0
+# nft needs: libmnl.so.0, libnftnl.so.11, libnftables.so.1, libgmp.so.10,
+#             libjansson.so.4, libreadline.so.8, libncursesw.so.6
+_fetch_so() {
+    local apk_file="$1" apk_url="$2" soname="$3"
+    local dest="$WORK/$soname"
+    if [ ! -f "$dest" ]; then
+        [ ! -f "$apk_file" ] && curl -L --progress-bar -o "$apk_file" "$apk_url"
+        extract_so "$apk_file" "$soname" "$dest" || \
+            { echo "ERROR: $soname not found in $apk_file" >&2; exit 1; }
+        echo "  Extracted $soname"
+    else
+        echo "  (cached: $soname)"
+    fi
+}
+_fetch_so "$LIBCAP2_APK"    "$LIBCAP2_URL"    "libcap.so.2"
+_fetch_so "$LIBELF_APK"     "$LIBELF_URL"     "libelf.so.1"
+_fetch_so "$LIBMNL_APK"     "$LIBMNL_URL"     "libmnl.so.0"
+_fetch_so "$LIBNFTNL_APK"   "$LIBNFTNL_URL"   "libnftnl.so.11"
+_fetch_so "$LIBGMP_APK"     "$LIBGMP_URL"     "libgmp.so.10"
+_fetch_so "$LIBJANSSON_APK" "$LIBJANSSON_URL" "libjansson.so.4"
+_fetch_so "$LIBREADLINE_APK" "$LIBREADLINE_URL" "libreadline.so.8"
+_fetch_so "$LIBNCURSESW_APK" "$LIBNCURSESW_URL" "libncursesw.so.6"
+_fetch_so "$NFTABLES_APK"   "$NFTABLES_URL"   "libnftables.so.1"
+
 
 # ---------------------------------------------------------------------------
 echo "[6/8] Staging Mozilla CA bundle (for TLS inside VM)"
@@ -463,6 +572,7 @@ if [ ! -f "$INITRAMFS_OUT" ] \
         # are all CONFIG_xxx=y (built-in).  Modules that are =m and required:
         #   vsock        — pelagos-guest comms
         #   overlayfs    — container layer stacking
+        #   virtiofs     — AVF host directory sharing (volumes, $HOME bind-mounts)
         #   bridge+deps  — pelagos bridge networking (NetworkMode::Bridge / -p)
         #   nftables     — port-forward DNAT rules
         # Stage all of the above from the Ubuntu module tree extracted by
@@ -470,6 +580,7 @@ if [ ! -f "$INITRAMFS_OUT" ] \
         for rel_dir in \
             net/vmw_vsock \
             fs/overlayfs \
+            fs/fuse \
             net/llc \
             net/802 \
             net/bridge \
@@ -493,24 +604,32 @@ if [ ! -f "$INITRAMFS_OUT" ] \
         else
             echo "  WARNING: overlay.ko not found in $UBUNTU_MODULES" >&2
         fi
-        # bridge + nftables modules (optional — warn but don't abort if missing,
-        # since they are only absent on old ubuntu-modules trees built before #172)
+        # virtiofs, bridge, nftables modules (optional — warn but don't abort if missing,
+        # since they are absent on old ubuntu-modules trees built before this fix)
         for rel_ko in \
+            fs/fuse/virtiofs.ko \
             net/llc/llc.ko \
             net/802/stp.ko \
             net/bridge/bridge.ko \
+            drivers/net/veth.ko \
+            lib/libcrc32c.ko \
+            net/ipv4/netfilter/nf_defrag_ipv4.ko \
+            net/ipv6/netfilter/nf_defrag_ipv6.ko \
             net/netfilter/nfnetlink.ko \
             net/netfilter/nf_tables.ko \
             net/netfilter/nf_conntrack.ko \
-            net/netfilter/nf_nat.ko
+            net/netfilter/nf_nat.ko \
+            net/netfilter/nft_nat.ko \
+            net/netfilter/nft_chain_nat.ko
         do
             src="$UBUNTU_MODULES/$rel_ko"
             dst="$INITRD_TMP/lib/modules/$KVER/kernel/$rel_ko"
             if [ -f "$src" ]; then
+                mkdir -p "$(dirname "$dst")"
                 cp "$src" "$dst"
                 echo "  staged (Ubuntu) $(basename $rel_ko)"
             else
-                echo "  INFO: $(basename $rel_ko) not in ubuntu-modules (rebuild with build-build-image.sh to enable bridge/nftables)" >&2
+                echo "  INFO: $(basename $rel_ko) not in ubuntu-modules (rebuild with build-build-image.sh to enable virtiofs/bridge/nftables)" >&2
             fi
         done
         # Use the Ubuntu modules.dep so modprobe resolves all dependency chains.
@@ -660,6 +779,25 @@ if [ ! -f "$INITRAMFS_OUT" ] \
     fi
 
 
+    # Add ip (iproute2-minimal) + nft (nftables) + their shared libs.
+    # Required for pelagos bridge networking and port-forward DNAT rules.
+    mkdir -p "$INITRD_TMP/sbin" "$INITRD_TMP/usr/sbin" "$INITRD_TMP/usr/lib"
+    cp "$IP_BIN"  "$INITRD_TMP/sbin/ip"
+    cp "$NFT_BIN" "$INITRD_TMP/usr/sbin/nft"
+    chmod 755 "$INITRD_TMP/sbin/ip" "$INITRD_TMP/usr/sbin/nft"
+    for soname in \
+        libcap.so.2 libelf.so.1 libmnl.so.0 libnftnl.so.11 \
+        libgmp.so.10 libjansson.so.4 libreadline.so.8 libncursesw.so.6 \
+        libnftables.so.1; do
+        src="$WORK/$soname"
+        if [ -f "$src" ]; then
+            cp "$src" "$INITRD_TMP/usr/lib/$soname"
+            echo "  staged $soname"
+        else
+            echo "  WARNING: $soname not found in $WORK — ip/nft may not work" >&2
+        fi
+    done
+
     # Stage the host's public key as the VM's authorized_keys.
     mkdir -p "$INITRD_TMP/root/.ssh"
     cp "${SSH_KEY_FILE}.pub" "$INITRD_TMP/root/.ssh/authorized_keys"
@@ -738,16 +876,25 @@ if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
     modprobe tun                 2>/dev/null || true
     modprobe jbd2                2>/dev/null || true
     modprobe ext4                2>/dev/null || true
+    # virtiofs for AVF host directory sharing (pelagos volumes, $HOME bind-mounts).
+    # =m in Ubuntu 6.8 HWE; absent on old images, silently skipped in that case.
+    modprobe virtiofs            2>/dev/null || true
     # Bridge networking + nftables for pelagos container networking (-p / bridge mode).
     # These are =m in Ubuntu 6.8 HWE; loaded here so pelagos run works immediately
     # after boot.  Silently skipped on old images that predate #172.
     modprobe llc                 2>/dev/null || true
     modprobe stp                 2>/dev/null || true
     modprobe bridge              2>/dev/null || true
+    modprobe libcrc32c           2>/dev/null || true
+    modprobe nf_defrag_ipv4      2>/dev/null || true
+    modprobe nf_defrag_ipv6      2>/dev/null || true
     modprobe nfnetlink           2>/dev/null || true
     modprobe nf_conntrack        2>/dev/null || true
     modprobe nf_nat              2>/dev/null || true
+    modprobe nft_nat             2>/dev/null || true
+    modprobe nft_chain_nat       2>/dev/null || true
     modprobe nf_tables           2>/dev/null || true
+    modprobe veth                2>/dev/null || true
     # Create /dev/net/tun device node.  The tun kernel module registers
     # the device (char major 10, minor 200) but does not create the node
     # automatically without udevd/mdev.  pasta requires /dev/net/tun to
@@ -829,6 +976,7 @@ if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
             [ -d "/\$d" ] && busybox cp -a "/\$d" /newroot/ 2>/dev/null || true
         done
         busybox cp /init /newroot/init
+        busybox chmod 755 /newroot/init
         busybox mkdir -p /newroot/proc /newroot/sys \
                          /newroot/dev /newroot/dev/pts /newroot/dev/net \
                          /newroot/tmp /newroot/run /newroot/run/pelagos \
@@ -871,6 +1019,11 @@ busybox ip link set eth0 up
 busybox ip addr add 192.168.105.2/24 dev eth0
 busybox ip route add default via 192.168.105.1
 echo "[pelagos-init] network: static 192.168.105.2/24"
+# Enable IP forwarding unconditionally — this is a container runtime VM.
+# pelagos port-forwarding uses nftables DNAT in PREROUTING to redirect
+# host-port connections to the container IP, which requires ip_forward=1
+# to move packets from eth0 to the bridge (pelagos0) interface.
+echo 1 > /proc/sys/net/ipv4/ip_forward
 echo "[pelagos-init] network ready"
 busybox mkdir -p /etc
 echo 'nameserver 8.8.8.8' > /etc/resolv.conf
@@ -879,6 +1032,10 @@ echo 'nameserver 8.8.4.4' >> /etc/resolv.conf
 # /tmp: bounded tmpfs — prevents VM-level OOM from unbounded temp storage.
 # Container workloads write to their own overlayfs (on /dev/vda), not here.
 busybox mkdir -p /tmp /run /run/pelagos
+# pelagos looks for /run/netns/{name}; Alpine iproute2 creates /var/run/netns.
+# Symlink so both paths resolve to the same directory.
+busybox mkdir -p /var/run/netns
+busybox ln -sf /var/run/netns /run/netns
 busybox mount -t tmpfs -o size=512m tmpfs /tmp
 
 # Gate on network readiness before pelagos-guest starts pulling images.
@@ -945,6 +1102,7 @@ mkdir -p /etc/dropbear
 
 (while true; do /bin/sh </dev/hvc0 >/dev/hvc0 2>/dev/hvc0; sleep 1; done) &
 
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export RUST_LOG=warn
 # Raise the open-file limit.  The default (1024) is easily exceeded when VS
 # Code opens 10+ simultaneous vsock connections each using namespace fds,
