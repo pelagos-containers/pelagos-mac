@@ -11,20 +11,20 @@
 //!      bidirectionally proxies bytes between the Unix stream and the vsock fd.
 //!   4. On SIGTERM the daemon stops the VM, removes state files, and exits.
 
-use std::io;
-use std::net::{TcpListener, TcpStream};
+use std::collections::HashMap;
+use std::io::{self, Read, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use pelagos_vz::vm::{Vm, VmConfig};
 
+use crate::port_dispatcher::{DispatchCmd, PortDispatcher};
 use crate::state::StateDir;
 
 // ---------------------------------------------------------------------------
@@ -73,6 +73,42 @@ pub struct VirtiofsShare {
     pub read_only: bool,
     /// Absolute path inside the container where the share is mounted.
     pub container_path: String,
+}
+
+/// Commands sent directly to the daemon (not proxied to vsock).
+///
+/// The daemon peeks at the first JSON line of each connection; if it
+/// deserialises as `DaemonCmd` it is handled locally and the connection is
+/// closed.  Any other first line is forwarded to the guest via vsock.
+#[derive(Debug, Deserialize, Serialize)]
+pub enum DaemonCmd {
+    /// Start listening on `host_port` and relay connections to `container_port`.
+    RegisterPort { host_port: u16, container_port: u16 },
+    /// Stop listening on `host_port`.  Active connections are not affected.
+    UnregisterPort { host_port: u16 },
+}
+
+/// One-line JSON response to a `DaemonCmd`.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DaemonResponse {
+    Ok,
+    Err { message: String },
+}
+
+/// Live port-forward state shared between connection handler threads and (in a
+/// future PR) the subscription watcher thread.
+struct PortState {
+    /// Maps host_port → container_port for every currently active forward.
+    active: HashMap<u16, u16>,
+}
+
+impl PortState {
+    fn new() -> Self {
+        Self {
+            active: HashMap::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -255,13 +291,21 @@ pub fn run(args: DaemonArgs) -> ! {
             log::error!("write extra_disks: {}", e);
         });
 
-    // Start a TCP proxy thread for each requested port forward.
-    for pf in &args.port_forwards {
-        let host_port = pf.host_port;
-        let container_port = pf.container_port;
-        std::thread::spawn(move || {
-            port_forward_loop(host_port, container_port);
-        });
+    // Spawn the single-threaded port-forward dispatcher (O(1) listener threads
+    // regardless of how many ports or containers are active).
+    let dispatcher = Arc::new(PortDispatcher::spawn());
+    let port_state = Arc::new(Mutex::new(PortState::new()));
+
+    // Pre-register any ports requested at daemon startup via `vm start -p`.
+    {
+        let mut ps = port_state.lock().unwrap();
+        for pf in &args.port_forwards {
+            dispatcher.send(DispatchCmd::Add {
+                host_port: pf.host_port,
+                container_port: pf.container_port,
+            });
+            ps.active.insert(pf.host_port, pf.container_port);
+        }
     }
 
     log::info!("daemon listening on {}", state.sock_file.display());
@@ -284,6 +328,8 @@ pub fn run(args: DaemonArgs) -> ! {
     loop {
         if shutdown.load(Ordering::Relaxed) {
             log::info!("shutdown requested, stopping VM...");
+            dispatcher.send(DispatchCmd::Shutdown);
+            drop(dispatcher);
             // Drop the Arc. If no proxy threads are active, Vm::drop runs stop().
             // If threads still hold clones the VM will stop when the last clone
             // drops. Either way the process exits immediately after cleanup.
@@ -318,19 +364,10 @@ pub fn run(args: DaemonArgs) -> ! {
         // blocked while waiting for the guest daemon to start (which can take
         // up to ~45 s during the ping-gate phase).
         let vm2 = Arc::clone(&vm);
+        let disp2 = Arc::clone(&dispatcher);
+        let ps2 = Arc::clone(&port_state);
         std::thread::spawn(move || {
-            let conn_id = std::thread::current().id();
-            log::info!("[{conn_id:?}] client connected");
-            let vsock_fd = match vm2.connect_vsock() {
-                Ok(fd) => fd,
-                Err(e) => {
-                    log::error!("[{conn_id:?}] vsock connect: {}", e);
-                    return; // unix stream dropped → EOF on CLI side
-                }
-            };
-            drop(vm2); // release Arc before entering the proxy loop
-            proxy(unix, vsock_fd, conn_id);
-            log::info!("[{conn_id:?}] client disconnected");
+            handle_connection(unix, vm2, disp2, ps2);
         });
     }
 }
@@ -390,81 +427,130 @@ fn proxy(unix: UnixStream, vsock: OwnedFd, conn_id: std::thread::ThreadId) {
 }
 
 // ---------------------------------------------------------------------------
-// Port forwarding
+// Connection handler
 // ---------------------------------------------------------------------------
 
-/// Accept TCP connections on `host_port` and proxy each one to the VM container
-/// port via the smoltcp NAT relay proxy (127.0.0.1:RELAY_PROXY_PORT).
+/// Handle one accepted Unix socket connection.
 ///
-/// Protocol: connect to relay, send 2-byte big-endian container_port, then
-/// use the socket as a bidirectional stream into the VM.  This avoids needing
-/// a macOS route to 192.168.105.2 (which no longer exists without vmnet).
-pub(crate) fn port_forward_loop(host_port: u16, container_port: u16) {
-    use std::io::Write;
-    const RELAY_PROXY_PORT: u16 = pelagos_vz::nat_relay::RELAY_PROXY_PORT;
+/// Peeks at the first newline-terminated JSON line:
+/// - If it is a `DaemonCmd`: handle locally (port registration / removal) and return.
+/// - Otherwise: open a vsock channel to the guest and bidirectionally proxy all bytes.
+fn handle_connection(
+    mut unix: UnixStream,
+    vm: Arc<Vm>,
+    dispatcher: Arc<PortDispatcher>,
+    port_state: Arc<Mutex<PortState>>,
+) {
+    let conn_id = std::thread::current().id();
+    log::info!("[{conn_id:?}] client connected");
 
-    let listener = match TcpListener::bind(("0.0.0.0", host_port)) {
-        Ok(l) => l,
+    // Read the first line byte-by-byte so we never consume more than one line
+    // into a buffer that could then be lost when we hand the stream to proxy().
+    let mut first_line: Vec<u8> = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    loop {
+        match unix.read(&mut byte) {
+            Ok(0) | Err(_) => {
+                log::debug!("[{conn_id:?}] connection closed before first line");
+                return;
+            }
+            Ok(_) => {
+                first_line.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+                if first_line.len() > 64 * 1024 {
+                    log::warn!("[{conn_id:?}] first line exceeds 64 KiB — dropping connection");
+                    return;
+                }
+            }
+        }
+    }
+
+    let trimmed = String::from_utf8_lossy(&first_line);
+    let trimmed = trimmed.trim_end();
+
+    // If the first line is a DaemonCmd, handle it locally (no vsock needed).
+    if let Ok(cmd) = serde_json::from_str::<DaemonCmd>(trimmed) {
+        handle_daemon_cmd(cmd, &mut unix, &dispatcher, &port_state, conn_id);
+        return;
+    }
+
+    // Not a DaemonCmd — proxy to vsock.  Connect inside this thread so the
+    // accept loop is not blocked while waiting for the guest to start.
+    let vsock_fd = match vm.connect_vsock() {
+        Ok(fd) => fd,
         Err(e) => {
-            log::error!("port forward bind 0.0.0.0:{}: {}", host_port, e);
+            log::error!("[{conn_id:?}] vsock connect: {}", e);
             return;
         }
     };
-    log::info!(
-        "port forward active: 0.0.0.0:{} → VM:{}  (via relay :{})",
-        host_port,
-        container_port,
-        RELAY_PROXY_PORT
-    );
-    for incoming in listener.incoming() {
-        let client = match incoming {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!("port forward accept: {}", e);
-                continue;
-            }
-        };
-        std::thread::spawn(move || {
-            let relay_addr = std::net::SocketAddr::from(([127, 0, 0, 1], RELAY_PROXY_PORT));
-            let mut server =
-                match TcpStream::connect_timeout(&relay_addr, std::time::Duration::from_secs(5)) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::warn!("port forward connect relay:{}: {}", RELAY_PROXY_PORT, e);
-                        return;
-                    }
-                };
-            // Send 2-byte big-endian container port.
-            if server.write_all(&container_port.to_be_bytes()).is_err() {
-                return;
-            }
-            tcp_proxy(client, server);
-        });
+    drop(vm);
+
+    // Replay the peeked line to vsock before entering the bidirectional proxy.
+    let vsock_raw = vsock_fd.into_raw_fd();
+    {
+        // SAFETY: vsock_raw is valid.  mem::forget prevents the File from
+        // closing it so we can hand it to proxy() below.
+        let mut f = unsafe { std::fs::File::from_raw_fd(vsock_raw) };
+        let ok = f.write_all(&first_line).is_ok();
+        std::mem::forget(f);
+        if !ok {
+            log::warn!("[{conn_id:?}] failed to replay first line to vsock");
+            unsafe { libc::close(vsock_raw) };
+            return;
+        }
     }
+    let vsock_owned = unsafe { OwnedFd::from_raw_fd(vsock_raw) };
+    proxy(unix, vsock_owned, conn_id);
+    log::info!("[{conn_id:?}] client disconnected");
 }
 
-/// Bidirectionally proxy two TCP streams.  Returns when either side closes.
-fn tcp_proxy(client: TcpStream, server: TcpStream) {
-    let mut client_read = client;
-    let mut server_read = server;
-    let mut client_write = client_read.try_clone().expect("tcp clone");
-    let mut server_write = server_read.try_clone().expect("tcp clone");
+/// Execute a `DaemonCmd` locally and write a `DaemonResponse` back to the caller.
+fn handle_daemon_cmd(
+    cmd: DaemonCmd,
+    unix: &mut UnixStream,
+    dispatcher: &PortDispatcher,
+    port_state: &Mutex<PortState>,
+    conn_id: std::thread::ThreadId,
+) {
+    let response = match cmd {
+        DaemonCmd::RegisterPort {
+            host_port,
+            container_port,
+        } => {
+            let mut ps = port_state.lock().unwrap();
+            if let std::collections::hash_map::Entry::Vacant(e) = ps.active.entry(host_port) {
+                dispatcher.send(DispatchCmd::Add {
+                    host_port,
+                    container_port,
+                });
+                e.insert(container_port);
+                log::info!(
+                    "[{conn_id:?}] registered port {}:{}",
+                    host_port,
+                    container_port
+                );
+                DaemonResponse::Ok
+            } else {
+                let msg = format!("port {} is already registered", host_port);
+                log::warn!("[{conn_id:?}] register port: {}", msg);
+                DaemonResponse::Err { message: msg }
+            }
+        }
+        DaemonCmd::UnregisterPort { host_port } => {
+            let mut ps = port_state.lock().unwrap();
+            if ps.active.remove(&host_port).is_some() {
+                dispatcher.send(DispatchCmd::Remove { host_port });
+                log::info!("[{conn_id:?}] unregistered port {}", host_port);
+            }
+            DaemonResponse::Ok
+        }
+    };
 
-    // client → server
-    let t1 = std::thread::spawn(move || {
-        let _ = std::io::copy(&mut client_read, &mut server_write);
-        // Signal server that client is done sending.
-        let _ = server_write.shutdown(std::net::Shutdown::Write);
-    });
-
-    // server → client
-    let t2 = std::thread::spawn(move || {
-        let _ = std::io::copy(&mut server_read, &mut client_write);
-        let _ = client_write.shutdown(std::net::Shutdown::Write);
-    });
-
-    let _ = t1.join();
-    let _ = t2.join();
+    let mut resp_str = serde_json::to_string(&response).unwrap_or_default();
+    resp_str.push('\n');
+    let _ = unix.write_all(resp_str.as_bytes());
 }
 
 // ---------------------------------------------------------------------------

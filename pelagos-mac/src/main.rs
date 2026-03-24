@@ -15,6 +15,7 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 mod daemon;
+mod port_dispatcher;
 mod state;
 
 // ---------------------------------------------------------------------------
@@ -751,23 +752,25 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            // Start host-side port proxies for foreground runs so that
-            // localhost:HOST_PORT is forwarded to VM:HOST_PORT via the relay.
-            // These threads are tied to the CLI process lifetime — they stop
-            // when the container exits and the CLI process exits.
-            // For detached runs the daemon-level port_forwards handle host-side
-            // forwarding (configured at daemon startup via -p global flag).
-            if !cli.ports.is_empty() && !detach {
-                for spec in &cli.ports {
-                    if let Some(pf) = daemon::parse_port_spec(spec) {
-                        let hp = pf.host_port;
-                        let cp = pf.host_port; // relay to VM host_port (pelagos proxy listens there)
-                        std::thread::spawn(move || daemon::port_forward_loop(hp, cp));
+            // Register port forwards with the daemon.  The daemon's
+            // PortDispatcher (one listener thread for all ports) manages TCP
+            // listeners; conflict detection returns an error immediately.
+            for spec in &cli.ports {
+                if let Some(pf) = daemon::parse_port_spec(spec) {
+                    if let Err(e) = send_daemon_cmd(
+                        &profile,
+                        daemon::DaemonCmd::RegisterPort {
+                            host_port: pf.host_port,
+                            container_port: pf.container_port,
+                        },
+                    ) {
+                        log::error!("port registration failed: {}", e);
+                        process::exit(1);
                     }
                 }
             }
             let stream = connect_or_exit(&profile);
-            process::exit(passthrough_command(
+            let exit_code = passthrough_command(
                 stream,
                 GuestCommand::Run {
                     image,
@@ -779,7 +782,25 @@ fn main() {
                     labels,
                     publish: cli.ports.clone(),
                 },
-            ));
+            );
+            // For foreground containers the CLI process stays alive until the
+            // container exits; deregister ports now.  For detached containers
+            // the caller has already returned (passthrough exits immediately)
+            // and deregistration will be handled by the subscription watcher
+            // (issue #169).
+            if !detach {
+                for spec in &cli.ports {
+                    if let Some(pf) = daemon::parse_port_spec(spec) {
+                        let _ = send_daemon_cmd(
+                            &profile,
+                            daemon::DaemonCmd::UnregisterPort {
+                                host_port: pf.host_port,
+                            },
+                        );
+                    }
+                }
+            }
+            process::exit(exit_code);
         }
 
         Commands::Exec {
@@ -1117,15 +1138,20 @@ fn main() {
 /// macOS and forwards each accepted connection to `192.168.105.2:VM`.
 /// Runs until the process is killed (SIGTERM from the shim on container stop/rm).
 fn cmd_port_proxy(ports: &[String]) {
+    use port_dispatcher::{DispatchCmd, PortDispatcher};
+
     if ports.is_empty() {
         log::warn!("port-proxy: no ports specified, exiting immediately");
         return;
     }
+    let dispatcher = PortDispatcher::spawn();
     for spec in ports {
         match daemon::parse_port_spec(spec) {
             Some(pf) => {
-                let (hp, cp) = (pf.host_port, pf.container_port);
-                std::thread::spawn(move || daemon::port_forward_loop(hp, cp));
+                dispatcher.send(DispatchCmd::Add {
+                    host_port: pf.host_port,
+                    container_port: pf.container_port,
+                });
             }
             None => {
                 log::error!("port-proxy: invalid port spec {:?}", spec);
@@ -1439,6 +1465,32 @@ fn connect_or_exit(profile: &str) -> UnixStream {
         log::error!("connect to VM daemon: {}", e);
         process::exit(1);
     })
+}
+
+/// Send a `DaemonCmd` to the running daemon and return the response.
+///
+/// Connects to `vm.sock`, writes one JSON line, reads one JSON response line,
+/// then closes.  Returns `Err` if the daemon reports a port conflict or the
+/// connection fails.
+fn send_daemon_cmd(profile: &str, cmd: daemon::DaemonCmd) -> io::Result<()> {
+    let mut stream = daemon::connect(profile)?;
+    let mut msg =
+        serde_json::to_string(&cmd).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    msg.push('\n');
+    stream.write_all(msg.as_bytes())?;
+
+    // Read the one-line response.
+    let mut line = String::new();
+    let mut reader = BufReader::new(stream);
+    reader.read_line(&mut line)?;
+
+    match serde_json::from_str::<daemon::DaemonResponse>(line.trim()) {
+        Ok(daemon::DaemonResponse::Ok) => Ok(()),
+        Ok(daemon::DaemonResponse::Err { message }) => {
+            Err(io::Error::new(io::ErrorKind::AlreadyExists, message))
+        }
+        Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+    }
 }
 
 // ---------------------------------------------------------------------------
