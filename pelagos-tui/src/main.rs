@@ -291,11 +291,12 @@ fn run_loop(
             // race the rm commands: the snapshot would arrive mid-delete and some
             // containers would reappear.  stop/restart rely on ContainerExited /
             // ContainerStarted subscription events and don't need a forced reconnect.
-            let sub_config_for_rm = if action == ConfirmAction::Remove {
-                app.sub_config.clone()
-            } else {
-                None
-            };
+            let sub_config_for_rm =
+                if action == ConfirmAction::Remove || action == ConfirmAction::StopAndRemove {
+                    app.sub_config.clone()
+                } else {
+                    None
+                };
             std::thread::spawn(move || {
                 execute_action_bg(&profile, &action, &targets, status_tx, sub_config_for_rm);
             });
@@ -379,10 +380,22 @@ fn execute_action_bg(
     status_tx: Option<mpsc::SyncSender<String>>,
     sub_config: Option<std::sync::Arc<std::sync::Mutex<SubConfig>>>,
 ) {
-    let subcmd = action.pelagos_cmd();
     let mut errors: Vec<String> = Vec::new();
 
     for name in targets {
+        // StopAndRemove: stop the container first, then remove it.
+        if *action == ConfirmAction::StopAndRemove {
+            log::info!("action: profile={} stop {}", profile, name);
+            let _ = std::process::Command::new("pelagos")
+                .arg("--profile")
+                .arg(profile)
+                .arg("stop")
+                .arg(name)
+                .stdin(std::process::Stdio::null())
+                .output();
+        }
+
+        let subcmd = action.pelagos_cmd();
         log::info!("action: profile={} {} {}", profile, subcmd, name);
         let result = std::process::Command::new("pelagos")
             .arg("--profile")
