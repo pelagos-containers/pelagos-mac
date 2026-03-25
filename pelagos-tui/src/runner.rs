@@ -3,6 +3,7 @@
 //! The Runner trait abstracts over the underlying pelagos binary invocation so
 //! that M5 can add a `LinuxRunner` without touching app or ui code.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -10,28 +11,67 @@ use std::process::Command;
 // Data model
 // ---------------------------------------------------------------------------
 
-/// Mirrors the JSON shape emitted by `pelagos ps --format json`.
+/// Subset of `SpawnConfig` from pelagos/src/cli/mod.rs that we surface in the
+/// inspect overlay.  Fields are all `#[serde(default)]` so old state files
+/// (without a `spawn_config` key) deserialise cleanly.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct SpawnConfigView {
+    #[serde(default)]
+    pub env: Vec<String>,
+    #[serde(default)]
+    pub bind: Vec<String>,
+    #[serde(default)]
+    pub bind_ro: Vec<String>,
+    #[serde(default)]
+    pub volume: Vec<String>,
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    #[serde(default)]
+    pub hostname: Option<String>,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// Mirrors the JSON shape emitted by `pelagos ps --json`.
 ///
 /// Field names match `ContainerState` in pelagos/src/cli/mod.rs exactly.
-/// Optional fields use `#[serde(default)]` for forward/backward compatibility.
+/// Optional/collection fields use `#[serde(default)]` for forward/backward
+/// compatibility — absent keys deserialise to empty/None.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Container {
     pub name: String,
     pub rootfs: String,
     pub status: String, // "running" | "exited"
-    // pid, exit_code, and command are part of the wire format and may be used in M2+.
-    #[allow(dead_code)]
     pub pid: i32,
     pub started_at: String,
     #[serde(default)]
-    #[allow(dead_code)]
     pub exit_code: Option<i32>,
     #[serde(default)]
-    #[allow(dead_code)]
     pub command: Vec<String>,
     /// Port mappings from `pelagos run -p HOST:CONTAINER` (e.g. `["8080:80"]`).
     #[serde(default)]
     pub ports: Vec<String>,
+    // ---- fields present in ContainerState but absent from ContainerSnapshot ----
+    /// Bridge IP address (bridge networking).
+    #[serde(default)]
+    pub bridge_ip: Option<String>,
+    /// Per-network IP map: network_name → IP.
+    #[serde(default)]
+    pub network_ips: HashMap<String, String>,
+    /// Key-value labels.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+    /// Captured stdout log path (detached containers).
+    #[serde(default)]
+    pub stdout_log: Option<String>,
+    /// Captured stderr log path (detached containers).
+    #[serde(default)]
+    pub stderr_log: Option<String>,
+    /// Original spawn configuration (present after first `pelagos run`).
+    #[serde(default)]
+    pub spawn_config: Option<SpawnConfigView>,
 }
 
 // ---------------------------------------------------------------------------

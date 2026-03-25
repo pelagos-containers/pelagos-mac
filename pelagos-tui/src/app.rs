@@ -5,6 +5,41 @@ use std::collections::HashSet;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
+// ---------------------------------------------------------------------------
+// Random container name generator (adjective-noun)
+// ---------------------------------------------------------------------------
+
+const ADJECTIVES: &[&str] = &[
+    "admiring", "adoring", "agitated", "amazing", "bold", "brave", "busy", "charming",
+    "clever", "confident", "cool", "curious", "daring", "determined", "eager", "earnest",
+    "elegant", "epic", "fervent", "fierce", "focused", "friendly", "gentle", "graceful",
+    "happy", "hopeful", "jolly", "keen", "lively", "lucid", "merry", "nifty", "nimble",
+    "peaceful", "quiet", "relaxed", "sharp", "sleepy", "stoic", "tender", "trusting",
+    "upbeat", "vigilant", "vivid", "witty", "wonderful", "zealous",
+];
+
+const NOUNS: &[&str] = &[
+    "albatross", "baboon", "bear", "beaver", "capybara", "cheetah", "condor", "crane",
+    "dingo", "dolphin", "dragon", "eagle", "falcon", "ferret", "firefly", "flamingo",
+    "gazelle", "gecko", "gibbon", "giraffe", "gorilla", "hawk", "hedgehog", "heron",
+    "ibis", "iguana", "jaguar", "jellyfish", "kestrel", "kingfisher", "lemur", "leopard",
+    "lynx", "meerkat", "narwhal", "ocelot", "osprey", "otter", "panda", "panther",
+    "parrot", "peacock", "pelican", "penguin", "phoenix", "puffin", "raven", "seahorse",
+    "sparrow", "squirrel", "swift", "tiger", "tortoise", "toucan", "vulture", "wombat",
+    "zebra",
+];
+
+fn random_name() -> String {
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(42);
+    let adj = ADJECTIVES[(seed as usize) % ADJECTIVES.len()];
+    let noun = NOUNS[((seed >> 16) as usize) % NOUNS.len()];
+    format!("{}-{}", adj, noun)
+}
+
+use crate::config::TuiConfig;
 use crate::runner::Container;
 
 // ---------------------------------------------------------------------------
@@ -21,7 +56,7 @@ pub enum SubscriptionMsg {
         vm_running: bool,
     },
     ContainerStarted {
-        container: Container,
+        container: Box<Container>,
     },
     ContainerExited {
         name: String,
@@ -89,6 +124,8 @@ pub enum Mode {
     Confirm,
     /// Waiting for y/N/q confirmation before quitting.
     ConfirmQuit,
+    /// Scrollable inspect overlay showing full container detail.
+    Inspect,
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +149,7 @@ pub struct App {
     pub palette_input: String,
     /// Set by the palette on Enter; main.rs drains this to spawn the run.
     pub pending_run: Option<String>,
+    pub tui_config: TuiConfig,
     /// Set by confirm on 'y'; main.rs drains this to execute the action.
     pub pending_action: Option<(ConfirmAction, Vec<String>)>,
     pub status_message: Option<String>,
@@ -123,12 +161,24 @@ pub struct App {
     // Confirm mode state — valid only when mode == Mode::Confirm.
     pub confirm_action: Option<ConfirmAction>,
     pub confirm_targets: Vec<String>,
+    // Inspect overlay state.
+    /// Container name to fetch detail for; drained by main.rs to spawn the query.
+    pub pending_inspect: Option<String>,
+    /// Channel on which the background ps thread delivers the enriched Container.
+    pub inspect_result_tx: Option<mpsc::SyncSender<Container>>,
+    pub inspect_result_rx: Option<mpsc::Receiver<Container>>,
+    /// The container whose detail is currently displayed.
+    pub inspect_container: Option<Container>,
+    /// Scroll offset within the inspect overlay (lines).
+    pub inspect_scroll: usize,
 }
 
 impl App {
     pub fn new(profile: String, profiles: Vec<String>) -> Self {
         let picker_idx = profiles.iter().position(|p| p == &profile).unwrap_or(0);
         let (status_tx, status_rx) = mpsc::sync_channel(8);
+        let (inspect_tx, inspect_rx) = mpsc::sync_channel(1);
+        let tui_config = TuiConfig::load(&profile);
         Self {
             mode: Mode::Normal,
             containers: Vec::new(),
@@ -143,6 +193,7 @@ impl App {
             should_quit: false,
             palette_input: String::new(),
             pending_run: None,
+            tui_config,
             pending_action: None,
             status_message: None,
             status_tx: Some(status_tx),
@@ -152,6 +203,11 @@ impl App {
             last_any_msg: Instant::now(),
             confirm_action: None,
             confirm_targets: Vec::new(),
+            pending_inspect: None,
+            inspect_result_tx: Some(inspect_tx),
+            inspect_result_rx: Some(inspect_rx),
+            inspect_container: None,
+            inspect_scroll: 0,
         }
     }
 
@@ -198,9 +254,9 @@ impl App {
                         .iter()
                         .position(|c| c.name == container.name)
                     {
-                        self.containers[pos] = container;
+                        self.containers[pos] = *container;
                     } else {
-                        self.containers.push(container);
+                        self.containers.push(*container);
                     }
                 }
                 self.last_refresh = Instant::now();
@@ -243,6 +299,7 @@ impl App {
             Mode::CommandPalette => self.on_key_palette(key),
             Mode::Confirm => self.on_key_confirm(key),
             Mode::ConfirmQuit => self.on_key_confirm_quit(key),
+            Mode::Inspect => self.on_key_inspect(key),
         }
     }
 
@@ -295,7 +352,17 @@ impl App {
             }
 
             KeyCode::Char('r') => {
-                self.palette_input.clear();
+                self.palette_input = format!(
+                    "--name {} -it {} {}",
+                    random_name(),
+                    self.tui_config.default_image,
+                    self.tui_config.default_it_cmd,
+                );
+                self.mode = Mode::CommandPalette;
+            }
+
+            KeyCode::Char('R') => {
+                self.palette_input = format!("--name {} -d ", random_name());
                 self.mode = Mode::CommandPalette;
             }
 
@@ -303,6 +370,15 @@ impl App {
             KeyCode::Char('s') => self.begin_action(ConfirmAction::Stop),
             KeyCode::Char('S') => self.begin_action(ConfirmAction::Restart),
             KeyCode::Char('d') => self.begin_action(ConfirmAction::Remove),
+
+            // Inspect overlay: show full detail for highlighted container.
+            KeyCode::Enter | KeyCode::Char('i') => {
+                if let Some(c) = self.containers.get(self.selected) {
+                    self.pending_inspect = Some(c.name.clone());
+                    self.inspect_scroll = 0;
+                    self.mode = Mode::Inspect;
+                }
+            }
 
             // Prune: target all exited containers regardless of selection.
             KeyCode::Char('P') => {
@@ -414,6 +490,22 @@ impl App {
         }
     }
 
+    fn on_key_inspect(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = Mode::Normal;
+                self.inspect_container = None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.inspect_scroll = self.inspect_scroll.saturating_add(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.inspect_scroll = self.inspect_scroll.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
@@ -464,6 +556,17 @@ impl App {
     #[allow(dead_code)]
     pub fn selected_container(&self) -> Option<&Container> {
         self.containers.get(self.selected)
+    }
+
+    /// Drain any pending inspect result delivered by the background thread.
+    pub fn poll_inspect_result(&mut self) {
+        if let Some(rx) = &self.inspect_result_rx {
+            while let Ok(c) = rx.try_recv() {
+                self.inspect_container = Some(c);
+                // Clamp scroll in case the new result is shorter.
+                self.inspect_scroll = 0;
+            }
+        }
     }
 
     pub fn refresh_age_secs(&self) -> u64 {
