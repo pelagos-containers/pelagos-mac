@@ -227,6 +227,11 @@ enum Commands {
         #[arg(default_value = ".")]
         context: String,
     },
+    /// Manage OCI images stored inside the VM
+    Image {
+        #[command(subcommand)]
+        cmd: ImageCmd,
+    },
     /// Manage named volumes inside the VM
     Volume {
         /// Subcommand: create, ls, rm
@@ -278,6 +283,34 @@ enum Commands {
     SshRelayProxy {
         /// VM port to connect to (e.g. 22 for SSH).
         port: u16,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ImageCmd {
+    /// List locally stored OCI images
+    Ls,
+    /// Pull an OCI image from a registry
+    Pull {
+        /// Image reference (e.g. alpine:latest, registry.io/org/repo:tag)
+        reference: String,
+    },
+    /// Remove a locally stored OCI image
+    Rm {
+        /// Image reference to remove
+        reference: String,
+    },
+    /// Tag a local OCI image with a new reference
+    Tag {
+        /// Source image reference
+        source: String,
+        /// New tag to apply
+        target: String,
+    },
+    /// Show details of a locally stored OCI image (JSON)
+    Inspect {
+        /// Image reference
+        reference: String,
     },
 }
 
@@ -448,6 +481,25 @@ enum GuestCommand {
         container: String,
         dst: String,
         data_size: u64,
+    },
+    /// List locally stored OCI images; maps to `pelagos image ls --format json`.
+    ImageLs,
+    /// Pull an OCI image from a registry; maps to `pelagos image pull <reference>`.
+    ImagePull {
+        reference: String,
+    },
+    /// Remove a locally stored OCI image; maps to `pelagos image rm <reference>`.
+    ImageRm {
+        reference: String,
+    },
+    /// Tag a local OCI image with a new reference; maps to `pelagos image tag <source> <target>`.
+    ImageTag {
+        source: String,
+        target: String,
+    },
+    /// Inspect a local OCI image; maps to `pelagos image ls --format json` filtered by reference.
+    ImageInspect {
+        reference: String,
     },
 }
 
@@ -1039,6 +1091,32 @@ fn main() {
                 no_cache,
                 &context,
             ));
+        }
+
+        Commands::Image { ref cmd } => {
+            let daemon_args = daemon_args_from_cli(&cli);
+            if let Err(e) = daemon::ensure_running(&daemon_args) {
+                log::error!("failed to start VM daemon: {}", e);
+                process::exit(1);
+            }
+            let stream = connect_or_exit(&profile);
+            let guest_cmd = match cmd {
+                ImageCmd::Ls => GuestCommand::ImageLs,
+                ImageCmd::Pull { reference } => GuestCommand::ImagePull {
+                    reference: reference.clone(),
+                },
+                ImageCmd::Rm { reference } => GuestCommand::ImageRm {
+                    reference: reference.clone(),
+                },
+                ImageCmd::Tag { source, target } => GuestCommand::ImageTag {
+                    source: source.clone(),
+                    target: target.clone(),
+                },
+                ImageCmd::Inspect { reference } => GuestCommand::ImageInspect {
+                    reference: reference.clone(),
+                },
+            };
+            process::exit(passthrough_command(stream, guest_cmd));
         }
 
         Commands::Volume { ref sub, ref name } => {
@@ -3197,6 +3275,60 @@ mod tests {
         assert_eq!(v["container"], "mybox");
         assert_eq!(v["dst"], "/tmp/");
         assert_eq!(v["data_size"], 4096);
+    }
+
+    #[test]
+    fn image_ls_serializes() {
+        let cmd = GuestCommand::ImageLs;
+        let json = serde_json::to_string(&cmd).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "image_ls");
+    }
+
+    #[test]
+    fn image_pull_serializes() {
+        let cmd = GuestCommand::ImagePull {
+            reference: "alpine:latest".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "image_pull");
+        assert_eq!(v["reference"], "alpine:latest");
+    }
+
+    #[test]
+    fn image_rm_serializes() {
+        let cmd = GuestCommand::ImageRm {
+            reference: "alpine:latest".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "image_rm");
+        assert_eq!(v["reference"], "alpine:latest");
+    }
+
+    #[test]
+    fn image_tag_serializes() {
+        let cmd = GuestCommand::ImageTag {
+            source: "alpine:latest".into(),
+            target: "alpine:sparky".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "image_tag");
+        assert_eq!(v["source"], "alpine:latest");
+        assert_eq!(v["target"], "alpine:sparky");
+    }
+
+    #[test]
+    fn image_inspect_serializes() {
+        let cmd = GuestCommand::ImageInspect {
+            reference: "alpine:latest".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "image_inspect");
+        assert_eq!(v["reference"], "alpine:latest");
     }
 
     #[test]
