@@ -152,6 +152,9 @@ pub struct App {
     pub tui_config: TuiConfig,
     /// Set by confirm on 'y'; main.rs drains this to execute the action.
     pub pending_action: Option<(ConfirmAction, Vec<String>)>,
+    /// Old profile name set on profile switch; main.rs stops that VM then
+    /// bumps the subscription generation to connect to the new profile.
+    pub pending_profile_switch: Option<String>,
     pub status_message: Option<String>,
     pub status_tx: Option<mpsc::SyncSender<String>>,
     pub status_rx: Option<mpsc::Receiver<String>>,
@@ -195,6 +198,7 @@ impl App {
             pending_run: None,
             tui_config,
             pending_action: None,
+            pending_profile_switch: None,
             status_message: None,
             status_tx: Some(status_tx),
             status_rx: Some(status_rx),
@@ -415,16 +419,19 @@ impl App {
             KeyCode::Enter => {
                 if let Some(chosen) = self.profiles.get(self.profile_picker_selected).cloned() {
                     if chosen != self.profile {
-                        log::debug!("profile switch: {} -> {}", self.profile, chosen);
-                        self.profile = chosen.clone();
+                        let old = std::mem::replace(&mut self.profile, chosen.clone());
+                        log::debug!("profile switch: {} -> {}", old, chosen);
                         self.containers.clear();
                         self.selected = 0;
                         self.selected_names.clear();
+                        self.tui_config = TuiConfig::load(&chosen);
+                        // Update the target profile but do NOT bump generation yet.
+                        // main.rs will stop the old VM first, then bump, so the
+                        // new VM starts without a NAT relay port conflict.
                         if let Some(cfg) = &self.sub_config {
-                            let mut c = cfg.lock().unwrap();
-                            c.profile = chosen;
-                            c.generation = c.generation.wrapping_add(1);
+                            cfg.lock().unwrap().profile = chosen;
                         }
+                        self.pending_profile_switch = Some(old);
                     }
                 }
                 self.mode = Mode::Normal;

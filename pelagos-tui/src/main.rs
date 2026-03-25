@@ -315,6 +315,23 @@ fn run_loop(
             });
         }
 
+        // Profile switch: stop the old VM, then trigger subscription reconnect.
+        // Stopping first avoids a NAT relay port conflict that would cause
+        // ensure_running to fail and the TUI to show "vm not running".
+        if let Some(old_profile) = app.pending_profile_switch.take() {
+            let sub_config = app.sub_config.clone();
+            std::thread::spawn(move || {
+                log::info!("profile switch: stopping VM for profile '{}'", old_profile);
+                let _ = std::process::Command::new("pelagos")
+                    .args(["--profile", &old_profile, "vm", "stop"])
+                    .status();
+                if let Some(cfg) = sub_config {
+                    let mut c = cfg.lock().unwrap();
+                    c.generation = c.generation.wrapping_add(1);
+                }
+            });
+        }
+
         // Liveness check: if the subscription has been silent for > 15s,
         // force a reconnect (handles silently-dead vsock connections).
         if app.subscription_stale() {
