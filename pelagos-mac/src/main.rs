@@ -354,6 +354,8 @@ enum GuestCommand {
         #[serde(default)]
         env: std::collections::HashMap<String, String>,
         tty: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
     ExecInto {
         container: String,
@@ -702,6 +704,7 @@ fn main() {
                         args,
                         env: env_map,
                         tty,
+                        name,
                     },
                     tty,
                 ));
@@ -2905,6 +2908,7 @@ mod tests {
             args: vec!["sh".into()],
             env: std::collections::HashMap::new(),
             tty: true,
+            name: None,
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

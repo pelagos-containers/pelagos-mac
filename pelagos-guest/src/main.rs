@@ -123,6 +123,9 @@ pub enum GuestCommand {
         env: std::collections::HashMap<String, String>,
         #[serde(default)]
         tty: bool,
+        /// Optional container name passed to `pelagos run --name`.
+        #[serde(default)]
+        name: Option<String>,
     },
     /// Exec a command inside an already-running container by name.
     /// Enters the container's namespaces via setns(2) and execs the command.
@@ -491,8 +494,9 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 args,
                 env,
                 tty,
+                name,
             } => {
-                handle_exec(fd, &image, &args, &env, tty)?;
+                handle_exec(fd, &image, &args, &env, tty, name.as_deref())?;
                 return Ok(());
             }
             GuestCommand::ExecInto {
@@ -1563,6 +1567,7 @@ fn handle_exec(
     args: &[String],
     env: &std::collections::HashMap<String, String>,
     tty: bool,
+    name: Option<&str>,
 ) -> std::io::Result<()> {
     let pelagos = pelagos_bin();
 
@@ -1589,6 +1594,9 @@ fn handle_exec(
     // adding another PTY layer on top would double-process terminal escapes.
     if tty {
         cmd.arg("--interactive");
+    }
+    if let Some(n) = name {
+        cmd.arg("--name").arg(n);
     }
     cmd.arg(image);
     if !args.is_empty() {

@@ -353,7 +353,7 @@ impl App {
 
             KeyCode::Char('r') => {
                 self.palette_input = format!(
-                    "--name {} -it {} {}",
+                    "--name {} -i {} {}",
                     random_name(),
                     self.tui_config.default_image,
                     self.tui_config.default_it_cmd,

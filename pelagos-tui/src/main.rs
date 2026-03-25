@@ -406,12 +406,14 @@ fn execute_run_bg(profile: &str, input: &str, status_tx: Option<mpsc::SyncSender
         .iter()
         .any(|a| *a == "-i" || *a == "--interactive" || *a == "-it" || *a == "-ti");
     if interactive {
+        log::debug!("run interactive: raw input={:?}", input);
         if let Err(e) = open_in_terminal(profile, input) {
             send_status(&status_tx, format!("terminal launch: {}", e));
         }
         return;
     }
 
+    log::debug!("run detached: args={:?}", args);
     let result = std::process::Command::new("pelagos")
         .arg("--profile")
         .arg(profile)
@@ -624,8 +626,38 @@ fn send_status(tx: &Option<mpsc::SyncSender<String>>, msg: String) {
 // Terminal launcher (for interactive -i runs)
 // ---------------------------------------------------------------------------
 
+/// Resolve the full path of the `pelagos` binary so that interactive runs
+/// in new terminal windows don't depend on the terminal's shell PATH.
+fn resolve_pelagos_path() -> String {
+    // Prefer a sibling binary next to the running pelagos-tui executable.
+    if let Ok(mut exe) = std::env::current_exe() {
+        exe.set_file_name("pelagos");
+        if exe.exists() {
+            return exe.to_string_lossy().into_owned();
+        }
+    }
+    // Fall back to `which pelagos` using the current process's PATH.
+    if let Ok(out) = std::process::Command::new("which").arg("pelagos").output() {
+        if out.status.success() {
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !p.is_empty() {
+                return p;
+            }
+        }
+    }
+    // Last resort: well-known homebrew locations.
+    for candidate in &["/opt/homebrew/bin/pelagos", "/usr/local/bin/pelagos"] {
+        if std::path::Path::new(candidate).exists() {
+            return candidate.to_string();
+        }
+    }
+    "pelagos".to_string()
+}
+
 fn open_in_terminal(profile: &str, input: &str) -> anyhow::Result<()> {
-    let cmd = format!("pelagos --profile {} run {}", shell_escape(profile), input);
+    let pelagos = resolve_pelagos_path();
+    let cmd = format!("{} --profile {} run {}", pelagos, shell_escape(profile), input);
+    log::debug!("open_in_terminal: cmd={:?}", cmd);
 
     if let Ok(term_bin) = std::env::var("PELAGOS_TERMINAL") {
         return spawn_generic(&term_bin, &cmd);

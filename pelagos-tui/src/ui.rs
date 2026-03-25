@@ -162,7 +162,7 @@ fn render_hint_bar(f: &mut Frame, app: &App, area: Rect) {
         Mode::Confirm => "  confirm action: [y]yes  [any]cancel",
         Mode::ConfirmQuit => "  quit pelagos-tui: [y/q]yes  [any]cancel",
         Mode::Inspect => "  [j/k] scroll  [Esc/q] close",
-        _ => "  [q]quit  [a]all  [j/k]nav  [Space]sel  [s]stop  [S]restart  [d]rm  [P]prune  [r]run-it  [R]run-d  [i/Enter]inspect  [p]profile",
+        _ => "  [q]quit  [a]all  [j/k]nav  [Space]sel  [s]stop  [S]restart  [d]rm  [P]prune  [r]run-i  [R]run-d  [i/Enter]inspect  [p]profile",
     };
     let hints = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     f.render_widget(hints, area);
