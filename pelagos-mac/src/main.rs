@@ -356,6 +356,13 @@ enum GuestCommand {
         tty: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mounts: Vec<GuestMount>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        labels: Vec<String>,
+        /// Port mappings HOST:CONTAINER forwarded to `pelagos run --publish`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        publish: Vec<String>,
     },
     ExecInto {
         container: String,
@@ -681,34 +688,8 @@ fn main() {
             let args = args.clone();
             let name = name.clone();
             let labels = labels.clone();
-            // -it: route through the PTY/interactive path (GuestCommand::Exec)
-            if interactive || tty {
-                let tty = tty || unsafe { libc::isatty(libc::STDOUT_FILENO) } != 0;
-                let env_map: std::collections::HashMap<String, String> = env
-                    .iter()
-                    .filter_map(|kv| {
-                        let (k, v) = kv.split_once('=')?;
-                        Some((k.to_string(), v.to_string()))
-                    })
-                    .collect();
-                let daemon_args = daemon_args_from_cli(&cli);
-                if let Err(e) = daemon::ensure_running(&daemon_args) {
-                    log::error!("failed to start VM daemon: {}", e);
-                    process::exit(1);
-                }
-                let stream = connect_or_exit(&profile);
-                process::exit(exec_command(
-                    stream,
-                    GuestCommand::Exec {
-                        image,
-                        args,
-                        env: env_map,
-                        tty,
-                        name,
-                    },
-                    tty,
-                ));
-            }
+
+            // --- Shared setup for both interactive and detached paths ---
             let env_map: std::collections::HashMap<String, String> = env
                 .iter()
                 .filter_map(|kv| {
@@ -778,6 +759,26 @@ fn main() {
                         process::exit(1);
                     }
                 }
+            }
+
+            // --- Branch: interactive (PTY/Exec) vs foreground/detached (Run) ---
+            if interactive || tty {
+                let tty = tty || unsafe { libc::isatty(libc::STDOUT_FILENO) } != 0;
+                let stream = connect_or_exit(&profile);
+                process::exit(exec_command(
+                    stream,
+                    GuestCommand::Exec {
+                        image,
+                        args,
+                        env: env_map,
+                        tty,
+                        name,
+                        mounts,
+                        labels,
+                        publish: cli.ports.clone(),
+                    },
+                    tty,
+                ));
             }
             let stream = connect_or_exit(&profile);
             let exit_code = passthrough_command(
@@ -2909,6 +2910,9 @@ mod tests {
             env: std::collections::HashMap::new(),
             tty: true,
             name: None,
+            mounts: vec![],
+            labels: vec![],
+            publish: vec![],
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

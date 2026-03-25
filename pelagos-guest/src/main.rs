@@ -126,6 +126,13 @@ pub enum GuestCommand {
         /// Optional container name passed to `pelagos run --name`.
         #[serde(default)]
         name: Option<String>,
+        #[serde(default)]
+        mounts: Vec<GuestMount>,
+        #[serde(default)]
+        labels: Vec<String>,
+        /// Port mappings HOST:CONTAINER forwarded to `pelagos run --publish`.
+        #[serde(default)]
+        publish: Vec<String>,
     },
     /// Exec a command inside an already-running container by name.
     /// Enters the container's namespaces via setns(2) and execs the command.
@@ -495,8 +502,11 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 env,
                 tty,
                 name,
+                mounts,
+                labels,
+                publish,
             } => {
-                handle_exec(fd, &image, &args, &env, tty, name.as_deref())?;
+                handle_exec(fd, &image, &args, &env, tty, name.as_deref(), &mounts, &labels, &publish)?;
                 return Ok(());
             }
             GuestCommand::ExecInto {
@@ -1561,6 +1571,7 @@ fn handle_cp_to(
 // Exec handler
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn handle_exec(
     fd: libc::c_int,
     image: &str,
@@ -1568,6 +1579,9 @@ fn handle_exec(
     env: &std::collections::HashMap<String, String>,
     tty: bool,
     name: Option<&str>,
+    mounts: &[GuestMount],
+    labels: &[String],
+    publish: &[String],
 ) -> std::io::Result<()> {
     let pelagos = pelagos_bin();
 
@@ -1597,6 +1611,20 @@ fn handle_exec(
     }
     if let Some(n) = name {
         cmd.arg("--name").arg(n);
+    }
+    for label in labels {
+        cmd.arg("--label").arg(label);
+    }
+    for port in publish {
+        cmd.arg("--publish").arg(port);
+    }
+    for m in mounts {
+        let host_dir = if m.subpath.is_empty() {
+            format!("/mnt/{}", m.tag)
+        } else {
+            format!("/mnt/{}/{}", m.tag, m.subpath)
+        };
+        cmd.arg("--volume").arg(format!("{}:{}", host_dir, m.container_path));
     }
     cmd.arg(image);
     if !args.is_empty() {
