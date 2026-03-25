@@ -14,6 +14,7 @@
 //! spawned in a background thread so the event loop never blocks on them either.
 
 mod app;
+mod config;
 mod runner;
 mod ui;
 
@@ -271,6 +272,18 @@ fn run_loop(
             }
         }
 
+        // Inspect: drain any result delivered by the background ps thread.
+        app.poll_inspect_result();
+
+        // Inspect: spawn a background ps query when the user opens the overlay.
+        if let Some(name) = app.pending_inspect.take() {
+            let profile = app.profile.clone();
+            let tx = app.inspect_result_tx.clone();
+            std::thread::spawn(move || {
+                execute_inspect_bg(&profile, &name, tx);
+            });
+        }
+
         // Command palette: execute pending run in a background thread so the
         // event loop never blocks.  The subscription thread will deliver the
         // ContainerStarted event when the container appears.
@@ -321,6 +334,62 @@ fn run_loop(
 }
 
 // ---------------------------------------------------------------------------
+// Inspect query (background thread — never blocks event loop)
+// ---------------------------------------------------------------------------
+
+/// Run `pelagos ps --json --all`, find the container named `name`, and send it
+/// back via `tx`.  If the container is not found or the query fails the channel
+/// simply stays empty and the overlay shows a loading indicator.
+fn execute_inspect_bg(
+    profile: &str,
+    name: &str,
+    tx: Option<mpsc::SyncSender<runner::Container>>,
+) {
+    let tx = match tx {
+        Some(t) => t,
+        None => return,
+    };
+
+    let out = std::process::Command::new("pelagos")
+        .arg("--profile")
+        .arg(profile)
+        .arg("ps")
+        .arg("--json")
+        .arg("--all")
+        .stdin(std::process::Stdio::null())
+        .output();
+
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            log::debug!(
+                "inspect ps failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return;
+        }
+        Err(e) => {
+            log::debug!("inspect ps error: {}", e);
+            return;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    match serde_json::from_str::<Vec<runner::Container>>(stdout.trim()) {
+        Ok(list) => {
+            if let Some(c) = list.into_iter().find(|c| c.name == name) {
+                let _ = tx.try_send(c);
+            } else {
+                log::debug!("inspect: container '{}' not found in ps output", name);
+            }
+        }
+        Err(e) => {
+            log::debug!("inspect ps parse error: {}", e);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Run command execution (background thread — never blocks event loop)
 // ---------------------------------------------------------------------------
 
@@ -337,12 +406,14 @@ fn execute_run_bg(profile: &str, input: &str, status_tx: Option<mpsc::SyncSender
         .iter()
         .any(|a| *a == "-i" || *a == "--interactive" || *a == "-it" || *a == "-ti");
     if interactive {
+        log::debug!("run interactive: raw input={:?}", input);
         if let Err(e) = open_in_terminal(profile, input) {
             send_status(&status_tx, format!("terminal launch: {}", e));
         }
         return;
     }
 
+    log::debug!("run detached: args={:?}", args);
     let result = std::process::Command::new("pelagos")
         .arg("--profile")
         .arg(profile)
@@ -555,8 +626,38 @@ fn send_status(tx: &Option<mpsc::SyncSender<String>>, msg: String) {
 // Terminal launcher (for interactive -i runs)
 // ---------------------------------------------------------------------------
 
+/// Resolve the full path of the `pelagos` binary so that interactive runs
+/// in new terminal windows don't depend on the terminal's shell PATH.
+fn resolve_pelagos_path() -> String {
+    // Prefer a sibling binary next to the running pelagos-tui executable.
+    if let Ok(mut exe) = std::env::current_exe() {
+        exe.set_file_name("pelagos");
+        if exe.exists() {
+            return exe.to_string_lossy().into_owned();
+        }
+    }
+    // Fall back to `which pelagos` using the current process's PATH.
+    if let Ok(out) = std::process::Command::new("which").arg("pelagos").output() {
+        if out.status.success() {
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !p.is_empty() {
+                return p;
+            }
+        }
+    }
+    // Last resort: well-known homebrew locations.
+    for candidate in &["/opt/homebrew/bin/pelagos", "/usr/local/bin/pelagos"] {
+        if std::path::Path::new(candidate).exists() {
+            return candidate.to_string();
+        }
+    }
+    "pelagos".to_string()
+}
+
 fn open_in_terminal(profile: &str, input: &str) -> anyhow::Result<()> {
-    let cmd = format!("pelagos --profile {} run {}", shell_escape(profile), input);
+    let pelagos = resolve_pelagos_path();
+    let cmd = format!("{} --profile {} run {}", pelagos, shell_escape(profile), input);
+    log::debug!("open_in_terminal: cmd={:?}", cmd);
 
     if let Ok(term_bin) = std::env::var("PELAGOS_TERMINAL") {
         return spawn_generic(&term_bin, &cmd);
