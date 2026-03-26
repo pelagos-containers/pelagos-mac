@@ -111,6 +111,12 @@ enum Commands {
         /// Allocate a pseudo-TTY
         #[arg(short = 't', long)]
         tty: bool,
+        /// Network mode: none, loopback, bridge, or pasta (repeatable; first is primary)
+        #[arg(long = "network", short = 'n')]
+        network: Vec<String>,
+        /// DNS server inside the container (repeatable; requires bridge or pasta)
+        #[arg(long)]
+        dns: Vec<String>,
     },
     /// Run a command inside an already-running container (enters its namespaces).
     /// Equivalent to `docker exec`.
@@ -384,6 +390,12 @@ enum GuestCommand {
         /// Port mappings HOST:CONTAINER forwarded to `pelagos run --publish`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         publish: Vec<String>,
+        /// Network mode forwarded to `pelagos run --network`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        network: Option<String>,
+        /// DNS servers forwarded to `pelagos run --dns`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dns: Vec<String>,
     },
     Exec {
         image: String,
@@ -400,6 +412,12 @@ enum GuestCommand {
         /// Port mappings HOST:CONTAINER forwarded to `pelagos run --publish`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         publish: Vec<String>,
+        /// Network mode forwarded to `pelagos run --network`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        network: Option<String>,
+        /// DNS servers forwarded to `pelagos run --dns`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dns: Vec<String>,
     },
     ExecInto {
         container: String,
@@ -742,6 +760,8 @@ fn main() {
             ref labels,
             interactive,
             tty,
+            ref network,
+            ref dns,
         } => {
             let image = image.clone();
             let args = args.clone();
@@ -835,6 +855,8 @@ fn main() {
                         mounts,
                         labels,
                         publish: cli.ports.clone(),
+                        network: network.first().cloned(),
+                        dns: dns.clone(),
                     },
                     tty,
                 ));
@@ -851,6 +873,8 @@ fn main() {
                     env: env_map,
                     labels,
                     publish: cli.ports.clone(),
+                    network: network.first().cloned(),
+                    dns: dns.clone(),
                 },
             );
             // For foreground containers the CLI process stays alive until the
@@ -2944,6 +2968,8 @@ mod tests {
             env: std::collections::HashMap::new(),
             labels: vec![],
             publish: vec![],
+            network: None,
+            dns: vec![],
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2966,6 +2992,8 @@ mod tests {
             env: std::collections::HashMap::new(),
             labels: vec![],
             publish: vec![],
+            network: None,
+            dns: vec![],
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2989,6 +3017,8 @@ mod tests {
             env: std::collections::HashMap::new(),
             labels: vec![],
             publish: vec![],
+            network: None,
+            dns: vec![],
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -3084,6 +3114,8 @@ mod tests {
             mounts: vec![],
             labels: vec![],
             publish: vec![],
+            network: None,
+            dns: vec![],
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

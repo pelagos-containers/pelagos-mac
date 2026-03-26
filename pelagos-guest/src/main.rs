@@ -115,6 +115,12 @@ pub enum GuestCommand {
         /// Port mappings HOST:CONTAINER forwarded to `pelagos run --publish`.
         #[serde(default)]
         publish: Vec<String>,
+        /// Network mode forwarded to `pelagos run --network`.
+        #[serde(default)]
+        network: Option<String>,
+        /// DNS servers forwarded to `pelagos run --dns`.
+        #[serde(default)]
+        dns: Vec<String>,
     },
     Exec {
         image: String,
@@ -133,6 +139,12 @@ pub enum GuestCommand {
         /// Port mappings HOST:CONTAINER forwarded to `pelagos run --publish`.
         #[serde(default)]
         publish: Vec<String>,
+        /// Network mode forwarded to `pelagos run --network`.
+        #[serde(default)]
+        network: Option<String>,
+        /// DNS servers forwarded to `pelagos run --dns`.
+        #[serde(default)]
+        dns: Vec<String>,
     },
     /// Exec a command inside an already-running container by name.
     /// Enters the container's namespaces via setns(2) and execs the command.
@@ -510,6 +522,8 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 detach,
                 labels,
                 publish,
+                network,
+                dns,
             } => {
                 run_container(
                     &mut writer,
@@ -521,6 +535,8 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                     detach,
                     &labels,
                     &publish,
+                    network.as_deref(),
+                    &dns,
                 )?;
             }
             GuestCommand::Exec {
@@ -532,6 +548,8 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 mounts,
                 labels,
                 publish,
+                network,
+                dns,
             } => {
                 handle_exec(
                     fd,
@@ -543,6 +561,8 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                     &mounts,
                     &labels,
                     &publish,
+                    network.as_deref(),
+                    &dns,
                 )?;
                 return Ok(());
             }
@@ -935,6 +955,8 @@ fn run_container(
     detach: bool,
     labels: &[String],
     publish: &[String],
+    network: Option<&str>,
+    dns: &[String],
 ) -> std::io::Result<()> {
     let pelagos = pelagos_bin();
 
@@ -983,6 +1005,12 @@ fn run_container(
     }
     for port_spec in publish {
         cmd.arg("--publish").arg(port_spec);
+    }
+    if let Some(net) = network {
+        cmd.arg("--network").arg(net);
+    }
+    for server in dns {
+        cmd.arg("--dns").arg(server);
     }
     cmd.arg(image);
     if !args.is_empty() {
@@ -1674,6 +1702,8 @@ fn handle_exec(
     mounts: &[GuestMount],
     labels: &[String],
     publish: &[String],
+    network: Option<&str>,
+    dns: &[String],
 ) -> std::io::Result<()> {
     let pelagos = pelagos_bin();
 
@@ -1709,6 +1739,12 @@ fn handle_exec(
     }
     for port in publish {
         cmd.arg("--publish").arg(port);
+    }
+    if let Some(net) = network {
+        cmd.arg("--network").arg(net);
+    }
+    for server in dns {
+        cmd.arg("--dns").arg(server);
     }
     for m in mounts {
         let host_dir = if m.subpath.is_empty() {
