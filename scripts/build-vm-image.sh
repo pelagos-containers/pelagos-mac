@@ -1024,6 +1024,8 @@ echo "[pelagos-init] network: static 192.168.105.2/24"
 # host-port connections to the container IP, which requires ip_forward=1
 # to move packets from eth0 to the bridge (pelagos0) interface.
 echo 1 > /proc/sys/net/ipv4/ip_forward
+# Allow all GIDs to open ICMP echo sockets (enables ping inside pasta containers).
+echo '0 2147483647' > /proc/sys/net/ipv4/ping_group_range
 echo "[pelagos-init] network ready"
 busybox mkdir -p /etc
 echo 'nameserver 8.8.8.8' > /etc/resolv.conf
