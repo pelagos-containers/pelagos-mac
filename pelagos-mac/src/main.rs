@@ -1119,9 +1119,9 @@ fn main() {
                     source: source.clone(),
                     target: target.clone(),
                 },
-                ImageCmd::Inspect { reference } => GuestCommand::ImageInspect {
-                    reference: reference.clone(),
-                },
+                ImageCmd::Inspect { reference } => {
+                    process::exit(inspect_image_command(stream, reference));
+                }
             };
             process::exit(passthrough_command(stream, guest_cmd));
         }
@@ -1783,6 +1783,92 @@ fn passthrough_command(stream: UnixStream, cmd: GuestCommand) -> i32 {
         }
     }
     exit_code
+}
+
+/// Send ImageInspect to the guest, accumulate the JSON image list, and print
+/// the single entry whose "reference" field matches `reference`. Exits 0 on
+/// success, 1 if the image is not found or the response cannot be parsed.
+fn inspect_image_command(stream: UnixStream, reference: &str) -> i32 {
+    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+    let mut writer = stream;
+
+    let cmd = GuestCommand::ImageInspect {
+        reference: reference.to_string(),
+    };
+    let mut msg = serde_json::to_string(&cmd).unwrap();
+    msg.push('\n');
+    if let Err(e) = writer.write_all(msg.as_bytes()) {
+        log::error!("write error: {}", e);
+        return 1;
+    }
+
+    // Accumulate stdout chunks; the guest streams `pelagos image ls --format json`.
+    let mut stdout_buf = String::new();
+    let mut exit_code = 1;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<GuestResponse>(trimmed) {
+            Ok(GuestResponse::Stream { stream, data }) => {
+                if stream == "stderr" {
+                    eprint!("{}", data);
+                } else {
+                    stdout_buf.push_str(&data);
+                }
+            }
+            Ok(GuestResponse::Exit { exit }) => {
+                exit_code = exit;
+                break;
+            }
+            Ok(GuestResponse::Error { error }) => {
+                log::error!("guest error: {}", error);
+                return 1;
+            }
+            Ok(resp) => {
+                log::warn!("unexpected response: {:?}", resp);
+            }
+            Err(e) => {
+                log::error!("parse error: {} (line: {:?})", e, trimmed);
+                return 1;
+            }
+        }
+    }
+
+    if exit_code != 0 {
+        return exit_code;
+    }
+
+    // Parse the JSON image list and find the matching entry.
+    let images: Vec<serde_json::Value> = match serde_json::from_str(&stdout_buf) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("failed to parse image list JSON: {}", e);
+            return 1;
+        }
+    };
+
+    let matched = images
+        .into_iter()
+        .find(|img| img.get("reference").and_then(|r| r.as_str()) == Some(reference));
+
+    match matched {
+        Some(img) => {
+            println!("{}", serde_json::to_string_pretty(&img).unwrap_or_default());
+            0
+        }
+        None => {
+            eprintln!("Error: image not found: {}", reference);
+            1
+        }
+    }
 }
 
 /// Tar up the build context, send it to the guest, and relay build output.
