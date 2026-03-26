@@ -178,7 +178,7 @@ fn render_hint_bar(f: &mut Frame, app: &App, area: Rect) {
         Mode::ConfirmQuit => "  quit pelagos-tui: [y/q]yes  [any]cancel",
         Mode::Inspect => "  [j/k]scroll  [Esc/q]close",
         Mode::ImageInspect => "  [j/k]scroll  [Esc/q]close",
-        Mode::Images => "  [I/Esc]containers  [j/k]nav  [p]pull  [d]delete  [Enter]inspect  [r]refresh",
+        Mode::Images => "  [I/Esc]containers  [j/k]nav  [R]run  [p]pull  [d]delete  [Enter]inspect  [r]refresh",
         _ => "  [q]quit  [a]all  [j/k]nav  [Space]sel  [s]stop  [S]restart  [d]rm  [P]prune  [r]run-i  [R]run-d  [i/Enter]inspect  [p]profile  [I]images",
     };
     let hints = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));

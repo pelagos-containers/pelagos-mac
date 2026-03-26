@@ -620,6 +620,17 @@ impl App {
                 self.images_error = None;
                 self.pending_image_ls = true;
             }
+            // Open the run command palette with the selected image pre-filled.
+            KeyCode::Char('R') => {
+                if let Some(img) = self.images.get(self.images_selected) {
+                    self.palette_input = format!(
+                        "--name {} -d {}",
+                        random_name(),
+                        img.reference,
+                    );
+                    self.mode = Mode::CommandPalette;
+                }
+            }
             KeyCode::Char('p') => {
                 self.image_pull_input.clear();
                 self.mode = Mode::ImagePull;
