@@ -1,6 +1,6 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-03-24 — port forwarding e2e verified; ip_forward fix shipped; pelagos bugs documented*
+*Last updated: 2026-03-25 — OCI image management shipped (protocol + CLI + TUI); git SHA: 251d57a*
 
 ---
 
@@ -92,6 +92,13 @@ to any client connecting at any time. `pelagos vm console [--profile build]` wor
 ---
 
 ## Remaining Work
+
+### Completed this session (2026-03-25)
+
+- **Epic #178 — OCI image management** ✅ (PR #192, merged to main)
+  - Phase 1: `GuestCommand` variants `ImageLs|Pull|Rm|Tag|Inspect` added to vsock protocol in both `pelagos-mac` and `pelagos-guest`
+  - Phase 2: `pelagos image ls|pull|rm|tag|inspect` CLI subcommands; `ls` defaults to human-readable table, `--json` for machine output; `inspect` filters client-side by reference
+  - Phase 3: TUI image screen (`I`): browse, pull (`p`), delete with confirm (`d`), inspect JSON overlay (`Enter`), `R` pre-fills run palette with selected image
 
 ### Next priorities
 
