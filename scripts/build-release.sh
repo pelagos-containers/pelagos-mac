@@ -81,10 +81,13 @@ echo "[release]   $(du -sh "$DIST/$BIN_TARBALL" | awk '{print $1}')  sha256: ${B
 # Normalise names: drop ubuntu- prefix and -custom suffix.
 cp "$OUT/ubuntu-vmlinuz"      "$VM_STAGING/vmlinuz"
 cp "$OUT/initramfs-custom.gz" "$VM_STAGING/initramfs.gz"
-cp "$OUT/root.img"            "$VM_STAGING/root.img"
+# Always create a fresh sparse placeholder — never ship the local disk which
+# contains per-machine container image cache and state.  On first boot the VM
+# formats this as ext4 and populates it from the initramfs.
+truncate -s 8192m "$VM_STAGING/root.img"
 
 echo "[release] packing ${VM_TARBALL}..."
-# root.img is sparse (~8.6 GiB logical, ~126 MiB actual); zeros compress well.
+# root.img is a fresh sparse 8192 MiB placeholder; zeros compress to ~1 MiB.
 COPYFILE_DISABLE=1 tar -czf "$DIST/$VM_TARBALL" -C "$VM_STAGING" .
 VM_SHA256="$(shasum -a 256 "$DIST/$VM_TARBALL" | awk '{print $1}')"
 echo "[release]   $(du -sh "$DIST/$VM_TARBALL" | awk '{print $1}')  sha256: ${VM_SHA256}"
