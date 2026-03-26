@@ -533,7 +533,17 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 labels,
                 publish,
             } => {
-                handle_exec(fd, &image, &args, &env, tty, name.as_deref(), &mounts, &labels, &publish)?;
+                handle_exec(
+                    fd,
+                    &image,
+                    &args,
+                    &env,
+                    tty,
+                    name.as_deref(),
+                    &mounts,
+                    &labels,
+                    &publish,
+                )?;
                 return Ok(());
             }
             GuestCommand::ExecInto {
@@ -1706,7 +1716,8 @@ fn handle_exec(
         } else {
             format!("/mnt/{}/{}", m.tag, m.subpath)
         };
-        cmd.arg("--volume").arg(format!("{}:{}", host_dir, m.container_path));
+        cmd.arg("--volume")
+            .arg(format!("{}:{}", host_dir, m.container_path));
     }
     cmd.arg(image);
     if !args.is_empty() {

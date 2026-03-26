@@ -35,8 +35,7 @@ pub fn render(f: &mut Frame, app: &App) {
     if app.mode == Mode::Images
         || app.mode == Mode::ImagePull
         || app.mode == Mode::ImageInspect
-        || (app.mode == Mode::Confirm
-            && app.confirm_action == Some(ConfirmAction::ImageRm))
+        || (app.mode == Mode::Confirm && app.confirm_action == Some(ConfirmAction::ImageRm))
     {
         render_images(f, app, chunks[0]);
     } else {
@@ -240,7 +239,11 @@ fn render_modeline(f: &mut Frame, app: &App, area: Rect) {
                     .to_string()
             } else {
                 let count = app.confirm_targets.len();
-                let noun = if count == 1 { "container" } else { "containers" };
+                let noun = if count == 1 {
+                    "container"
+                } else {
+                    "containers"
+                };
                 format!("{} {}", count, noun)
             };
             let spans = vec![
@@ -416,8 +419,12 @@ fn render_profile_picker(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_inspect_overlay(f: &mut Frame, app: &App, area: Rect) {
     // Popup dimensions: 70% wide, up to 80% tall.
-    let popup_width = (area.width * 70 / 100).max(60).min(area.width.saturating_sub(4));
-    let popup_height = (area.height * 80 / 100).max(10).min(area.height.saturating_sub(4));
+    let popup_width = (area.width * 70 / 100)
+        .max(60)
+        .min(area.width.saturating_sub(4));
+    let popup_height = (area.height * 80 / 100)
+        .max(10)
+        .min(area.height.saturating_sub(4));
     let popup_x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let popup_y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
@@ -503,14 +510,8 @@ fn build_inspect_lines(c: &Container) -> Vec<Line<'static>> {
         label("STATUS"),
         Span::styled(c.status.clone(), Style::default().fg(status_color)),
     ]));
-    lines.push(Line::from(vec![
-        label("IMAGE"),
-        value(c.rootfs.clone()),
-    ]));
-    lines.push(Line::from(vec![
-        label("PID"),
-        value(c.pid.to_string()),
-    ]));
+    lines.push(Line::from(vec![label("IMAGE"), value(c.rootfs.clone())]));
+    lines.push(Line::from(vec![label("PID"), value(c.pid.to_string())]));
     lines.push(Line::from(vec![
         label("UPTIME"),
         value(format_uptime(&c.started_at)),
@@ -520,11 +521,7 @@ fn build_inspect_lines(c: &Container) -> Vec<Line<'static>> {
             label("EXIT CODE"),
             Span::styled(
                 code.to_string(),
-                Style::default().fg(if code == 0 {
-                    Color::Green
-                } else {
-                    Color::Red
-                }),
+                Style::default().fg(if code == 0 { Color::Green } else { Color::Red }),
             ),
         ]));
     }
@@ -544,10 +541,7 @@ fn build_inspect_lines(c: &Container) -> Vec<Line<'static>> {
         lines.push(inspect_section("NETWORK"));
         if let Some(ip) = &c.bridge_ip {
             lines.push(Line::from(vec![
-                Span::styled(
-                    "    bridge       ",
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled("    bridge       ", Style::default().fg(Color::DarkGray)),
                 value(ip.clone()),
             ]));
         }
@@ -714,8 +708,7 @@ fn render_images(f: &mut Frame, app: &App, area: Rect) {
         let p = Paragraph::new("  loading…").style(Style::default().fg(Color::DarkGray));
         f.render_widget(p, inner);
     } else if let Some(err) = &app.images_error {
-        let p = Paragraph::new(format!("  error: {}", err))
-            .style(Style::default().fg(Color::Red));
+        let p = Paragraph::new(format!("  error: {}", err)).style(Style::default().fg(Color::Red));
         f.render_widget(p, inner);
     } else if app.images.is_empty() {
         let p = Paragraph::new("  No images. Press 'p' to pull one.")
@@ -729,8 +722,12 @@ fn render_images(f: &mut Frame, app: &App, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn render_image_inspect_overlay(f: &mut Frame, app: &App, area: Rect) {
-    let popup_width = (area.width * 70 / 100).max(60).min(area.width.saturating_sub(4));
-    let popup_height = (area.height * 80 / 100).max(10).min(area.height.saturating_sub(4));
+    let popup_width = (area.width * 70 / 100)
+        .max(60)
+        .min(area.width.saturating_sub(4));
+    let popup_height = (area.height * 80 / 100)
+        .max(10)
+        .min(area.height.saturating_sub(4));
     let popup_x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let popup_y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);

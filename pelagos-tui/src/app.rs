@@ -10,22 +10,112 @@ use std::time::Instant;
 // ---------------------------------------------------------------------------
 
 const ADJECTIVES: &[&str] = &[
-    "admiring", "adoring", "agitated", "amazing", "bold", "brave", "busy", "charming",
-    "clever", "confident", "cool", "curious", "daring", "determined", "eager", "earnest",
-    "elegant", "epic", "fervent", "fierce", "focused", "friendly", "gentle", "graceful",
-    "happy", "hopeful", "jolly", "keen", "lively", "lucid", "merry", "nifty", "nimble",
-    "peaceful", "quiet", "relaxed", "sharp", "sleepy", "stoic", "tender", "trusting",
-    "upbeat", "vigilant", "vivid", "witty", "wonderful", "zealous",
+    "admiring",
+    "adoring",
+    "agitated",
+    "amazing",
+    "bold",
+    "brave",
+    "busy",
+    "charming",
+    "clever",
+    "confident",
+    "cool",
+    "curious",
+    "daring",
+    "determined",
+    "eager",
+    "earnest",
+    "elegant",
+    "epic",
+    "fervent",
+    "fierce",
+    "focused",
+    "friendly",
+    "gentle",
+    "graceful",
+    "happy",
+    "hopeful",
+    "jolly",
+    "keen",
+    "lively",
+    "lucid",
+    "merry",
+    "nifty",
+    "nimble",
+    "peaceful",
+    "quiet",
+    "relaxed",
+    "sharp",
+    "sleepy",
+    "stoic",
+    "tender",
+    "trusting",
+    "upbeat",
+    "vigilant",
+    "vivid",
+    "witty",
+    "wonderful",
+    "zealous",
 ];
 
 const NOUNS: &[&str] = &[
-    "albatross", "baboon", "bear", "beaver", "capybara", "cheetah", "condor", "crane",
-    "dingo", "dolphin", "dragon", "eagle", "falcon", "ferret", "firefly", "flamingo",
-    "gazelle", "gecko", "gibbon", "giraffe", "gorilla", "hawk", "hedgehog", "heron",
-    "ibis", "iguana", "jaguar", "jellyfish", "kestrel", "kingfisher", "lemur", "leopard",
-    "lynx", "meerkat", "narwhal", "ocelot", "osprey", "otter", "panda", "panther",
-    "parrot", "peacock", "pelican", "penguin", "phoenix", "puffin", "raven", "seahorse",
-    "sparrow", "squirrel", "swift", "tiger", "tortoise", "toucan", "vulture", "wombat",
+    "albatross",
+    "baboon",
+    "bear",
+    "beaver",
+    "capybara",
+    "cheetah",
+    "condor",
+    "crane",
+    "dingo",
+    "dolphin",
+    "dragon",
+    "eagle",
+    "falcon",
+    "ferret",
+    "firefly",
+    "flamingo",
+    "gazelle",
+    "gecko",
+    "gibbon",
+    "giraffe",
+    "gorilla",
+    "hawk",
+    "hedgehog",
+    "heron",
+    "ibis",
+    "iguana",
+    "jaguar",
+    "jellyfish",
+    "kestrel",
+    "kingfisher",
+    "lemur",
+    "leopard",
+    "lynx",
+    "meerkat",
+    "narwhal",
+    "ocelot",
+    "osprey",
+    "otter",
+    "panda",
+    "panther",
+    "parrot",
+    "peacock",
+    "pelican",
+    "penguin",
+    "phoenix",
+    "puffin",
+    "raven",
+    "seahorse",
+    "sparrow",
+    "squirrel",
+    "swift",
+    "tiger",
+    "tortoise",
+    "toucan",
+    "vulture",
+    "wombat",
     "zebra",
 ];
 
@@ -608,8 +698,7 @@ impl App {
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if !self.images.is_empty() {
-                    self.images_selected =
-                        (self.images_selected + 1).min(self.images.len() - 1);
+                    self.images_selected = (self.images_selected + 1).min(self.images.len() - 1);
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
@@ -623,11 +712,7 @@ impl App {
             // Open the run command palette with the selected image pre-filled.
             KeyCode::Char('R') => {
                 if let Some(img) = self.images.get(self.images_selected) {
-                    self.palette_input = format!(
-                        "--name {} -d {}",
-                        random_name(),
-                        img.reference,
-                    );
+                    self.palette_input = format!("--name {} -d {}", random_name(), img.reference,);
                     self.mode = Mode::CommandPalette;
                 }
             }
@@ -787,8 +872,7 @@ impl App {
                 self.image_inspect_loading = false;
                 match result {
                     Ok(json) => {
-                        self.image_inspect_lines =
-                            json.lines().map(|l| l.to_string()).collect();
+                        self.image_inspect_lines = json.lines().map(|l| l.to_string()).collect();
                         self.image_inspect_scroll = 0;
                     }
                     Err(e) => {

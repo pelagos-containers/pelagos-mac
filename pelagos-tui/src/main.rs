@@ -534,11 +534,7 @@ fn execute_image_inspect_bg(
 /// Run `pelagos ps --json --all`, find the container named `name`, and send it
 /// back via `tx`.  If the container is not found or the query fails the channel
 /// simply stays empty and the overlay shows a loading indicator.
-fn execute_inspect_bg(
-    profile: &str,
-    name: &str,
-    tx: Option<mpsc::SyncSender<runner::Container>>,
-) {
+fn execute_inspect_bg(profile: &str, name: &str, tx: Option<mpsc::SyncSender<runner::Container>>) {
     let tx = match tx {
         Some(t) => t,
         None => return,
@@ -850,7 +846,12 @@ fn resolve_pelagos_path() -> String {
 
 fn open_in_terminal(profile: &str, input: &str) -> anyhow::Result<()> {
     let pelagos = resolve_pelagos_path();
-    let cmd = format!("{} --profile {} run {}", pelagos, shell_escape(profile), input);
+    let cmd = format!(
+        "{} --profile {} run {}",
+        pelagos,
+        shell_escape(profile),
+        input
+    );
     log::debug!("open_in_terminal: cmd={:?}", cmd);
 
     if let Ok(term_bin) = std::env::var("PELAGOS_TERMINAL") {
