@@ -29,7 +29,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use app::{App, ConfirmAction, SubscriptionMsg};
+use app::{App, ConfirmAction, ImageInfo, SubscriptionMsg};
 use runner::{MacOsRunner, Runner};
 
 /// Shared state that the subscription thread reads before each (re)connect.
@@ -284,6 +284,49 @@ fn run_loop(
             });
         }
 
+        // Images: drain background fetch results.
+        app.poll_image_ls_result();
+        app.poll_image_inspect_result();
+
+        // Images: spawn background image list fetch.
+        if app.pending_image_ls {
+            app.pending_image_ls = false;
+            let profile = app.profile.clone();
+            let tx = app.image_ls_tx.clone();
+            std::thread::spawn(move || {
+                execute_image_ls_bg(&profile, tx);
+            });
+        }
+
+        // Images: spawn background pull.
+        if let Some(reference) = app.pending_image_pull.take() {
+            let profile = app.profile.clone();
+            let status_tx = app.status_tx.clone();
+            let ls_tx = app.image_ls_tx.clone();
+            std::thread::spawn(move || {
+                execute_image_pull_bg(&profile, &reference, status_tx, ls_tx);
+            });
+        }
+
+        // Images: spawn background rm (after confirm).
+        if let Some(reference) = app.pending_image_rm.take() {
+            let profile = app.profile.clone();
+            let status_tx = app.status_tx.clone();
+            let ls_tx = app.image_ls_tx.clone();
+            std::thread::spawn(move || {
+                execute_image_rm_bg(&profile, &reference, status_tx, ls_tx);
+            });
+        }
+
+        // Image inspect: spawn background fetch.
+        if let Some(reference) = app.pending_image_inspect.take() {
+            let profile = app.profile.clone();
+            let tx = app.image_inspect_tx.clone();
+            std::thread::spawn(move || {
+                execute_image_inspect_bg(&profile, &reference, tx);
+            });
+        }
+
         // Command palette: execute pending run in a background thread so the
         // event loop never blocks.  The subscription thread will deliver the
         // ContainerStarted event when the container appears.
@@ -331,6 +374,157 @@ fn run_loop(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Image background functions (never block event loop)
+// ---------------------------------------------------------------------------
+
+/// Run `pelagos --profile <p> image ls --json`, parse into `Vec<ImageInfo>`, send result.
+fn execute_image_ls_bg(
+    profile: &str,
+    tx: Option<mpsc::SyncSender<Result<Vec<ImageInfo>, String>>>,
+) {
+    let tx = match tx {
+        Some(t) => t,
+        None => return,
+    };
+
+    let out = std::process::Command::new("pelagos")
+        .arg("--profile")
+        .arg(profile)
+        .arg("image")
+        .arg("ls")
+        .arg("--json")
+        .stdin(std::process::Stdio::null())
+        .output();
+
+    let result = match out {
+        Ok(o) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            match serde_json::from_str::<Vec<ImageInfo>>(stdout.trim()) {
+                Ok(list) => Ok(list),
+                Err(e) => Err(format!("parse error: {}", e)),
+            }
+        }
+        Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+
+    let _ = tx.try_send(result);
+}
+
+/// Run `pelagos --profile <p> image pull <reference>`, then refresh the image list.
+fn execute_image_pull_bg(
+    profile: &str,
+    reference: &str,
+    status_tx: Option<mpsc::SyncSender<String>>,
+    ls_tx: Option<mpsc::SyncSender<Result<Vec<ImageInfo>, String>>>,
+) {
+    log::info!("image pull: profile={} reference={}", profile, reference);
+
+    let result = std::process::Command::new("pelagos")
+        .arg("--profile")
+        .arg(profile)
+        .arg("image")
+        .arg("pull")
+        .arg(reference)
+        .stdin(std::process::Stdio::null())
+        .output();
+
+    match result {
+        Ok(out) if out.status.success() => {
+            // Refresh image list after successful pull.
+            execute_image_ls_bg(profile, ls_tx);
+        }
+        Ok(out) => {
+            let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let msg = if msg.is_empty() {
+                format!("pull failed (exit {})", out.status)
+            } else {
+                format!("pull: {}", msg)
+            };
+            log::warn!("{}", msg);
+            send_status(&status_tx, msg);
+        }
+        Err(e) => {
+            send_status(&status_tx, format!("pull: {}", e));
+        }
+    }
+}
+
+/// Run `pelagos --profile <p> image rm <reference>`, then refresh the image list.
+fn execute_image_rm_bg(
+    profile: &str,
+    reference: &str,
+    status_tx: Option<mpsc::SyncSender<String>>,
+    ls_tx: Option<mpsc::SyncSender<Result<Vec<ImageInfo>, String>>>,
+) {
+    log::info!("image rm: profile={} reference={}", profile, reference);
+
+    let result = std::process::Command::new("pelagos")
+        .arg("--profile")
+        .arg(profile)
+        .arg("image")
+        .arg("rm")
+        .arg(reference)
+        .stdin(std::process::Stdio::null())
+        .output();
+
+    match result {
+        Ok(out) if out.status.success() => {
+            execute_image_ls_bg(profile, ls_tx);
+        }
+        Ok(out) => {
+            let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let msg = if msg.is_empty() {
+                format!("rm failed (exit {})", out.status)
+            } else {
+                format!("image rm: {}", msg)
+            };
+            log::warn!("{}", msg);
+            send_status(&status_tx, msg);
+        }
+        Err(e) => {
+            send_status(&status_tx, format!("image rm: {}", e));
+        }
+    }
+}
+
+/// Run `pelagos --profile <p> image inspect <reference>`, send pretty JSON string.
+fn execute_image_inspect_bg(
+    profile: &str,
+    reference: &str,
+    tx: Option<mpsc::SyncSender<Result<String, String>>>,
+) {
+    let tx = match tx {
+        Some(t) => t,
+        None => return,
+    };
+
+    let out = std::process::Command::new("pelagos")
+        .arg("--profile")
+        .arg(profile)
+        .arg("image")
+        .arg("inspect")
+        .arg(reference)
+        .stdin(std::process::Stdio::null())
+        .output();
+
+    let result = match out {
+        Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).trim().to_string()),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            Err(if stderr.is_empty() {
+                format!("inspect failed (exit {})", o.status)
+            } else {
+                stderr
+            })
+        }
+        Err(e) => Err(e.to_string()),
+    };
+
+    let _ = tx.try_send(result);
 }
 
 // ---------------------------------------------------------------------------
