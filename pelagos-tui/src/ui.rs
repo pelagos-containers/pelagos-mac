@@ -31,7 +31,16 @@ pub fn render(f: &mut Frame, app: &App) {
         ])
         .split(area);
 
-    render_table(f, app, chunks[0]);
+    // Main content area: containers or images depending on mode.
+    if app.mode == Mode::Images
+        || app.mode == Mode::ImagePull
+        || app.mode == Mode::ImageInspect
+        || (app.mode == Mode::Confirm && app.confirm_action == Some(ConfirmAction::ImageRm))
+    {
+        render_images(f, app, chunks[0]);
+    } else {
+        render_table(f, app, chunks[0]);
+    }
     render_hint_bar(f, app, chunks[1]);
     render_modeline(f, app, chunks[2]);
 
@@ -41,6 +50,10 @@ pub fn render(f: &mut Frame, app: &App) {
 
     if app.mode == Mode::Inspect {
         render_inspect_overlay(f, app, area);
+    }
+
+    if app.mode == Mode::ImageInspect {
+        render_image_inspect_overlay(f, app, area);
     }
 }
 
@@ -159,10 +172,13 @@ fn render_table(f: &mut Frame, app: &App, area: Rect) {
 fn render_hint_bar(f: &mut Frame, app: &App, area: Rect) {
     let text = match app.mode {
         Mode::CommandPalette => "  [Enter]run  [Esc]cancel",
+        Mode::ImagePull => "  [Enter]pull  [Esc]cancel",
         Mode::Confirm => "  confirm action: [y]yes  [any]cancel",
         Mode::ConfirmQuit => "  quit pelagos-tui: [y/q]yes  [any]cancel",
-        Mode::Inspect => "  [j/k] scroll  [Esc/q] close",
-        _ => "  [q]quit  [a]all  [j/k]nav  [Space]sel  [s]stop  [S]restart  [d]rm  [P]prune  [r]run-i  [R]run-d  [i/Enter]inspect  [p]profile",
+        Mode::Inspect => "  [j/k]scroll  [Esc/q]close",
+        Mode::ImageInspect => "  [j/k]scroll  [Esc/q]close",
+        Mode::Images => "  [I/Esc]containers  [j/k]nav  [R]run  [p]pull  [d]delete  [Enter]inspect  [r]refresh",
+        _ => "  [q]quit  [a]all  [j/k]nav  [Space]sel  [s]stop  [S]restart  [d]rm  [P]prune  [r]run-i  [R]run-d  [i/Enter]inspect  [p]profile  [I]images",
     };
     let hints = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     f.render_widget(hints, area);
@@ -208,17 +224,27 @@ fn render_modeline(f: &mut Frame, app: &App, area: Rect) {
     // In confirm mode the modeline shows the action + target count prompt.
     if app.mode == Mode::Confirm {
         if let Some(action) = &app.confirm_action {
-            let count = app.confirm_targets.len();
-            let noun = if count == 1 {
-                "container"
-            } else {
-                "containers"
-            };
             let action_color = match action {
-                ConfirmAction::Remove => Color::Red,
-                ConfirmAction::StopAndRemove => Color::Red,
+                ConfirmAction::Remove | ConfirmAction::StopAndRemove | ConfirmAction::ImageRm => {
+                    Color::Red
+                }
                 ConfirmAction::Stop => Color::Yellow,
                 ConfirmAction::Restart => Color::Cyan,
+            };
+            let subject = if *action == ConfirmAction::ImageRm {
+                app.confirm_targets
+                    .first()
+                    .map(|s| s.as_str())
+                    .unwrap_or("image")
+                    .to_string()
+            } else {
+                let count = app.confirm_targets.len();
+                let noun = if count == 1 {
+                    "container"
+                } else {
+                    "containers"
+                };
+                format!("{} {}", count, noun)
             };
             let spans = vec![
                 Span::styled(
@@ -227,10 +253,7 @@ fn render_modeline(f: &mut Frame, app: &App, area: Rect) {
                         .fg(action_color)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!("{} {}?  ", count, noun),
-                    Style::default().fg(Color::White),
-                ),
+                Span::styled(format!("{}?  ", subject), Style::default().fg(Color::White)),
                 Span::styled("[y/N] ", Style::default().fg(Color::Yellow)),
             ];
             let modeline = Paragraph::new(Line::from(spans))
@@ -254,6 +277,27 @@ fn render_modeline(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::White),
             ),
             Span::styled(CURSOR, Style::default().fg(Color::Yellow)),
+        ];
+        let modeline = Paragraph::new(Line::from(spans))
+            .style(Style::default().bg(Color::Black).fg(Color::White));
+        f.render_widget(modeline, area);
+        return;
+    }
+
+    // In image pull mode the modeline becomes a pull input field.
+    if app.mode == Mode::ImagePull {
+        let spans = vec![
+            Span::styled(
+                "  pull> ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                app.image_pull_input.as_str(),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(CURSOR, Style::default().fg(Color::Cyan)),
         ];
         let modeline = Paragraph::new(Line::from(spans))
             .style(Style::default().bg(Color::Black).fg(Color::White));
@@ -375,8 +419,12 @@ fn render_profile_picker(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_inspect_overlay(f: &mut Frame, app: &App, area: Rect) {
     // Popup dimensions: 70% wide, up to 80% tall.
-    let popup_width = (area.width * 70 / 100).max(60).min(area.width.saturating_sub(4));
-    let popup_height = (area.height * 80 / 100).max(10).min(area.height.saturating_sub(4));
+    let popup_width = (area.width * 70 / 100)
+        .max(60)
+        .min(area.width.saturating_sub(4));
+    let popup_height = (area.height * 80 / 100)
+        .max(10)
+        .min(area.height.saturating_sub(4));
     let popup_x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let popup_y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
@@ -462,14 +510,8 @@ fn build_inspect_lines(c: &Container) -> Vec<Line<'static>> {
         label("STATUS"),
         Span::styled(c.status.clone(), Style::default().fg(status_color)),
     ]));
-    lines.push(Line::from(vec![
-        label("IMAGE"),
-        value(c.rootfs.clone()),
-    ]));
-    lines.push(Line::from(vec![
-        label("PID"),
-        value(c.pid.to_string()),
-    ]));
+    lines.push(Line::from(vec![label("IMAGE"), value(c.rootfs.clone())]));
+    lines.push(Line::from(vec![label("PID"), value(c.pid.to_string())]));
     lines.push(Line::from(vec![
         label("UPTIME"),
         value(format_uptime(&c.started_at)),
@@ -479,11 +521,7 @@ fn build_inspect_lines(c: &Container) -> Vec<Line<'static>> {
             label("EXIT CODE"),
             Span::styled(
                 code.to_string(),
-                Style::default().fg(if code == 0 {
-                    Color::Green
-                } else {
-                    Color::Red
-                }),
+                Style::default().fg(if code == 0 { Color::Green } else { Color::Red }),
             ),
         ]));
     }
@@ -503,10 +541,7 @@ fn build_inspect_lines(c: &Container) -> Vec<Line<'static>> {
         lines.push(inspect_section("NETWORK"));
         if let Some(ip) = &c.bridge_ip {
             lines.push(Line::from(vec![
-                Span::styled(
-                    "    bridge       ",
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled("    bridge       ", Style::default().fg(Color::DarkGray)),
                 value(ip.clone()),
             ]));
         }
@@ -612,6 +647,126 @@ fn build_inspect_lines(c: &Container) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+// ---------------------------------------------------------------------------
+// Images screen
+// ---------------------------------------------------------------------------
+
+fn render_images(f: &mut Frame, app: &App, area: Rect) {
+    let header = Row::new(vec![
+        Cell::from("REPOSITORY:TAG").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("LAYERS").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("DIGEST").style(Style::default().add_modifier(Modifier::BOLD)),
+    ])
+    .height(1);
+
+    let rows: Vec<Row> = app
+        .images
+        .iter()
+        .map(|img| {
+            Row::new(vec![
+                Cell::from(img.reference.as_str()),
+                Cell::from(img.layers.len().to_string())
+                    .style(Style::default().fg(Color::DarkGray)),
+                Cell::from(img.short_digest().to_string())
+                    .style(Style::default().fg(Color::DarkGray)),
+            ])
+            .height(1)
+        })
+        .collect();
+
+    let mut table_state = TableState::default();
+    if !app.images.is_empty() {
+        table_state.select(Some(app.images_selected));
+    }
+
+    let title = format!(" images — {} ", app.profile);
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(70),
+            Constraint::Percentage(10),
+            Constraint::Percentage(20),
+        ],
+    )
+    .header(header)
+    .block(Block::default().borders(Borders::ALL).title(title))
+    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+    .highlight_symbol("▶ ");
+
+    f.render_stateful_widget(table, area, &mut table_state);
+
+    // Loading / error / empty state messages.
+    let inner = Rect {
+        x: area.x + 1,
+        y: area.y + area.height / 2,
+        width: area.width.saturating_sub(2),
+        height: 1,
+    };
+    if app.images_loading {
+        let p = Paragraph::new("  loading…").style(Style::default().fg(Color::DarkGray));
+        f.render_widget(p, inner);
+    } else if let Some(err) = &app.images_error {
+        let p = Paragraph::new(format!("  error: {}", err)).style(Style::default().fg(Color::Red));
+        f.render_widget(p, inner);
+    } else if app.images.is_empty() {
+        let p = Paragraph::new("  No images. Press 'p' to pull one.")
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(p, inner);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Image inspect overlay
+// ---------------------------------------------------------------------------
+
+fn render_image_inspect_overlay(f: &mut Frame, app: &App, area: Rect) {
+    let popup_width = (area.width * 70 / 100)
+        .max(60)
+        .min(area.width.saturating_sub(4));
+    let popup_height = (area.height * 80 / 100)
+        .max(10)
+        .min(area.height.saturating_sub(4));
+    let popup_x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let popup_y = area.y + (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    f.render_widget(Clear, popup_area);
+
+    let reference = app
+        .images
+        .get(app.images_selected)
+        .map(|img| img.reference.as_str())
+        .unwrap_or("image");
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", reference))
+        .title_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    if app.image_inspect_loading {
+        let p = Paragraph::new("  loading…").style(Style::default().fg(Color::DarkGray));
+        f.render_widget(p, inner);
+        return;
+    }
+
+    let lines: Vec<Line> = app
+        .image_inspect_lines
+        .iter()
+        .map(|l| Line::from(Span::styled(l.as_str(), Style::default().fg(Color::White))))
+        .collect();
+
+    let max_scroll = lines.len().saturating_sub(inner.height as usize);
+    let scroll = app.image_inspect_scroll.min(max_scroll);
+    let visible: Vec<Line> = lines.into_iter().skip(scroll).collect();
+    f.render_widget(Paragraph::new(visible), inner);
 }
 
 // ---------------------------------------------------------------------------

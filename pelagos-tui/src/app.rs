@@ -10,22 +10,112 @@ use std::time::Instant;
 // ---------------------------------------------------------------------------
 
 const ADJECTIVES: &[&str] = &[
-    "admiring", "adoring", "agitated", "amazing", "bold", "brave", "busy", "charming",
-    "clever", "confident", "cool", "curious", "daring", "determined", "eager", "earnest",
-    "elegant", "epic", "fervent", "fierce", "focused", "friendly", "gentle", "graceful",
-    "happy", "hopeful", "jolly", "keen", "lively", "lucid", "merry", "nifty", "nimble",
-    "peaceful", "quiet", "relaxed", "sharp", "sleepy", "stoic", "tender", "trusting",
-    "upbeat", "vigilant", "vivid", "witty", "wonderful", "zealous",
+    "admiring",
+    "adoring",
+    "agitated",
+    "amazing",
+    "bold",
+    "brave",
+    "busy",
+    "charming",
+    "clever",
+    "confident",
+    "cool",
+    "curious",
+    "daring",
+    "determined",
+    "eager",
+    "earnest",
+    "elegant",
+    "epic",
+    "fervent",
+    "fierce",
+    "focused",
+    "friendly",
+    "gentle",
+    "graceful",
+    "happy",
+    "hopeful",
+    "jolly",
+    "keen",
+    "lively",
+    "lucid",
+    "merry",
+    "nifty",
+    "nimble",
+    "peaceful",
+    "quiet",
+    "relaxed",
+    "sharp",
+    "sleepy",
+    "stoic",
+    "tender",
+    "trusting",
+    "upbeat",
+    "vigilant",
+    "vivid",
+    "witty",
+    "wonderful",
+    "zealous",
 ];
 
 const NOUNS: &[&str] = &[
-    "albatross", "baboon", "bear", "beaver", "capybara", "cheetah", "condor", "crane",
-    "dingo", "dolphin", "dragon", "eagle", "falcon", "ferret", "firefly", "flamingo",
-    "gazelle", "gecko", "gibbon", "giraffe", "gorilla", "hawk", "hedgehog", "heron",
-    "ibis", "iguana", "jaguar", "jellyfish", "kestrel", "kingfisher", "lemur", "leopard",
-    "lynx", "meerkat", "narwhal", "ocelot", "osprey", "otter", "panda", "panther",
-    "parrot", "peacock", "pelican", "penguin", "phoenix", "puffin", "raven", "seahorse",
-    "sparrow", "squirrel", "swift", "tiger", "tortoise", "toucan", "vulture", "wombat",
+    "albatross",
+    "baboon",
+    "bear",
+    "beaver",
+    "capybara",
+    "cheetah",
+    "condor",
+    "crane",
+    "dingo",
+    "dolphin",
+    "dragon",
+    "eagle",
+    "falcon",
+    "ferret",
+    "firefly",
+    "flamingo",
+    "gazelle",
+    "gecko",
+    "gibbon",
+    "giraffe",
+    "gorilla",
+    "hawk",
+    "hedgehog",
+    "heron",
+    "ibis",
+    "iguana",
+    "jaguar",
+    "jellyfish",
+    "kestrel",
+    "kingfisher",
+    "lemur",
+    "leopard",
+    "lynx",
+    "meerkat",
+    "narwhal",
+    "ocelot",
+    "osprey",
+    "otter",
+    "panda",
+    "panther",
+    "parrot",
+    "peacock",
+    "pelican",
+    "penguin",
+    "phoenix",
+    "puffin",
+    "raven",
+    "seahorse",
+    "sparrow",
+    "squirrel",
+    "swift",
+    "tiger",
+    "tortoise",
+    "toucan",
+    "vulture",
+    "wombat",
     "zebra",
 ];
 
@@ -41,6 +131,26 @@ fn random_name() -> String {
 
 use crate::config::TuiConfig;
 use crate::runner::Container;
+
+// ---------------------------------------------------------------------------
+// ImageInfo — parsed from `pelagos image ls --json`
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ImageInfo {
+    pub reference: String,
+    pub digest: String,
+    #[serde(default)]
+    pub layers: Vec<String>,
+}
+
+impl ImageInfo {
+    /// First 12 hex chars of the digest, without the "sha256:" prefix.
+    pub fn short_digest(&self) -> &str {
+        let hex = self.digest.strip_prefix("sha256:").unwrap_or(&self.digest);
+        &hex[..hex.len().min(12)]
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Subscription message (deserialized from `pelagos subscribe` NDJSON output)
@@ -85,6 +195,8 @@ pub enum ConfirmAction {
     Remove,
     /// Stop then remove: used when at least one target is currently running.
     StopAndRemove,
+    /// Remove an OCI image; `confirm_targets[0]` is the image reference.
+    ImageRm,
 }
 
 impl ConfirmAction {
@@ -95,17 +207,19 @@ impl ConfirmAction {
             ConfirmAction::Restart => "restart",
             ConfirmAction::Remove => "remove",
             ConfirmAction::StopAndRemove => "stop and remove",
+            ConfirmAction::ImageRm => "remove image",
         }
     }
 
-    /// The `pelagos` subcommand name.  `StopAndRemove` is handled specially in
-    /// `execute_action_bg` and should not be used directly as a subcommand.
+    /// The `pelagos` subcommand name.  `StopAndRemove` and `ImageRm` are
+    /// handled specially in `execute_action_bg`.
     pub fn pelagos_cmd(&self) -> &'static str {
         match self {
             ConfirmAction::Stop => "stop",
             ConfirmAction::Restart => "restart",
             ConfirmAction::Remove => "rm",
             ConfirmAction::StopAndRemove => "rm",
+            ConfirmAction::ImageRm => "image rm",
         }
     }
 }
@@ -117,6 +231,12 @@ impl ConfirmAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Normal,
+    /// Image management screen (toggled with `I` from Normal).
+    Images,
+    /// Pull dialog: modeline becomes a `pull> <input>` text field.
+    ImagePull,
+    /// Scrollable overlay showing full image JSON detail.
+    ImageInspect,
     ProfilePicker,
     /// Command palette: modeline becomes a `run> <input>` text field.
     CommandPalette,
@@ -171,6 +291,31 @@ pub struct App {
     pub inspect_container: Option<Container>,
     /// Scroll offset within the inspect overlay (lines).
     pub inspect_scroll: usize,
+
+    // Images screen state.
+    pub images: Vec<ImageInfo>,
+    pub images_selected: usize,
+    pub images_loading: bool,
+    pub images_error: Option<String>,
+    /// Set to true to trigger a background image list fetch.
+    pub pending_image_ls: bool,
+    pub image_ls_tx: Option<mpsc::SyncSender<Result<Vec<ImageInfo>, String>>>,
+    pub image_ls_rx: Option<mpsc::Receiver<Result<Vec<ImageInfo>, String>>>,
+    /// Pull dialog text input.
+    pub image_pull_input: String,
+    /// Set to trigger a background pull; drained by main.rs.
+    pub pending_image_pull: Option<String>,
+    /// Set after image-rm confirmation; drained by main.rs.
+    pub pending_image_rm: Option<String>,
+    // Image inspect overlay state.
+    /// Image reference to inspect; drained by main.rs to spawn the query.
+    pub pending_image_inspect: Option<String>,
+    pub image_inspect_tx: Option<mpsc::SyncSender<Result<String, String>>>,
+    pub image_inspect_rx: Option<mpsc::Receiver<Result<String, String>>>,
+    /// Pretty-printed JSON lines for the image inspect overlay.
+    pub image_inspect_lines: Vec<String>,
+    pub image_inspect_loading: bool,
+    pub image_inspect_scroll: usize,
 }
 
 impl App {
@@ -178,6 +323,8 @@ impl App {
         let picker_idx = profiles.iter().position(|p| p == &profile).unwrap_or(0);
         let (status_tx, status_rx) = mpsc::sync_channel(8);
         let (inspect_tx, inspect_rx) = mpsc::sync_channel(1);
+        let (image_ls_tx, image_ls_rx) = mpsc::sync_channel(1);
+        let (image_inspect_tx, image_inspect_rx) = mpsc::sync_channel(1);
         let tui_config = TuiConfig::load(&profile);
         Self {
             mode: Mode::Normal,
@@ -208,6 +355,22 @@ impl App {
             inspect_result_rx: Some(inspect_rx),
             inspect_container: None,
             inspect_scroll: 0,
+            images: Vec::new(),
+            images_selected: 0,
+            images_loading: false,
+            images_error: None,
+            pending_image_ls: false,
+            image_ls_tx: Some(image_ls_tx),
+            image_ls_rx: Some(image_ls_rx),
+            image_pull_input: String::new(),
+            pending_image_pull: None,
+            pending_image_rm: None,
+            pending_image_inspect: None,
+            image_inspect_tx: Some(image_inspect_tx),
+            image_inspect_rx: Some(image_inspect_rx),
+            image_inspect_lines: Vec::new(),
+            image_inspect_loading: false,
+            image_inspect_scroll: 0,
         }
     }
 
@@ -295,6 +458,9 @@ impl App {
     pub fn on_key(&mut self, key: KeyEvent) {
         match self.mode {
             Mode::Normal => self.on_key_normal(key),
+            Mode::Images => self.on_key_images(key),
+            Mode::ImagePull => self.on_key_image_pull(key),
+            Mode::ImageInspect => self.on_key_image_inspect(key),
             Mode::ProfilePicker => self.on_key_profile_picker(key),
             Mode::CommandPalette => self.on_key_palette(key),
             Mode::Confirm => self.on_key_confirm(key),
@@ -378,6 +544,15 @@ impl App {
                     self.inspect_scroll = 0;
                     self.mode = Mode::Inspect;
                 }
+            }
+
+            // Images screen.
+            KeyCode::Char('I') => {
+                self.images_selected = 0;
+                self.images_error = None;
+                self.pending_image_ls = true;
+                self.images_loading = true;
+                self.mode = Mode::Images;
             }
 
             // Prune: target all exited containers regardless of selection.
@@ -465,16 +640,26 @@ impl App {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Some(action) = self.confirm_action.take() {
                     let targets = std::mem::take(&mut self.confirm_targets);
-                    self.pending_action = Some((action, targets));
+                    if action == ConfirmAction::ImageRm {
+                        self.pending_image_rm = targets.into_iter().next();
+                        self.mode = Mode::Images;
+                    } else {
+                        self.pending_action = Some((action, targets));
+                        self.selected_names.clear();
+                        self.mode = Mode::Normal;
+                    }
                 }
-                self.selected_names.clear();
-                self.mode = Mode::Normal;
             }
             _ => {
-                // Any key other than 'y' cancels.
+                // Any key other than 'y' cancels — return to whichever screen initiated.
+                let from_images = self.confirm_action == Some(ConfirmAction::ImageRm);
                 self.confirm_action = None;
                 self.confirm_targets.clear();
-                self.mode = Mode::Normal;
+                self.mode = if from_images {
+                    Mode::Images
+                } else {
+                    Mode::Normal
+                };
             }
         }
     }
@@ -501,6 +686,95 @@ impl App {
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.inspect_scroll = self.inspect_scroll.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+
+    fn on_key_images(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('I') => {
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !self.images.is_empty() {
+                    self.images_selected = (self.images_selected + 1).min(self.images.len() - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.images_selected = self.images_selected.saturating_sub(1);
+            }
+            KeyCode::Char('r') => {
+                self.images_loading = true;
+                self.images_error = None;
+                self.pending_image_ls = true;
+            }
+            // Open the run command palette with the selected image pre-filled.
+            KeyCode::Char('R') => {
+                if let Some(img) = self.images.get(self.images_selected) {
+                    self.palette_input = format!("--name {} -d {}", random_name(), img.reference,);
+                    self.mode = Mode::CommandPalette;
+                }
+            }
+            KeyCode::Char('p') => {
+                self.image_pull_input.clear();
+                self.mode = Mode::ImagePull;
+            }
+            KeyCode::Char('d') => {
+                if let Some(img) = self.images.get(self.images_selected) {
+                    self.confirm_action = Some(ConfirmAction::ImageRm);
+                    self.confirm_targets = vec![img.reference.clone()];
+                    self.mode = Mode::Confirm;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(img) = self.images.get(self.images_selected) {
+                    self.pending_image_inspect = Some(img.reference.clone());
+                    self.image_inspect_lines.clear();
+                    self.image_inspect_loading = true;
+                    self.image_inspect_scroll = 0;
+                    self.mode = Mode::ImageInspect;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_key_image_pull(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.image_pull_input.clear();
+                self.mode = Mode::Images;
+            }
+            KeyCode::Enter => {
+                let input = self.image_pull_input.trim().to_string();
+                if !input.is_empty() {
+                    self.pending_image_pull = Some(input);
+                }
+                self.image_pull_input.clear();
+                self.mode = Mode::Images;
+            }
+            KeyCode::Backspace => {
+                self.image_pull_input.pop();
+            }
+            KeyCode::Char(c) => {
+                self.image_pull_input.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    fn on_key_image_inspect(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.image_inspect_lines.clear();
+                self.mode = Mode::Images;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.image_inspect_scroll = self.image_inspect_scroll.saturating_add(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.image_inspect_scroll = self.image_inspect_scroll.saturating_sub(1);
             }
             _ => {}
         }
@@ -565,6 +839,46 @@ impl App {
                 self.inspect_container = Some(c);
                 // Clamp scroll in case the new result is shorter.
                 self.inspect_scroll = 0;
+            }
+        }
+    }
+
+    /// Drain any image list result delivered by the background fetch thread.
+    pub fn poll_image_ls_result(&mut self) {
+        if let Some(rx) = &self.image_ls_rx {
+            while let Ok(result) = rx.try_recv() {
+                self.images_loading = false;
+                match result {
+                    Ok(list) => {
+                        self.images = list;
+                        self.images_error = None;
+                        // Clamp selection to new list length.
+                        if self.images_selected >= self.images.len() {
+                            self.images_selected = self.images.len().saturating_sub(1);
+                        }
+                    }
+                    Err(e) => {
+                        self.images_error = Some(e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drain any image inspect result delivered by the background fetch thread.
+    pub fn poll_image_inspect_result(&mut self) {
+        if let Some(rx) = &self.image_inspect_rx {
+            while let Ok(result) = rx.try_recv() {
+                self.image_inspect_loading = false;
+                match result {
+                    Ok(json) => {
+                        self.image_inspect_lines = json.lines().map(|l| l.to_string()).collect();
+                        self.image_inspect_scroll = 0;
+                    }
+                    Err(e) => {
+                        self.image_inspect_lines = vec![format!("Error: {}", e)];
+                    }
+                }
             }
         }
     }

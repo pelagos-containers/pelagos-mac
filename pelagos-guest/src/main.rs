@@ -249,6 +249,33 @@ pub enum GuestCommand {
     /// (NDJSON, one per line) until the client disconnects.  This connection
     /// is held open indefinitely — it does not produce a `GuestResponse`.
     Subscribe,
+    /// List locally stored OCI images; maps to `pelagos image ls [--format json]`.
+    ImageLs {
+        #[serde(default)]
+        json: bool,
+    },
+    /// Pull an OCI image from a registry; maps to `pelagos image pull <reference>`.
+    ImagePull {
+        #[serde(default)]
+        reference: String,
+    },
+    /// Remove a locally stored OCI image; maps to `pelagos image rm <reference>`.
+    ImageRm {
+        #[serde(default)]
+        reference: String,
+    },
+    /// Tag a local OCI image with a new reference; maps to `pelagos image tag <source> <target>`.
+    ImageTag {
+        #[serde(default)]
+        source: String,
+        #[serde(default)]
+        target: String,
+    },
+    /// Inspect a local OCI image; maps to `pelagos image ls --format json` filtered by reference.
+    ImageInspect {
+        #[serde(default)]
+        reference: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -506,7 +533,17 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 labels,
                 publish,
             } => {
-                handle_exec(fd, &image, &args, &env, tty, name.as_deref(), &mounts, &labels, &publish)?;
+                handle_exec(
+                    fd,
+                    &image,
+                    &args,
+                    &env,
+                    tty,
+                    name.as_deref(),
+                    &mounts,
+                    &labels,
+                    &publish,
+                )?;
                 return Ok(());
             }
             GuestCommand::ExecInto {
@@ -714,6 +751,21 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 // Holds connection open; does not participate in the read loop.
                 handle_subscribe(&mut writer)?;
                 return Ok(());
+            }
+            GuestCommand::ImageLs { json } => {
+                handle_image_ls(&mut writer, json)?;
+            }
+            GuestCommand::ImagePull { reference } => {
+                handle_image_pull(&mut writer, &reference)?;
+            }
+            GuestCommand::ImageRm { reference } => {
+                handle_image_rm(&mut writer, &reference)?;
+            }
+            GuestCommand::ImageTag { source, target } => {
+                handle_image_tag(&mut writer, &source, &target)?;
+            }
+            GuestCommand::ImageInspect { reference } => {
+                handle_image_inspect(&mut writer, &reference)?;
             }
         }
     }
@@ -1304,6 +1356,46 @@ fn handle_network(writer: &mut impl Write, sub: &str, args: &[String]) -> std::i
 }
 
 // ---------------------------------------------------------------------------
+// Image management handlers
+// ---------------------------------------------------------------------------
+
+fn handle_image_ls(writer: &mut impl Write, json: bool) -> std::io::Result<()> {
+    let mut cmd = Command::new(pelagos_bin());
+    cmd.arg("image").arg("ls");
+    if json {
+        cmd.arg("--format").arg("json");
+    }
+    spawn_and_stream(writer, cmd)
+}
+
+fn handle_image_pull(writer: &mut impl Write, reference: &str) -> std::io::Result<()> {
+    let mut cmd = Command::new(pelagos_bin());
+    cmd.arg("image").arg("pull").arg(reference);
+    spawn_and_stream(writer, cmd)
+}
+
+fn handle_image_rm(writer: &mut impl Write, reference: &str) -> std::io::Result<()> {
+    let mut cmd = Command::new(pelagos_bin());
+    cmd.arg("image").arg("rm").arg(reference);
+    spawn_and_stream(writer, cmd)
+}
+
+fn handle_image_tag(writer: &mut impl Write, source: &str, target: &str) -> std::io::Result<()> {
+    let mut cmd = Command::new(pelagos_bin());
+    cmd.arg("image").arg("tag").arg(source).arg(target);
+    spawn_and_stream(writer, cmd)
+}
+
+fn handle_image_inspect(writer: &mut impl Write, reference: &str) -> std::io::Result<()> {
+    // pelagos has no `image inspect` subcommand; stream the full image list as
+    // JSON and let the caller filter by reference client-side.
+    let _ = reference;
+    let mut cmd = Command::new(pelagos_bin());
+    cmd.arg("image").arg("ls").arg("--format").arg("json");
+    spawn_and_stream(writer, cmd)
+}
+
+// ---------------------------------------------------------------------------
 // docker cp handlers
 // ---------------------------------------------------------------------------
 
@@ -1624,7 +1716,8 @@ fn handle_exec(
         } else {
             format!("/mnt/{}/{}", m.tag, m.subpath)
         };
-        cmd.arg("--volume").arg(format!("{}:{}", host_dir, m.container_path));
+        cmd.arg("--volume")
+            .arg(format!("{}:{}", host_dir, m.container_path));
     }
     cmd.arg(image);
     if !args.is_empty() {
@@ -2776,5 +2869,61 @@ mod tests {
         let (ft, data) = recv_frame(&mut cursor).unwrap();
         assert_eq!(ft, FRAME_STDOUT);
         assert_eq!(data, payload);
+    }
+
+    #[test]
+    fn image_ls_deserializes() {
+        let json = r#"{"cmd":"image_ls"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        assert!(matches!(cmd, GuestCommand::ImageLs { .. }));
+    }
+
+    #[test]
+    fn image_pull_deserializes() {
+        let json = r#"{"cmd":"image_pull","reference":"alpine:latest"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        match cmd {
+            GuestCommand::ImagePull { reference } => {
+                assert_eq!(reference, "alpine:latest");
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn image_rm_deserializes() {
+        let json = r#"{"cmd":"image_rm","reference":"alpine:latest"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        match cmd {
+            GuestCommand::ImageRm { reference } => {
+                assert_eq!(reference, "alpine:latest");
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn image_tag_deserializes() {
+        let json = r#"{"cmd":"image_tag","source":"alpine:latest","target":"alpine:sparky"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        match cmd {
+            GuestCommand::ImageTag { source, target } => {
+                assert_eq!(source, "alpine:latest");
+                assert_eq!(target, "alpine:sparky");
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn image_inspect_deserializes() {
+        let json = r#"{"cmd":"image_inspect","reference":"alpine:latest"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        match cmd {
+            GuestCommand::ImageInspect { reference } => {
+                assert_eq!(reference, "alpine:latest");
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
     }
 }
