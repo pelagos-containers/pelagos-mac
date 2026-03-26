@@ -289,7 +289,11 @@ enum Commands {
 #[derive(Subcommand, Debug)]
 enum ImageCmd {
     /// List locally stored OCI images
-    Ls,
+    Ls {
+        /// Output as JSON instead of a human-readable table
+        #[arg(long)]
+        json: bool,
+    },
     /// Pull an OCI image from a registry
     Pull {
         /// Image reference (e.g. alpine:latest, registry.io/org/repo:tag)
@@ -482,8 +486,11 @@ enum GuestCommand {
         dst: String,
         data_size: u64,
     },
-    /// List locally stored OCI images; maps to `pelagos image ls --format json`.
-    ImageLs,
+    /// List locally stored OCI images; maps to `pelagos image ls [--format json]`.
+    ImageLs {
+        #[serde(skip_serializing_if = "is_false")]
+        json: bool,
+    },
     /// Pull an OCI image from a registry; maps to `pelagos image pull <reference>`.
     ImagePull {
         reference: String,
@@ -1101,7 +1108,7 @@ fn main() {
             }
             let stream = connect_or_exit(&profile);
             let guest_cmd = match cmd {
-                ImageCmd::Ls => GuestCommand::ImageLs,
+                ImageCmd::Ls { json } => GuestCommand::ImageLs { json: *json },
                 ImageCmd::Pull { reference } => GuestCommand::ImagePull {
                     reference: reference.clone(),
                 },
@@ -3279,10 +3286,12 @@ mod tests {
 
     #[test]
     fn image_ls_serializes() {
-        let cmd = GuestCommand::ImageLs;
+        let cmd = GuestCommand::ImageLs { json: false };
         let json = serde_json::to_string(&cmd).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["cmd"], "image_ls");
+        // json=false is skip_serializing, so the field must be absent
+        assert!(v.get("json").is_none());
     }
 
     #[test]

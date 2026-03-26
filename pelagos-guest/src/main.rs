@@ -249,8 +249,11 @@ pub enum GuestCommand {
     /// (NDJSON, one per line) until the client disconnects.  This connection
     /// is held open indefinitely — it does not produce a `GuestResponse`.
     Subscribe,
-    /// List locally stored OCI images; maps to `pelagos image ls --format json`.
-    ImageLs,
+    /// List locally stored OCI images; maps to `pelagos image ls [--format json]`.
+    ImageLs {
+        #[serde(default)]
+        json: bool,
+    },
     /// Pull an OCI image from a registry; maps to `pelagos image pull <reference>`.
     ImagePull {
         #[serde(default)]
@@ -739,8 +742,8 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 handle_subscribe(&mut writer)?;
                 return Ok(());
             }
-            GuestCommand::ImageLs => {
-                handle_image_ls(&mut writer)?;
+            GuestCommand::ImageLs { json } => {
+                handle_image_ls(&mut writer, json)?;
             }
             GuestCommand::ImagePull { reference } => {
                 handle_image_pull(&mut writer, &reference)?;
@@ -1346,9 +1349,12 @@ fn handle_network(writer: &mut impl Write, sub: &str, args: &[String]) -> std::i
 // Image management handlers
 // ---------------------------------------------------------------------------
 
-fn handle_image_ls(writer: &mut impl Write) -> std::io::Result<()> {
+fn handle_image_ls(writer: &mut impl Write, json: bool) -> std::io::Result<()> {
     let mut cmd = Command::new(pelagos_bin());
-    cmd.arg("image").arg("ls").arg("--format").arg("json");
+    cmd.arg("image").arg("ls");
+    if json {
+        cmd.arg("--format").arg("json");
+    }
     spawn_and_stream(writer, cmd)
 }
 
@@ -2858,7 +2864,7 @@ mod tests {
     fn image_ls_deserializes() {
         let json = r#"{"cmd":"image_ls"}"#;
         let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
-        assert!(matches!(cmd, GuestCommand::ImageLs));
+        assert!(matches!(cmd, GuestCommand::ImageLs { .. }));
     }
 
     #[test]
