@@ -59,6 +59,9 @@ cargo build -p pelagos-mac --release 2>&1 | grep -E "Compiling|Finished|^error"
 echo "[release] building pelagos-docker..."
 cargo build -p pelagos-docker --release 2>&1 | grep -E "Compiling|Finished|^error"
 
+echo "[release] building pelagos-tui..."
+cargo build -p pelagos-tui --release 2>&1 | grep -E "Compiling|Finished|^error"
+
 echo "[release] signing pelagos..."
 bash "$REPO/scripts/sign.sh"
 
@@ -72,6 +75,7 @@ trap 'rm -rf "$BIN_STAGING" "$VM_STAGING"' EXIT
 
 cp "$REPO/target/aarch64-apple-darwin/release/pelagos"        "$BIN_STAGING/pelagos"
 cp "$REPO/target/aarch64-apple-darwin/release/pelagos-docker" "$BIN_STAGING/pelagos-docker"
+cp "$REPO/target/aarch64-apple-darwin/release/pelagos-tui"    "$BIN_STAGING/pelagos-tui"
 
 echo "[release] packing ${BIN_TARBALL}..."
 COPYFILE_DISABLE=1 tar -czf "$DIST/$BIN_TARBALL" -C "$BIN_STAGING" .
@@ -123,6 +127,7 @@ class PelagosMac < Formula
   def install
     bin.install "pelagos"
     bin.install "pelagos-docker"
+    bin.install "pelagos-tui"
     resource("vm").stage { (share/"pelagos-mac").install Dir["*"] }
   end
 

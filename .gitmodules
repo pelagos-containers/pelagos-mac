@@ -1,0 +1,3 @@
+[submodule "pelagos-tui"]
+	path = pelagos-tui
+	url = git@github.com:skeptomai/pelagos-tui.git
