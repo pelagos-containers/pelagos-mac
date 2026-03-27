@@ -56,7 +56,7 @@ KERNEL_OUT="$OUT/vmlinuz"
 UBUNTU_VMLINUZ="$OUT/ubuntu-vmlinuz"
 UBUNTU_MODULES="$OUT/ubuntu-modules"
 
-PELAGOS_VERSION="0.59.0"
+PELAGOS_VERSION="0.59.4"
 PELAGOS_BIN="$WORK/pelagos-${PELAGOS_VERSION}-aarch64-linux"
 PELAGOS_URL="https://github.com/pelagos-containers/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-aarch64-linux"
 # If a local build exists, use it instead of downloading.
