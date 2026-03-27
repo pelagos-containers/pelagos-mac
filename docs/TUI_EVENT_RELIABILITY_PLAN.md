@@ -1,7 +1,7 @@
 # TUI Container Event Reliability Plan
 
 **Status:** IMPLEMENTED — all fixes shipped in PR #161
-**Related issues:** [#156 (Epic: async guest daemon + push-based TUI events)](https://github.com/skeptomai/pelagos-mac/issues/156), [#158 (guest Subscribe)](https://github.com/skeptomai/pelagos-mac/issues/158), [#159 (TUI subscribe runner)](https://github.com/skeptomai/pelagos-mac/issues/159), [#149 (TUI Epic)](https://github.com/skeptomai/pelagos-mac/issues/149)
+**Related issues:** [#156 (Epic: async guest daemon + push-based TUI events)](https://github.com/pelagos-containers/pelagos-mac/issues/156), [#158 (guest Subscribe)](https://github.com/pelagos-containers/pelagos-mac/issues/158), [#159 (TUI subscribe runner)](https://github.com/pelagos-containers/pelagos-mac/issues/159), [#149 (TUI Epic)](https://github.com/pelagos-containers/pelagos-mac/issues/149)
 
 ---
 

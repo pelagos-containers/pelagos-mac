@@ -89,7 +89,7 @@ pelagos ps --filter label=devcontainer.local_folder=/Users/you/myproject
 ```json
 {
   "name": "My Rust Project",
-  "image": "ghcr.io/skeptomai/pelagos-dev:latest",
+  "image": "ghcr.io/pelagos-containers/pelagos-dev:latest",
   "mounts": [
     {
       "source": "vscode-server-${devcontainerId}",

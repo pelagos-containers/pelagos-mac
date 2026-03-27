@@ -1,6 +1,6 @@
 # pelagos-mac
 
-macOS CLI for the [pelagos](https://github.com/skeptomai/pelagos) Linux container
+macOS CLI for the [pelagos](https://github.com/pelagos-containers/pelagos) Linux container
 runtime. Runs pelagos containers on Apple Silicon by managing a lightweight Linux VM
 via Apple's Virtualization Framework.
 

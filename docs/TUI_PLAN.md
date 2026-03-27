@@ -1,6 +1,6 @@
 # pelagos-tui — Implementation Plan
 
-**Epic:** [#149](https://github.com/skeptomai/pelagos-mac/issues/149)
+**Epic:** [#149](https://github.com/pelagos-containers/pelagos-mac/issues/149)
 **Approach:** Alternative A — Rust + ratatui + crossterm
 **Status:** M1 in progress
 

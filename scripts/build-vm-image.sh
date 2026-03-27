@@ -58,7 +58,7 @@ UBUNTU_MODULES="$OUT/ubuntu-modules"
 
 PELAGOS_VERSION="0.59.0"
 PELAGOS_BIN="$WORK/pelagos-${PELAGOS_VERSION}-aarch64-linux"
-PELAGOS_URL="https://github.com/skeptomai/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-aarch64-linux"
+PELAGOS_URL="https://github.com/pelagos-containers/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-aarch64-linux"
 # If a local build exists, use it instead of downloading.
 PELAGOS_LOCAL_BUILD="$HOME/Projects/pelagos/target/aarch64-unknown-linux-musl/release/pelagos"
 

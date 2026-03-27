@@ -2,7 +2,7 @@
 
 ## What This Project Is
 
-pelagos-mac is the macOS CLI for the [pelagos](https://github.com/skeptomai/pelagos)
+pelagos-mac is the macOS CLI for the [pelagos](https://github.com/pelagos-containers/pelagos)
 Linux container runtime. Because pelagos uses Linux namespaces, cgroups, and seccomp —
 Linux-only kernel primitives — a Linux VM is mandatory on Apple Silicon. This project
 owns that VM layer and the macOS user experience.
@@ -32,7 +32,7 @@ layer for pelagos.**
 
 When a pelagos capability is missing or broken, the correct response is:
 
-1. File a GitHub issue at `https://github.com/skeptomai/pelagos` with a clear
+1. File a GitHub issue at `https://github.com/pelagos-containers/pelagos` with a clear
    reproduction case.
 2. Fix the bug in pelagos (the right place) — not in the shim.
 3. Update `ONGOING_TASKS.md` to note the pelagos issue number blocking further
@@ -254,7 +254,7 @@ WebFetch — use them freely without asking.
 - `docs/DESIGN.md` — full architecture analysis, options considered, security analysis,
   and rationale for the pure-Rust AVF approach
 - `pelagos` repo — the Linux runtime that runs inside the VM:
-  `https://github.com/skeptomai/pelagos`
+  `https://github.com/pelagos-containers/pelagos`
 - `objc2-virtualization` — AVF bindings: `https://docs.rs/objc2-virtualization`
 - `Code-Hex/vz` — Go AVF bindings, useful as API reference:
   `https://github.com/Code-Hex/vz`
