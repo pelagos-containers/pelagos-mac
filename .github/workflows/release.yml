@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    name: Build and release (macOS ARM64)
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.0"
+          components: rustfmt, clippy
+          targets: aarch64-unknown-linux-musl
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: brew install zig squashfs
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
+
+      - name: Build VM image (cross-compile guest + pack initramfs)
+        run: bash scripts/build-vm-image.sh
+
+      # build-release.sh checks for out/ubuntu-vmlinuz specifically.
+      # In CI we only have out/vmlinuz (Alpine LTS kernel); symlink it.
+      - name: Alias kernel artifact for build-release.sh
+        run: cp out/vmlinuz out/ubuntu-vmlinuz
+
+      - name: Build and pack release artifacts
+        run: bash scripts/build-release.sh
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION="$(grep '^version\s*=' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          gh release create "v${VERSION}" \
+            --title "pelagos-mac v${VERSION}" \
+            --generate-notes \
+            "dist/pelagos-mac-${VERSION}-aarch64-apple-darwin.tar.gz" \
+            "dist/pelagos-mac-vm-${VERSION}.tar.gz"
