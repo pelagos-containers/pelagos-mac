@@ -288,6 +288,27 @@ pub enum GuestCommand {
         #[serde(default)]
         reference: String,
     },
+    /// Proxy a `pelagos compose` subcommand.
+    ///
+    /// The compose file and all bind-mount paths must be accessible inside the
+    /// VM via virtiofs shares.  `$HOME` is always mounted as `share0` at
+    /// `/mnt/share0`; the macOS CLI translates host paths before sending this
+    /// command.  `working_dir` is set to the parent directory of `file` so that
+    /// relative paths inside the compose file resolve correctly.
+    Compose {
+        /// Compose subcommand: "up", "down", "ps", or "logs".
+        subcommand: String,
+        /// Absolute path to the `.reml` file inside the VM (e.g. `/mnt/share0/Projects/foo/compose.reml`).
+        file: String,
+        /// Working directory for the compose invocation (typically the directory containing `file`).
+        working_dir: String,
+        /// Optional project name override (`-p`).
+        #[serde(default)]
+        project: Option<String>,
+        /// Extra arguments forwarded verbatim (e.g. `["--foreground"]`, `["--follow", "grafana"]`).
+        #[serde(default)]
+        args: Vec<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -787,6 +808,22 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
             GuestCommand::ImageInspect { reference } => {
                 handle_image_inspect(&mut writer, &reference)?;
             }
+            GuestCommand::Compose {
+                subcommand,
+                file,
+                working_dir,
+                project,
+                args,
+            } => {
+                handle_compose(
+                    &mut writer,
+                    &subcommand,
+                    &file,
+                    &working_dir,
+                    project.as_deref(),
+                    &args,
+                )?;
+            }
         }
     }
     Ok(())
@@ -798,6 +835,40 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
 
 fn pelagos_bin() -> String {
     std::env::var("PELAGOS_BIN").unwrap_or_else(|_| "/usr/local/bin/pelagos".into())
+}
+
+// ---------------------------------------------------------------------------
+// Compose command handler
+// ---------------------------------------------------------------------------
+
+/// Proxy a `pelagos compose` subcommand.
+///
+/// Invokes `pelagos compose <subcommand> -f <file> [-p <project>] [args...]`
+/// at `working_dir` and streams stdout/stderr back to the client.
+///
+/// The compose supervisor daemonises by default (`compose up`), so the stream
+/// ends quickly.  In `--foreground` mode it runs indefinitely until the client
+/// disconnects or all services exit.
+fn handle_compose(
+    writer: &mut impl Write,
+    subcommand: &str,
+    file: &str,
+    working_dir: &str,
+    project: Option<&str>,
+    args: &[String],
+) -> std::io::Result<()> {
+    let pelagos = pelagos_bin();
+    let mut cmd = Command::new(&pelagos);
+    cmd.arg("compose").arg(subcommand);
+    cmd.arg("-f").arg(file);
+    if let Some(p) = project {
+        cmd.arg("-p").arg(p);
+    }
+    for a in args {
+        cmd.arg(a);
+    }
+    cmd.current_dir(working_dir);
+    spawn_and_stream(writer, cmd)
 }
 
 // ---------------------------------------------------------------------------
