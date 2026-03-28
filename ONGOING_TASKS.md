@@ -1,6 +1,6 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-03-25 — OCI image management shipped (protocol + CLI + TUI); git SHA: 251d57a*
+*Last updated: 2026-03-28 — core monitoring stack running end-to-end; pelagos-dns + nft_masq.ko in initramfs; git SHA: 4fe43fb*
 
 ---
 
@@ -93,7 +93,48 @@ to any client connecting at any time. `pelagos vm console [--profile build]` wor
 
 ## Remaining Work
 
-### Completed this session (2026-03-25)
+### Completed this session (2026-03-28)
+
+- **`pelagos compose` proxy** ✅ (PR #198, open)
+  - `pelagos compose up/down/ps/logs` proxies subcommands to the Linux `pelagos compose` binary via vsock
+  - Host paths under `$HOME` auto-translated to `/mnt/share0/...` (virtiofs)
+  - PortDispatcher registers macOS-side port listeners before stack starts
+  - Bugfix: `compose down --volumes` clap conflict with global `-v/--volume` flag
+
+- **Home monitoring stack compose config** — `~/Projects/home-monitoring/pelagos/`
+  - `compose.reml` with all 8 services (snmp-exporter, mktxp, graphite-exporter, truenas-api-exporter, plex-exporter, alertmanager, prometheus, grafana)
+  - Config files, grafana provisioning, start.sh, check.sh
+  - Secrets via `.env` (gitignored)
+  - Core images pulled; **blocked on pelagos#157**
+
+- **Root-caused pelagos#157: compose fails for non-root-user images**
+  - `pelagos compose` (and `pelagos run --security-opt seccomp=default --user N`) fails with
+    "Invalid argument (os error 22)" for any image with a non-root `User` (prometheus=65534, grafana, etc.)
+  - Root cause: `docker_default_filter()` in `seccomp.rs` incorrectly blocks `setuid`/`setgid`;
+    pelagos installs seccomp at step 4.849, then calls `setuid` at step 8.5 → EPERM →
+    `io::Error::other()` → Rust spawn reports EINVAL (via `raw_os_error().unwrap_or(EINVAL)`)
+  - Fix needed in pelagos: remove `setuid`/`setgid` from blocked_syscalls (Docker's real profile allows them)
+  - Fixed in pelagos PR #158 (`fix/seccomp-allow-setuid-setgid`); merged
+  - Filed: https://github.com/pelagos-containers/pelagos/issues/157
+
+- **`nft_masq.ko` added to VM initramfs** ✅
+  - `masquerade` nftables expression requires `nft_masq.ko`; was absent from Alpine initramfs
+  - Module extracted from `linux-modules-6.8.0-106-generic_6.8.0-106.106~22.04.1_arm64.deb` (Ubuntu base modules)
+  - Added to `scripts/build-vm-image.sh` and `scripts/build-build-image.sh`; staged at boot via `modprobe nft_masq`
+  - Without this, `pelagos compose up` with bridge networks failed: `Error: Could not process rule: No such file or directory`
+
+- **`pelagos-dns` added to VM initramfs** ✅
+  - Container hostname DNS resolution daemon; required for inter-container communication on bridge networks
+  - Built as musl static binary (`aarch64-unknown-linux-musl`); staged to `/usr/local/bin/pelagos-dns`
+  - Added to rebuild trigger and copy block in `scripts/build-vm-image.sh`
+  - Without this, Prometheus could not scrape `alertmanager:9093`, `grafana:3000`, etc.
+
+- **Core monitoring stack verified end-to-end** ✅
+  - `pelagos compose up -f compose-core.reml` starts prometheus + alertmanager + grafana
+  - All three scrape targets report `health: up` in Prometheus
+  - Grafana v12.4.2 accessible at `http://localhost:3000`, database ok
+
+### Completed in previous session (2026-03-25)
 
 - **Epic #178 — OCI image management** ✅ (PR #192, merged to main)
   - Phase 1: `GuestCommand` variants `ImageLs|Pull|Rm|Tag|Inspect` added to vsock protocol in both `pelagos-mac` and `pelagos-guest`
@@ -102,6 +143,7 @@ to any client connecting at any time. `pelagos vm console [--profile build]` wor
 
 ### Next priorities
 
+- **Home monitoring stack** — core stack (prometheus + alertmanager + grafana) running end-to-end. Full 8-service stack (`compose.reml`) needs `.env` with real credentials (MIKROTIK_PASSWORD, TRUENAS_API_KEY, PLEX_TOKEN, GF_SMTP_PASSWORD). Once credentials in place: verify all exporters up, import Grafana dashboards from k8s setup.
 - **Epic #135 — pelagos-ui** — Tauri + Svelte macOS management GUI (new). M1: container list. Blocked on #98 (JSON ps output).
 - **Release CI workflow (#118)** — self-hosted runner + `release.yml` to build, sign, and publish binaries on tag push.
 - **Port forwarding** ✅ — `pelagos run -p 8080:80 nginx:alpine` + `curl http://localhost:8080/`
