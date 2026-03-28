@@ -9,6 +9,8 @@ jobs:
   release:
     name: Build and release (macOS ARM64)
     runs-on: macos-14
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
@@ -30,6 +32,9 @@ jobs:
 
       - name: Install cargo-zigbuild
         run: cargo install cargo-zigbuild --locked
+
+      - name: Add musl cross-compile target
+        run: rustup target add aarch64-unknown-linux-musl
 
       - name: Build VM image (cross-compile guest + pack initramfs)
         run: bash scripts/build-vm-image.sh
