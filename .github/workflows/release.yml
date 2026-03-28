@@ -18,9 +18,8 @@ jobs:
           submodules: true
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.93.0"
           components: rustfmt, clippy
           targets: aarch64-unknown-linux-musl
 
@@ -32,9 +31,6 @@ jobs:
 
       - name: Install cargo-zigbuild
         run: cargo install cargo-zigbuild --locked
-
-      - name: Add musl cross-compile target
-        run: rustup target add aarch64-unknown-linux-musl
 
       - name: Build VM image (cross-compile guest + pack initramfs)
         run: bash scripts/build-vm-image.sh
