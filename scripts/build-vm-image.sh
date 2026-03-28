@@ -536,10 +536,13 @@ if [[ "$USE_UBUNTU_MODULES" -eq 0 ]]; then
     echo "  kernel version: $KVER (Alpine lts — run build-build-image.sh to upgrade to Ubuntu kernel)"
 fi
 
+PELAGOS_DNS_BIN="$HOME/Projects/pelagos/target/aarch64-unknown-linux-musl/release/pelagos-dns"
+
 if [ ! -f "$INITRAMFS_OUT" ] \
-    || [ "$GUEST_BIN"   -nt "$INITRAMFS_OUT" ] \
-    || [ "$PELAGOS_BIN" -nt "$INITRAMFS_OUT" ] \
-    || [ "$0"           -nt "$INITRAMFS_OUT" ]; then
+    || [ "$GUEST_BIN"        -nt "$INITRAMFS_OUT" ] \
+    || [ "$PELAGOS_BIN"      -nt "$INITRAMFS_OUT" ] \
+    || { [ -f "$PELAGOS_DNS_BIN" ] && [ "$PELAGOS_DNS_BIN" -nt "$INITRAMFS_OUT" ]; } \
+    || [ "$0"                -nt "$INITRAMFS_OUT" ]; then
 
     NETMOD_BASE="$MODLOOP_DIR/modules/$KVER/kernel"
     VSOCK_SRC="$NETMOD_BASE/net/vmw_vsock"
@@ -620,7 +623,8 @@ if [ ! -f "$INITRAMFS_OUT" ] \
             net/netfilter/nf_conntrack.ko \
             net/netfilter/nf_nat.ko \
             net/netfilter/nft_nat.ko \
-            net/netfilter/nft_chain_nat.ko
+            net/netfilter/nft_chain_nat.ko \
+            net/netfilter/nft_masq.ko
         do
             src="$UBUNTU_MODULES/$rel_ko"
             dst="$INITRD_TMP/lib/modules/$KVER/kernel/$rel_ko"
@@ -746,6 +750,15 @@ if [ ! -f "$INITRAMFS_OUT" ] \
     chmod 755 "$INITRD_TMP/usr/local/bin/pelagos-guest"
     cp "$PELAGOS_BIN" "$INITRD_TMP/usr/local/bin/pelagos"
     chmod 755 "$INITRD_TMP/usr/local/bin/pelagos"
+    # pelagos-dns: container name resolution daemon (co-located with pelagos binary).
+    PELAGOS_DNS_BIN="$HOME/Projects/pelagos/target/aarch64-unknown-linux-musl/release/pelagos-dns"
+    if [ -f "$PELAGOS_DNS_BIN" ]; then
+        cp "$PELAGOS_DNS_BIN" "$INITRD_TMP/usr/local/bin/pelagos-dns"
+        chmod 755 "$INITRD_TMP/usr/local/bin/pelagos-dns"
+        echo "  Staged pelagos-dns"
+    else
+        echo "  WARNING: pelagos-dns binary not found at $PELAGOS_DNS_BIN — container hostname DNS will not work" >&2
+    fi
 
     # Add dropbear SSH server and its runtime library dependencies.
     mkdir -p "$INITRD_TMP/usr/sbin"
@@ -893,6 +906,7 @@ if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
     modprobe nf_nat              2>/dev/null || true
     modprobe nft_nat             2>/dev/null || true
     modprobe nft_chain_nat       2>/dev/null || true
+    modprobe nft_masq            2>/dev/null || true
     modprobe nf_tables           2>/dev/null || true
     modprobe veth                2>/dev/null || true
     # Create /dev/net/tun device node.  The tun kernel module registers

@@ -253,6 +253,23 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Start, stop, and manage multi-container applications defined in a .reml compose file.
+    ///
+    /// The compose file must be under $HOME (virtiofs share0).  Relative paths
+    /// inside the file are resolved against the file's parent directory in the VM.
+    ///
+    /// Use -p HOST:CONTAINER (global flag) to register macOS-side port listeners
+    /// before the stack starts.
+    ///
+    /// Examples:
+    ///   pelagos -p 9090:9090 -p 3000:3000 compose up -f ~/Projects/monitoring/compose.reml
+    ///   pelagos compose ps -f ~/Projects/monitoring/compose.reml
+    ///   pelagos compose logs -f ~/Projects/monitoring/compose.reml --follow grafana
+    ///   pelagos compose down -f ~/Projects/monitoring/compose.reml
+    Compose {
+        #[command(subcommand)]
+        sub: ComposeSubcmd,
+    },
     /// Copy files between the host and a running container.
     /// Use `container:path` syntax to denote a path inside a container.
     /// Examples:
@@ -289,6 +306,57 @@ enum Commands {
     SshRelayProxy {
         /// VM port to connect to (e.g. 22 for SSH).
         port: u16,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ComposeSubcmd {
+    /// Start all services defined in a compose file (supervisor daemonises by default).
+    Up {
+        /// Path to the .reml compose file
+        #[arg(short = 'f', long = "file", default_value = "compose.reml")]
+        file: PathBuf,
+        /// Override the project name (default: parent directory name)
+        #[arg(long)]
+        project: Option<String>,
+        /// Run supervisor in foreground; stream output until the stack stops
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// Stop and remove all containers in a compose stack.
+    Down {
+        /// Path to the .reml compose file
+        #[arg(short = 'f', long = "file", default_value = "compose.reml")]
+        file: PathBuf,
+        /// Override the project name (default: parent directory name)
+        #[arg(long)]
+        project: Option<String>,
+        /// Also remove named volumes declared in the compose file
+        #[arg(long = "volumes")]
+        remove_volumes: bool,
+    },
+    /// List services and their status in a compose stack.
+    Ps {
+        /// Path to the .reml compose file
+        #[arg(short = 'f', long = "file", default_value = "compose.reml")]
+        file: PathBuf,
+        /// Override the project name (default: parent directory name)
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// View logs from services in a compose stack.
+    Logs {
+        /// Path to the .reml compose file
+        #[arg(short = 'f', long = "file", default_value = "compose.reml")]
+        file: PathBuf,
+        /// Override the project name (default: parent directory name)
+        #[arg(long)]
+        project: Option<String>,
+        /// Follow log output (stream continuously)
+        #[arg(long)]
+        follow: bool,
+        /// Show logs for this service only
+        service: Option<String>,
     },
 }
 
@@ -525,6 +593,16 @@ enum GuestCommand {
     /// Inspect a local OCI image; maps to `pelagos image ls --format json` filtered by reference.
     ImageInspect {
         reference: String,
+    },
+    /// Proxy a `pelagos compose` subcommand to the VM guest.
+    Compose {
+        subcommand: String,
+        file: String,
+        working_dir: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
     },
 }
 
@@ -1222,6 +1300,119 @@ fn main() {
                 stream,
                 GuestCommand::Network { sub, args },
             ));
+        }
+
+        Commands::Compose { ref sub } => {
+            let (file, project, subcommand_name, extra_args) = match sub {
+                ComposeSubcmd::Up {
+                    file,
+                    project,
+                    foreground,
+                } => {
+                    let mut args = vec![];
+                    if *foreground {
+                        args.push("--foreground".to_string());
+                    }
+                    (file.clone(), project.clone(), "up", args)
+                }
+                ComposeSubcmd::Down {
+                    file,
+                    project,
+                    remove_volumes,
+                } => {
+                    let mut args = vec![];
+                    if *remove_volumes {
+                        args.push("--volumes".to_string());
+                    }
+                    (file.clone(), project.clone(), "down", args)
+                }
+                ComposeSubcmd::Ps { file, project } => {
+                    (file.clone(), project.clone(), "ps", vec![])
+                }
+                ComposeSubcmd::Logs {
+                    file,
+                    project,
+                    follow,
+                    service,
+                } => {
+                    let mut args = vec![];
+                    if *follow {
+                        args.push("--follow".to_string());
+                    }
+                    if let Some(s) = service {
+                        args.push(s.clone());
+                    }
+                    (file.clone(), project.clone(), "logs", args)
+                }
+            };
+
+            // Resolve the compose file to an absolute path.
+            let abs_file = if file.is_absolute() {
+                file.clone()
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(&file)
+            };
+
+            // Translate the macOS host path to a VM virtiofs path.
+            // $HOME is always share0, mounted at /mnt/share0 in the VM.
+            let home = std::env::var("HOME").unwrap_or_default();
+            if home.is_empty() || !abs_file.starts_with(&home) {
+                eprintln!(
+                    "error: compose file {} is outside $HOME — only paths under $HOME are \
+                     accessible in the VM without a restart",
+                    abs_file.display()
+                );
+                process::exit(1);
+            }
+            let subpath = abs_file
+                .strip_prefix(&home)
+                .unwrap_or(&abs_file)
+                .to_string_lossy()
+                .trim_start_matches('/')
+                .to_string();
+            let vm_file = format!("/mnt/share0/{}", subpath);
+            let working_dir = std::path::Path::new(&vm_file)
+                .parent()
+                .unwrap_or(std::path::Path::new("/mnt/share0"))
+                .to_string_lossy()
+                .into_owned();
+
+            let daemon_args = daemon_args_from_cli(&cli);
+            if let Err(e) = daemon::ensure_running(&daemon_args) {
+                log::error!("failed to start VM daemon: {}", e);
+                process::exit(1);
+            }
+
+            // Register macOS-side port listeners before the stack starts.
+            for spec in &cli.ports {
+                if let Some(pf) = daemon::parse_port_spec(spec) {
+                    if let Err(e) = send_daemon_cmd(
+                        &profile,
+                        daemon::DaemonCmd::RegisterPort {
+                            host_port: pf.host_port,
+                            container_port: pf.container_port,
+                        },
+                    ) {
+                        log::error!("port registration failed: {}", e);
+                        process::exit(1);
+                    }
+                }
+            }
+
+            let stream = connect_or_exit(&profile);
+            let exit_code = passthrough_command(
+                stream,
+                GuestCommand::Compose {
+                    subcommand: subcommand_name.to_string(),
+                    file: vm_file,
+                    working_dir,
+                    project,
+                    args: extra_args,
+                },
+            );
+            process::exit(exit_code);
         }
 
         Commands::Cp { ref src, ref dst } => {

@@ -449,7 +449,8 @@ if [ -n "\$KVER" ]; then
         "\$MODDIR/net/netfilter/nf_conntrack.ko" \
         "\$MODDIR/net/netfilter/nf_nat.ko" \
         "\$MODDIR/net/netfilter/nft_nat.ko" \
-        "\$MODDIR/net/netfilter/nft_chain_nat.ko"
+        "\$MODDIR/net/netfilter/nft_chain_nat.ko" \
+        "\$MODDIR/net/netfilter/nft_masq.ko"
     do
         dir="\$OUTDIR/ubuntu-modules/\$(dirname \${ko#\$MODDIR/})"
         mkdir -p "\$dir"
