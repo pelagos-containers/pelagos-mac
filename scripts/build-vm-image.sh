@@ -838,19 +838,19 @@ UDHCPC
     mkdir -p "$INITRD_TMP/etc/ssl/certs"
     cp "$CA_BUNDLE" "$INITRD_TMP/etc/ssl/certs/ca-certificates.crt"
 
-    # Compute a version marker from the pelagos-guest binary AND the init
-    # script.  Embedded as a literal string in the init script at build time;
-    # pass 1 compares it against /etc/pelagos-root-version on /dev/vda to
-    # decide whether to refresh the disk root.  Changes to either the guest
-    # binary or the init script trigger an auto-refresh on next boot, with
-    # the OCI cache preserved.
+    # Compute a version marker from the pelagos-guest binary, the pelagos
+    # runtime binary, AND this build script.  Embedded as a literal string in
+    # the init script at build time; pass 1 compares it against
+    # /etc/pelagos-root-version on /dev/vda to decide whether to refresh the
+    # disk root.  Changes to any of these three inputs trigger an auto-refresh
+    # on next boot, with the OCI cache preserved.
     #
     # NOTE: the init script is written to $INITRD_TMP/init just below, so we
-    # cannot include it in this hash yet.  Instead we hash the guest binary
-    # (most churn) plus a stable hash of this build script itself as a proxy
-    # for "init script changed".  Any edit to build-vm-image.sh (which owns
-    # the init script) will change the marker.
-    ROOT_VERSION="$(cat "$INITRD_TMP/usr/local/bin/pelagos-guest" "$0" | shasum -a 256 | cut -c1-16)"
+    # cannot include it in this hash yet.  Instead we hash the guest binary,
+    # the pelagos runtime binary, and a stable hash of this build script
+    # itself as a proxy for "init script changed".  Any edit to
+    # build-vm-image.sh (which owns the init script) will change the marker.
+    ROOT_VERSION="$(cat "$INITRD_TMP/usr/local/bin/pelagos-guest" "$INITRD_TMP/usr/local/bin/pelagos" "$0" | shasum -a 256 | cut -c1-16)"
     echo "$ROOT_VERSION" > "$INITRD_TMP/etc/pelagos-root-version"
     echo "  root version marker: $ROOT_VERSION"
 
