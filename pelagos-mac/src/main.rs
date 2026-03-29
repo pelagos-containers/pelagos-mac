@@ -1430,6 +1430,11 @@ fn main() {
                 );
             }
 
+            // Forward only the env vars explicitly referenced in the compose file
+            // via (env "NAME") calls.  Forwarding the full host environment would
+            // expose unrelated shell secrets over vsock.
+            let compose_env = collect_compose_env(&abs_file);
+
             let stream = connect_or_exit(&profile);
             let exit_code = passthrough_command(
                 stream,
@@ -1439,7 +1444,7 @@ fn main() {
                     working_dir,
                     project,
                     args: extra_args,
-                    env: std::env::vars().collect(),
+                    env: compose_env,
                 },
             );
 
@@ -2308,6 +2313,35 @@ fn build_command(
 /// Matches Docker Compose v2 convention: use the explicit `--project-name`
 /// flag if given, otherwise fall back to the parent directory name of the
 /// compose file (lower-cased).
+/// Scan a compose `.reml` file for `(env "NAME")` calls and return a map of
+/// NAME → value for every such variable that is set in the current process
+/// environment.  Only variables explicitly referenced in the file are included;
+/// the rest of the host environment is never forwarded.
+fn collect_compose_env(
+    file: &std::path::Path,
+) -> std::collections::HashMap<String, String> {
+    let content = match std::fs::read_to_string(file) {
+        Ok(c) => c,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+    let mut result = std::collections::HashMap::new();
+    let needle = "(env \"";
+    let mut search = content.as_str();
+    while let Some(start) = search.find(needle) {
+        search = &search[start + needle.len()..];
+        if let Some(end) = search.find('"') {
+            let name = &search[..end];
+            if !name.is_empty() {
+                if let Ok(val) = std::env::var(name) {
+                    result.insert(name.to_string(), val);
+                }
+            }
+            search = &search[end + 1..];
+        }
+    }
+    result
+}
+
 fn compose_project_name(file: &std::path::Path, project_flag: Option<&str>) -> String {
     if let Some(p) = project_flag {
         return p.to_string();
