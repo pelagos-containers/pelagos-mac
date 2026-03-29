@@ -1049,8 +1049,10 @@ echo 'nameserver 8.8.4.4' >> /etc/resolv.conf
 # Container workloads write to their own overlayfs (on /dev/vda), not here.
 busybox mkdir -p /tmp /run /run/pelagos
 # pelagos looks for /run/netns/{name}; Alpine iproute2 creates /var/run/netns.
-# Symlink so both paths resolve to the same directory.
+# Mount as tmpfs so stale netns files do not survive a VM restart (issue #161).
+# Symlink /run/netns → /var/run/netns so both paths resolve to the same tmpfs.
 busybox mkdir -p /var/run/netns
+busybox mount -t tmpfs -o size=4m tmpfs /var/run/netns
 busybox ln -sf /var/run/netns /run/netns
 busybox mount -t tmpfs -o size=512m tmpfs /tmp
 

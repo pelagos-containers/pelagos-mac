@@ -1385,7 +1385,12 @@ fn main() {
                 process::exit(1);
             }
 
+            // Derive the compose project name (used for port tracking).
+            let project_name = compose_project_name(&abs_file, project.as_deref());
+
             // Register macOS-side port listeners before the stack starts.
+            // Track which ports we successfully register so we can roll back on failure.
+            let mut registered_ports: Vec<u16> = vec![];
             for spec in &cli.ports {
                 if let Some(pf) = daemon::parse_port_spec(spec) {
                     if let Err(e) = send_daemon_cmd(
@@ -1395,10 +1400,30 @@ fn main() {
                             container_port: pf.container_port,
                         },
                     ) {
+                        // Roll back any ports we already registered.
+                        for &hp in &registered_ports {
+                            let _ = send_daemon_cmd(
+                                &profile,
+                                daemon::DaemonCmd::UnregisterPort { host_port: hp },
+                            );
+                        }
                         log::error!("port registration failed: {}", e);
                         process::exit(1);
                     }
+                    registered_ports.push(pf.host_port);
                 }
+            }
+
+            // Associate registered ports with this project so they can be
+            // bulk-deregistered on exit (issue #161).
+            if !registered_ports.is_empty() {
+                let _ = send_daemon_cmd(
+                    &profile,
+                    daemon::DaemonCmd::TrackComposeProject {
+                        project: project_name.clone(),
+                        host_ports: registered_ports,
+                    },
+                );
             }
 
             let stream = connect_or_exit(&profile);
@@ -1412,6 +1437,16 @@ fn main() {
                     args: extra_args,
                 },
             );
+
+            // Deregister ports on any exit (success or failure).
+            // For `compose down` this is a no-op if `up` already cleaned up.
+            let _ = send_daemon_cmd(
+                &profile,
+                daemon::DaemonCmd::UnregisterComposePorts {
+                    project: project_name,
+                },
+            );
+
             process::exit(exit_code);
         }
 
@@ -2260,6 +2295,24 @@ fn build_command(
 }
 
 // ---------------------------------------------------------------------------
+// compose helpers
+// ---------------------------------------------------------------------------
+
+/// Derive the compose project name for port-tracking purposes.
+///
+/// Matches Docker Compose v2 convention: use the explicit `--project-name`
+/// flag if given, otherwise fall back to the parent directory name of the
+/// compose file (lower-cased).
+fn compose_project_name(file: &std::path::Path, project_flag: Option<&str>) -> String {
+    if let Some(p) = project_flag {
+        return p.to_string();
+    }
+    file.parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_else(|| "default".to_string())
+}
+
 // docker cp helpers
 // ---------------------------------------------------------------------------
 
