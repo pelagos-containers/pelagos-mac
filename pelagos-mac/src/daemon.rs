@@ -86,6 +86,11 @@ pub enum DaemonCmd {
     RegisterPort { host_port: u16, container_port: u16 },
     /// Stop listening on `host_port`.  Active connections are not affected.
     UnregisterPort { host_port: u16 },
+    /// Associate a set of host ports with a compose project name so they can
+    /// be bulk-deregistered when the project stops.
+    TrackComposeProject { project: String, host_ports: Vec<u16> },
+    /// Deregister all ports previously associated with a compose project.
+    UnregisterComposePorts { project: String },
 }
 
 /// One-line JSON response to a `DaemonCmd`.
@@ -101,12 +106,15 @@ pub enum DaemonResponse {
 struct PortState {
     /// Maps host_port → container_port for every currently active forward.
     active: HashMap<u16, u16>,
+    /// Maps compose project name → list of host ports it registered.
+    compose_projects: HashMap<String, Vec<u16>>,
 }
 
 impl PortState {
     fn new() -> Self {
         Self {
             active: HashMap::new(),
+            compose_projects: HashMap::new(),
         }
     }
 }
@@ -535,6 +543,32 @@ fn handle_daemon_cmd(
             if ps.active.remove(&host_port).is_some() {
                 dispatcher.send(DispatchCmd::Remove { host_port });
                 log::info!("[{conn_id:?}] unregistered port {}", host_port);
+            }
+            DaemonResponse::Ok
+        }
+        DaemonCmd::TrackComposeProject { project, host_ports } => {
+            let mut ps = port_state.lock().unwrap();
+            log::info!(
+                "[{conn_id:?}] tracking compose project '{}' with {} port(s)",
+                project,
+                host_ports.len()
+            );
+            ps.compose_projects.insert(project, host_ports);
+            DaemonResponse::Ok
+        }
+        DaemonCmd::UnregisterComposePorts { project } => {
+            let mut ps = port_state.lock().unwrap();
+            if let Some(ports) = ps.compose_projects.remove(&project) {
+                for host_port in ports {
+                    if ps.active.remove(&host_port).is_some() {
+                        dispatcher.send(DispatchCmd::Remove { host_port });
+                        log::info!(
+                            "[{conn_id:?}] compose '{}': unregistered port {}",
+                            project,
+                            host_port
+                        );
+                    }
+                }
             }
             DaemonResponse::Ok
         }
