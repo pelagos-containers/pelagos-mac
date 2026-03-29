@@ -308,6 +308,10 @@ pub enum GuestCommand {
         /// Extra arguments forwarded verbatim (e.g. `["--foreground"]`, `["--follow", "grafana"]`).
         #[serde(default)]
         args: Vec<String>,
+        /// Environment variables from the macOS host, forwarded so that REML `(env ...)` calls
+        /// in the compose file can resolve secrets set in the caller's shell environment.
+        #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+        env: std::collections::HashMap<String, String>,
     },
 }
 
@@ -814,6 +818,7 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 working_dir,
                 project,
                 args,
+                env,
             } => {
                 handle_compose(
                     &mut writer,
@@ -822,6 +827,7 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                     &working_dir,
                     project.as_deref(),
                     &args,
+                    &env,
                 )?;
             }
         }
@@ -856,6 +862,7 @@ fn handle_compose(
     working_dir: &str,
     project: Option<&str>,
     args: &[String],
+    env: &std::collections::HashMap<String, String>,
 ) -> std::io::Result<()> {
     let pelagos = pelagos_bin();
     let mut cmd = Command::new(&pelagos);
@@ -866,6 +873,9 @@ fn handle_compose(
     }
     for a in args {
         cmd.arg(a);
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
     }
     cmd.current_dir(working_dir);
     spawn_and_stream(writer, cmd)

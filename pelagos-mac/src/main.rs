@@ -603,6 +603,10 @@ enum GuestCommand {
         project: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         args: Vec<String>,
+        /// Host environment variables forwarded so that REML `(env ...)` calls
+        /// in the compose file resolve secrets from the caller's shell environment.
+        #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+        env: std::collections::HashMap<String, String>,
     },
 }
 
@@ -1435,6 +1439,7 @@ fn main() {
                     working_dir,
                     project,
                     args: extra_args,
+                    env: std::env::vars().collect(),
                 },
             );
 
