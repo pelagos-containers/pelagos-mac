@@ -2317,9 +2317,7 @@ fn build_command(
 /// NAME → value for every such variable that is set in the current process
 /// environment.  Only variables explicitly referenced in the file are included;
 /// the rest of the host environment is never forwarded.
-fn collect_compose_env(
-    file: &std::path::Path,
-) -> std::collections::HashMap<String, String> {
+fn collect_compose_env(file: &std::path::Path) -> std::collections::HashMap<String, String> {
     let content = match std::fs::read_to_string(file) {
         Ok(c) => c,
         Err(_) => return std::collections::HashMap::new(),

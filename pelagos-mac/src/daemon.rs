@@ -88,7 +88,10 @@ pub enum DaemonCmd {
     UnregisterPort { host_port: u16 },
     /// Associate a set of host ports with a compose project name so they can
     /// be bulk-deregistered when the project stops.
-    TrackComposeProject { project: String, host_ports: Vec<u16> },
+    TrackComposeProject {
+        project: String,
+        host_ports: Vec<u16>,
+    },
     /// Deregister all ports previously associated with a compose project.
     UnregisterComposePorts { project: String },
 }
@@ -546,7 +549,10 @@ fn handle_daemon_cmd(
             }
             DaemonResponse::Ok
         }
-        DaemonCmd::TrackComposeProject { project, host_ports } => {
+        DaemonCmd::TrackComposeProject {
+            project,
+            host_ports,
+        } => {
             let mut ps = port_state.lock().unwrap();
             log::info!(
                 "[{conn_id:?}] tracking compose project '{}' with {} port(s)",
