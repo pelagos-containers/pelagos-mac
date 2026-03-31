@@ -263,9 +263,10 @@ chroot "\$MNT" apt-get update -qq
 chroot "\$MNT" env DEBIAN_FRONTEND=noninteractive apt-get remove -y flash-kernel 2>/dev/null || true
 chroot "\$MNT" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     build-essential git curl wget ca-certificates \
-    iproute2 nftables openssh-server sudo \
+    iproute2 nftables iptables openssh-server sudo \
     systemd systemd-sysv systemd-timesyncd \
     pkg-config libssl-dev \
+    rsync file strace \
     initramfs-tools \
     linux-image-6.8.0-106-generic linux-modules-6.8.0-106-generic
 
@@ -326,6 +327,10 @@ ln -sf /dev/null "\$MNT/etc/systemd/system/systemd-resolved.service"
 # Static resolv.conf — plain file, not a symlink to the resolved stub.
 rm -f "\$MNT/etc/resolv.conf"
 printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > "\$MNT/etc/resolv.conf"
+
+# Hostname — set to the profile name so `uname -n` is meaningful.
+echo "ubuntu-build" > "\$MNT/etc/hostname"
+printf '127.0.1.1\tubuntu-build\n' >> "\$MNT/etc/hosts"
 
 # Load overlay at boot — required for pelagos container workloads.
 # The Ubuntu 6.8 HWE kernel ships overlay as a module (=m), not built-in,
