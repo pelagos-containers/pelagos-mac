@@ -133,7 +133,7 @@ for security). Homebrew can install it: `brew install socket_vmnet`.
 | Axis | Assessment |
 |---|---|
 | **Performance** | **Good.** vmnet kernel path for actual packet forwarding; minor IPC overhead for fd passing at setup time (~negligible after connect). |
-| **Reliability** | **Excellent.** Inherits vmnet's stability. No PF anchor degradation. Single daemon persists across all VM lifecycles. |
+| **Reliability** | **Poor under container workloads.** vmnet.framework maintains a fixed-size kernel NAT table. Under load — OCI image pulls (many parallel TCP streams), high container churn — the table fills and new connections are silently dropped. No error is surfaced; containers appear to hang with no diagnostic signal. This is the primary reason socket_vmnet was rejected for pelagos-mac. |
 | **Security** | Good with caveats. The helper runs as root — it is a privileged daemon on the host. Socket permissions (mode 0600, owner root) restrict who can connect. Needs careful installation to `/opt/socket_vmnet` (not `/usr/local`, which is user-writable). |
 | **Long-term viability** | **Good.** Actively maintained (Lima org, CNCF Incubating). Tracks vmnet.framework changes. Risk: if Apple restricts vmnet from root processes, this breaks; currently Apple has no such restriction. |
 | **Entitlements** | **None required on caller binary.** The helper daemon handles the privileged call. ✓ |
