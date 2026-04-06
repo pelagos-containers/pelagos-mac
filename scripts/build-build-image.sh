@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-build-image.sh — Provision a 20 GB Ubuntu 22.04 build VM image.
+# build-build-image.sh — Provision a 20 GB Ubuntu 24.04 build VM image.
 #
 # Creates out/build.img: an ext4 filesystem labeled "ubuntu-build" containing
-# a minimal Ubuntu 22.04 arm64 rootfs with Rust toolchain and pelagos build
+# a minimal Ubuntu 24.04 arm64 rootfs with Rust toolchain and pelagos build
 # dependencies.  The image boots via the same kernel/initramfs as the Alpine
 # pelagos VM; the init script pivots to Ubuntu systemd when it detects the
 # "ubuntu-build" disk label instead of "pelagos-root".
@@ -75,8 +75,8 @@ fi
 
 ALPINE_VOLUMES_DIR="$PELAGOS_BASE/volumes"
 SSH_KEY_FILE="$PELAGOS_BASE/vm_key"
-UBUNTU_BASE_URL="http://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04-base-arm64.tar.gz"
-UBUNTU_TARBALL_NAME="ubuntu-base-22.04-base-arm64.tar.gz"
+UBUNTU_BASE_URL="http://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-arm64.tar.gz"
+UBUNTU_TARBALL_NAME="ubuntu-base-24.04.4-base-arm64.tar.gz"
 
 # ---------------------------------------------------------------------------
 # Pre-flight checks
@@ -250,9 +250,9 @@ echo "nameserver 1.1.1.1" >> "\$MNT/etc/resolv.conf"
 
 # apt sources.
 cat > "\$MNT/etc/apt/sources.list" << 'SOURCES'
-deb http://ports.ubuntu.com/ubuntu-ports jammy main restricted universe multiverse
-deb http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted universe multiverse
-deb http://ports.ubuntu.com/ubuntu-ports jammy-security main restricted universe multiverse
+deb http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse
+deb http://ports.ubuntu.com/ubuntu-ports noble-updates main restricted universe multiverse
+deb http://ports.ubuntu.com/ubuntu-ports noble-security main restricted universe multiverse
 SOURCES
 
 echo "[provision] apt-get update + install"
@@ -268,15 +268,15 @@ chroot "\$MNT" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-instal
     pkg-config libssl-dev \
     rsync file strace \
     initramfs-tools \
-    linux-image-6.8.0-106-generic linux-modules-6.8.0-106-generic
+    linux-image-6.11.0-29-generic linux-modules-6.11.0-29-generic
 
 # Explicitly generate the initrd — apt's post-install hook is blocked by the
 # flash-kernel removal above, so initramfs-tools never runs automatically.
 # The bind-mounts (proc/sys/dev) are already in place, so this works cleanly.
-KVER_PKG=\$(chroot "\$MNT" dpkg-query -W -f '\${Version}\n' linux-image-6.8.0-106-generic 2>/dev/null | head -1)
-if [ -n "\$KVER_PKG" ] && [ ! -f "\$MNT/boot/initrd.img-6.8.0-106-generic" ]; then
-    echo "[provision] generating initrd for 6.8.0-106-generic"
-    chroot "\$MNT" update-initramfs -c -k 6.8.0-106-generic
+KVER_PKG=\$(chroot "\$MNT" dpkg-query -W -f '\${Version}\n' linux-image-6.11.0-29-generic 2>/dev/null | head -1)
+if [ -n "\$KVER_PKG" ] && [ ! -f "\$MNT/boot/initrd.img-6.11.0-29-generic" ]; then
+    echo "[provision] generating initrd for 6.11.0-29-generic"
+    chroot "\$MNT" update-initramfs -c -k 6.11.0-29-generic
 fi
 
 # ---- networking: systemd-networkd with static IP ----
@@ -608,7 +608,7 @@ ping_mode = ssh
 # net.ifnames=0: prevent udev from renaming eth0 → enp0sN.
 # Without this, udev brings eth0 down to rename it, dropping the IP configured
 # by the initramfs before switch_root, leaving smoltcp unable to ARP the VM.
-# cpuidle.off=1: disable cpuidle-psci deep idle states. Ubuntu 6.8 HWE uses
+# cpuidle.off=1: disable cpuidle-psci deep idle states. Ubuntu HWE kernels use
 # PSCI CPU_SUSPEND for deep idle; AVF does not reliably deliver hrtimers to
 # vCPUs parked in PSCI idle, causing rcu_preempt kthread timer stalls.
 # nohz=off alone did not help — tick delivery is fine, hrtimer delivery is not.

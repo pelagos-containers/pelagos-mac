@@ -49,14 +49,14 @@ DISK_IMG="$OUT/root.img"
 INITRAMFS_OUT="$OUT/initramfs-custom.gz"
 KERNEL_OUT="$OUT/vmlinuz"
 
-# Ubuntu 6.8 HWE kernel artifacts produced by build-build-image.sh.
+# Ubuntu 6.11 HWE kernel artifacts produced by build-build-image.sh.
 # When present, these replace the Alpine lts kernel and its modules.
 # CONFIG_KVM_GUEST=y in the Ubuntu kernel eliminates RCU stalls under AVF.
 # On first-time setup, run build-build-image.sh after this script to produce them.
 UBUNTU_VMLINUZ="$OUT/ubuntu-vmlinuz"
 UBUNTU_MODULES="$OUT/ubuntu-modules"
 
-PELAGOS_VERSION="0.59.4"
+PELAGOS_VERSION="0.60.6"
 PELAGOS_BIN="$WORK/pelagos-${PELAGOS_VERSION}-aarch64-linux"
 PELAGOS_URL="https://github.com/pelagos-containers/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-aarch64-linux"
 # If a local build exists, use it instead of downloading.
@@ -202,12 +202,12 @@ done
 echo "[3/8] Decompressing/staging kernel"
 # ---------------------------------------------------------------------------
 if [ ! -f "$KERNEL_OUT" ]; then
-    # Prefer the Ubuntu 6.8 HWE kernel (CONFIG_KVM_GUEST=y, no RCU stalls under AVF)
+    # Prefer the Ubuntu 6.11 HWE kernel (CONFIG_KVM_GUEST=y, no RCU stalls under AVF)
     # when build-build-image.sh has already produced it.  Fall back to the Alpine lts
     # kernel on first-time setup (before the Ubuntu build VM exists).
     if [ -f "$UBUNTU_VMLINUZ" ]; then
         cp "$UBUNTU_VMLINUZ" "$KERNEL_OUT"
-        echo "  kernel: using Ubuntu 6.8 HWE ($UBUNTU_VMLINUZ)"
+        echo "  kernel: using Ubuntu 6.11 HWE ($UBUNTU_VMLINUZ)"
         echo "  (CONFIG_KVM_GUEST=y — no RCU stalls under AVF)"
     else
         echo "  Ubuntu kernel not yet available — using Alpine lts (run build-build-image.sh to upgrade)"
