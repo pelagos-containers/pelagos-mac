@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-build-image.sh — Provision a 20 GB Ubuntu 22.04 build VM image.
+# build-build-image.sh — Provision a 20 GB Ubuntu 24.04 build VM image.
 #
 # Creates out/build.img: an ext4 filesystem labeled "ubuntu-build" containing
-# a minimal Ubuntu 22.04 arm64 rootfs with Rust toolchain and pelagos build
+# a minimal Ubuntu 24.04 arm64 rootfs with Rust toolchain and pelagos build
 # dependencies.  The image boots via the same kernel/initramfs as the Alpine
 # pelagos VM; the init script pivots to Ubuntu systemd when it detects the
 # "ubuntu-build" disk label instead of "pelagos-root".
@@ -75,8 +75,8 @@ fi
 
 ALPINE_VOLUMES_DIR="$PELAGOS_BASE/volumes"
 SSH_KEY_FILE="$PELAGOS_BASE/vm_key"
-UBUNTU_BASE_URL="http://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04-base-arm64.tar.gz"
-UBUNTU_TARBALL_NAME="ubuntu-base-22.04-base-arm64.tar.gz"
+UBUNTU_BASE_URL="http://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-arm64.tar.gz"
+UBUNTU_TARBALL_NAME="ubuntu-base-24.04.4-base-arm64.tar.gz"
 
 # ---------------------------------------------------------------------------
 # Pre-flight checks
@@ -250,9 +250,9 @@ echo "nameserver 1.1.1.1" >> "\$MNT/etc/resolv.conf"
 
 # apt sources.
 cat > "\$MNT/etc/apt/sources.list" << 'SOURCES'
-deb http://ports.ubuntu.com/ubuntu-ports jammy main restricted universe multiverse
-deb http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted universe multiverse
-deb http://ports.ubuntu.com/ubuntu-ports jammy-security main restricted universe multiverse
+deb http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse
+deb http://ports.ubuntu.com/ubuntu-ports noble-updates main restricted universe multiverse
+deb http://ports.ubuntu.com/ubuntu-ports noble-security main restricted universe multiverse
 SOURCES
 
 echo "[provision] apt-get update + install"
@@ -268,15 +268,15 @@ chroot "\$MNT" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-instal
     pkg-config libssl-dev \
     rsync file strace \
     initramfs-tools \
-    linux-image-6.8.0-106-generic linux-modules-6.8.0-106-generic
+    linux-image-6.11.0-29-generic linux-modules-6.11.0-29-generic
 
 # Explicitly generate the initrd — apt's post-install hook is blocked by the
 # flash-kernel removal above, so initramfs-tools never runs automatically.
 # The bind-mounts (proc/sys/dev) are already in place, so this works cleanly.
-KVER_PKG=\$(chroot "\$MNT" dpkg-query -W -f '\${Version}\n' linux-image-6.8.0-106-generic 2>/dev/null | head -1)
-if [ -n "\$KVER_PKG" ] && [ ! -f "\$MNT/boot/initrd.img-6.8.0-106-generic" ]; then
-    echo "[provision] generating initrd for 6.8.0-106-generic"
-    chroot "\$MNT" update-initramfs -c -k 6.8.0-106-generic
+KVER_PKG=\$(chroot "\$MNT" dpkg-query -W -f '\${Version}\n' linux-image-6.11.0-29-generic 2>/dev/null | head -1)
+if [ -n "\$KVER_PKG" ] && [ ! -f "\$MNT/boot/initrd.img-6.11.0-29-generic" ]; then
+    echo "[provision] generating initrd for 6.11.0-29-generic"
+    chroot "\$MNT" update-initramfs -c -k 6.11.0-29-generic
 fi
 
 # ---- networking: systemd-networkd with static IP ----
@@ -402,8 +402,8 @@ if [ -n "\$KVER" ]; then
     echo "  kernel: vmlinuz-\$KVER (\$(du -sh \$OUTDIR/ubuntu-vmlinuz | cut -f1) decompressed)"
     echo "  initrd: initrd.img-\$KVER (\$(du -sh \$OUTDIR/ubuntu-initrd.img | cut -f1))"
 
-    # Extract kernel modules that are =m in Ubuntu 6.8 HWE and are required
-    # by the container VM initramfs.  All core virtio drivers are =y (built-in).
+    # Extract kernel modules that are =m and required by the container VM initramfs.
+    # All core virtio drivers are =y (built-in) in Ubuntu HWE kernels.
     #
     # Modules extracted:
     #   vsock          — pelagos-guest ↔ host comms
@@ -411,6 +411,24 @@ if [ -n "\$KVER" ]; then
     #   virtiofs       — AVF host directory sharing (needed for vm volumes)
     #   bridge + deps  — pelagos bridge networking (NetworkMode::Bridge, -p flag)
     #   nftables       — port-forward DNAT rules (pelagos network.rs)
+    #
+    # Ubuntu 24.04 (6.11+) ships modules as .ko.zst (zstd-compressed).
+    # Earlier Ubuntu releases used plain .ko.  copy_ko() handles both: it tries
+    # .ko first, then .ko.zst (decompressing to .ko via zstd -d).  zstd is
+    # installed below for the .ko.zst case.
+    apk add -q --no-progress zstd 2>/dev/null || true
+    copy_ko() {
+        local src="\$1"   # full path including .ko extension
+        local dest_dir="\$2"
+        local name="\$(basename \$src)"
+        if [ -f "\$src" ]; then
+            cp "\$src" "\$dest_dir/\$name"
+            echo "  module: \$name"
+        elif [ -f "\${src}.zst" ]; then
+            zstd -d -q "\${src}.zst" -o "\$dest_dir/\$name"
+            echo "  module: \$name (from .ko.zst)"
+        fi
+    }
     MODDIR="\$MNT/lib/modules/\$KVER/kernel"
     mkdir -p \
         "\$OUTDIR/ubuntu-modules/net/vmw_vsock" \
@@ -426,17 +444,12 @@ if [ -n "\$KVER" ]; then
         "\$MODDIR/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko" \
         "\$MODDIR/net/vmw_vsock/vmw_vsock_virtio_transport.ko"
     do
-        [ -f "\$ko" ] && cp "\$ko" "\$OUTDIR/ubuntu-modules/net/vmw_vsock/" \
-            && echo "  module: \$(basename \$ko)"
+        copy_ko "\$ko" "\$OUTDIR/ubuntu-modules/net/vmw_vsock"
     done
     # overlayfs
-    [ -f "\$MODDIR/fs/overlayfs/overlay.ko" ] \
-        && cp "\$MODDIR/fs/overlayfs/overlay.ko" "\$OUTDIR/ubuntu-modules/fs/overlayfs/" \
-        && echo "  module: overlay.ko"
-    # virtiofs (AVF host directory sharing — fs/fuse/virtiofs.ko in Ubuntu 6.8)
-    [ -f "\$MODDIR/fs/fuse/virtiofs.ko" ] \
-        && cp "\$MODDIR/fs/fuse/virtiofs.ko" "\$OUTDIR/ubuntu-modules/fs/fuse/" \
-        && echo "  module: virtiofs.ko"
+    copy_ko "\$MODDIR/fs/overlayfs/overlay.ko" "\$OUTDIR/ubuntu-modules/fs/overlayfs"
+    # virtiofs (AVF host directory sharing)
+    copy_ko "\$MODDIR/fs/fuse/virtiofs.ko" "\$OUTDIR/ubuntu-modules/fs/fuse"
     # bridge + dependency chain (llc → stp → bridge)
     for ko in \
         "\$MODDIR/net/llc/llc.ko" \
@@ -445,7 +458,7 @@ if [ -n "\$KVER" ]; then
     do
         dir="\$OUTDIR/ubuntu-modules/\$(dirname \${ko#\$MODDIR/})"
         mkdir -p "\$dir"
-        [ -f "\$ko" ] && cp "\$ko" "\$dir/" && echo "  module: \$(basename \$ko)"
+        copy_ko "\$ko" "\$dir"
     done
     # nftables / netfilter (required for port-forward DNAT rules)
     for ko in \
@@ -459,7 +472,7 @@ if [ -n "\$KVER" ]; then
     do
         dir="\$OUTDIR/ubuntu-modules/\$(dirname \${ko#\$MODDIR/})"
         mkdir -p "\$dir"
-        [ -f "\$ko" ] && cp "\$ko" "\$dir/" && echo "  module: \$(basename \$ko)"
+        copy_ko "\$ko" "\$dir"
     done
     # veth — virtual ethernet pairs for container bridge networking
     for ko in \
@@ -467,7 +480,7 @@ if [ -n "\$KVER" ]; then
     do
         dir="\$OUTDIR/ubuntu-modules/\$(dirname \${ko#\$MODDIR/})"
         mkdir -p "\$dir"
-        [ -f "\$ko" ] && cp "\$ko" "\$dir/" && echo "  module: \$(basename \$ko)"
+        copy_ko "\$ko" "\$dir"
     done
     # libcrc32c — required by nf_conntrack (dependency for nf_nat DNAT rules)
     for ko in \
@@ -475,7 +488,7 @@ if [ -n "\$KVER" ]; then
     do
         dir="\$OUTDIR/ubuntu-modules/\$(dirname \${ko#\$MODDIR/})"
         mkdir -p "\$dir"
-        [ -f "\$ko" ] && cp "\$ko" "\$dir/" && echo "  module: \$(basename \$ko)"
+        copy_ko "\$ko" "\$dir"
     done
     # nf_defrag_ipv4/ipv6 — required by nf_conntrack (missing these causes symbol errors)
     for ko in \
@@ -484,7 +497,7 @@ if [ -n "\$KVER" ]; then
     do
         dir="\$OUTDIR/ubuntu-modules/\$(dirname \${ko#\$MODDIR/})"
         mkdir -p "\$dir"
-        [ -f "\$ko" ] && cp "\$ko" "\$dir/" && echo "  module: \$(basename \$ko)"
+        copy_ko "\$ko" "\$dir"
     done
     # modules.dep so modprobe can resolve the full dependency chain.
     cp "\$MNT/lib/modules/\$KVER/modules.dep" "\$OUTDIR/ubuntu-modules/" 2>/dev/null || true
@@ -608,7 +621,7 @@ ping_mode = ssh
 # net.ifnames=0: prevent udev from renaming eth0 → enp0sN.
 # Without this, udev brings eth0 down to rename it, dropping the IP configured
 # by the initramfs before switch_root, leaving smoltcp unable to ARP the VM.
-# cpuidle.off=1: disable cpuidle-psci deep idle states. Ubuntu 6.8 HWE uses
+# cpuidle.off=1: disable cpuidle-psci deep idle states. Ubuntu HWE kernels use
 # PSCI CPU_SUSPEND for deep idle; AVF does not reliably deliver hrtimers to
 # vCPUs parked in PSCI idle, causing rcu_preempt kthread timer stalls.
 # nohz=off alone did not help — tick delivery is fine, hrtimer delivery is not.

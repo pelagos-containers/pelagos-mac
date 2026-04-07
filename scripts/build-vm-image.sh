@@ -49,14 +49,14 @@ DISK_IMG="$OUT/root.img"
 INITRAMFS_OUT="$OUT/initramfs-custom.gz"
 KERNEL_OUT="$OUT/vmlinuz"
 
-# Ubuntu 6.8 HWE kernel artifacts produced by build-build-image.sh.
+# Ubuntu 6.11 HWE kernel artifacts produced by build-build-image.sh.
 # When present, these replace the Alpine lts kernel and its modules.
 # CONFIG_KVM_GUEST=y in the Ubuntu kernel eliminates RCU stalls under AVF.
 # On first-time setup, run build-build-image.sh after this script to produce them.
 UBUNTU_VMLINUZ="$OUT/ubuntu-vmlinuz"
 UBUNTU_MODULES="$OUT/ubuntu-modules"
 
-PELAGOS_VERSION="0.59.4"
+PELAGOS_VERSION="0.60.6"
 PELAGOS_BIN="$WORK/pelagos-${PELAGOS_VERSION}-aarch64-linux"
 PELAGOS_URL="https://github.com/pelagos-containers/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-aarch64-linux"
 # If a local build exists, use it instead of downloading.
@@ -202,12 +202,12 @@ done
 echo "[3/8] Decompressing/staging kernel"
 # ---------------------------------------------------------------------------
 if [ ! -f "$KERNEL_OUT" ]; then
-    # Prefer the Ubuntu 6.8 HWE kernel (CONFIG_KVM_GUEST=y, no RCU stalls under AVF)
+    # Prefer the Ubuntu 6.11 HWE kernel (CONFIG_KVM_GUEST=y, no RCU stalls under AVF)
     # when build-build-image.sh has already produced it.  Fall back to the Alpine lts
     # kernel on first-time setup (before the Ubuntu build VM exists).
     if [ -f "$UBUNTU_VMLINUZ" ]; then
         cp "$UBUNTU_VMLINUZ" "$KERNEL_OUT"
-        echo "  kernel: using Ubuntu 6.8 HWE ($UBUNTU_VMLINUZ)"
+        echo "  kernel: using Ubuntu 6.11 HWE ($UBUNTU_VMLINUZ)"
         echo "  (CONFIG_KVM_GUEST=y — no RCU stalls under AVF)"
     else
         echo "  Ubuntu kernel not yet available — using Alpine lts (run build-build-image.sh to upgrade)"
@@ -639,6 +639,9 @@ if [ ! -f "$INITRAMFS_OUT" ] \
         # Use the Ubuntu modules.dep so modprobe resolves all dependency chains.
         cp "$UBUNTU_MODULES/modules.dep"     "$INITRD_TMP/lib/modules/$KVER/modules.dep"     2>/dev/null || true
         cp "$UBUNTU_MODULES/modules.dep.bin" "$INITRD_TMP/lib/modules/$KVER/modules.dep.bin" 2>/dev/null || true
+        # Ubuntu 6.11+ stores modules as .ko.zst but we stage them as .ko (decompressed).
+        # Strip the .zst suffix from modules.dep so busybox modprobe resolves paths correctly.
+        sed -i '' 's/\.ko\.zst/.ko/g' "$INITRD_TMP/lib/modules/$KVER/modules.dep" 2>/dev/null || true
         echo "  updated modules.dep from Ubuntu modules"
     else
         # Alpine lts fallback: all virtio drivers are modules, so we must stage them.
@@ -882,7 +885,15 @@ if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
     modprobe virtio_pci          2>/dev/null || true
     modprobe virtio_console      2>/dev/null || true
     modprobe virtio-rng          2>/dev/null || true
-    modprobe vmw_vsock_virtio_transport 2>/dev/null || true
+    # vsock: CONFIG_VSOCK=m in Ubuntu 6.11 HWE (a module, not built-in).
+    # busybox modprobe's dependency chain fails because it tries to load vsock.ko
+    # as a dependency for vmw_vsock_virtio_transport but gets a "Unknown symbol"
+    # error (CRC mismatch from .ko.zst → .ko decompression). Use busybox insmod
+    # directly to bypass the dependency chain and load each module in order.
+    _KVER=\$(uname -r)
+    busybox insmod /lib/modules/\$_KVER/kernel/net/vmw_vsock/vsock.ko 2>/dev/console || true
+    busybox insmod /lib/modules/\$_KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko 2>/dev/console || true
+    busybox insmod /lib/modules/\$_KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko 2>/dev/console || true
     modprobe overlay             2>/dev/null || true
     modprobe virtio_net          2>/dev/null || true
     modprobe virtio_blk          2>/dev/null || true
