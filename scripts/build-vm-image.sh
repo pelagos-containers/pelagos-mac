@@ -891,35 +891,40 @@ if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
     # error (CRC mismatch from .ko.zst → .ko decompression). Use busybox insmod
     # directly to bypass the dependency chain and load each module in order.
     _KVER=\$(uname -r)
-    busybox insmod /lib/modules/\$_KVER/kernel/net/vmw_vsock/vsock.ko 2>/dev/console || true
-    busybox insmod /lib/modules/\$_KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko 2>/dev/console || true
-    busybox insmod /lib/modules/\$_KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko 2>/dev/console || true
-    modprobe overlay             2>/dev/null || true
+    # Ubuntu 6.11 HWE: busybox modprobe fails on decompressed .ko.zst modules even
+    # when deps are empty — CRC metadata mismatch.  Use busybox insmod in explicit
+    # dependency order to bypass the modprobe dependency chain entirely.
+    _KD=/lib/modules/\$_KVER/kernel
+    # vsock
+    busybox insmod \$_KD/net/vmw_vsock/vsock.ko 2>/dev/console || true
+    busybox insmod \$_KD/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko 2>/dev/console || true
+    busybox insmod \$_KD/net/vmw_vsock/vmw_vsock_virtio_transport.ko 2>/dev/console || true
+    # overlayfs — container layer stacking (no deps)
+    busybox insmod \$_KD/fs/overlayfs/overlay.ko 2>/dev/console || true
+    # virtiofs — AVF host directory sharing (no deps)
+    busybox insmod \$_KD/fs/fuse/virtiofs.ko 2>/dev/console || true
+    # veth — virtual ethernet pairs (no deps)
+    busybox insmod \$_KD/drivers/net/veth.ko 2>/dev/console || true
+    # bridge + deps: llc → stp → bridge
+    busybox insmod \$_KD/net/llc/llc.ko 2>/dev/console || true
+    busybox insmod \$_KD/net/802/stp.ko 2>/dev/console || true
+    busybox insmod \$_KD/net/bridge/bridge.ko 2>/dev/console || true
+    # nftables + netfilter: load in dependency order
+    busybox insmod \$_KD/lib/libcrc32c.ko 2>/dev/console || true
+    busybox insmod \$_KD/net/ipv4/netfilter/nf_defrag_ipv4.ko 2>/dev/console || true
+    busybox insmod \$_KD/net/ipv6/netfilter/nf_defrag_ipv6.ko 2>/dev/console || true
+    busybox insmod \$_KD/net/netfilter/nfnetlink.ko 2>/dev/console || true
+    busybox insmod \$_KD/net/netfilter/nf_conntrack.ko 2>/dev/console || true
+    busybox insmod \$_KD/net/netfilter/nf_nat.ko 2>/dev/console || true
+    busybox insmod \$_KD/net/netfilter/nf_tables.ko 2>/dev/console || true
+    busybox insmod \$_KD/net/netfilter/nft_nat.ko 2>/dev/console || true
+    busybox insmod \$_KD/net/netfilter/nft_chain_nat.ko 2>/dev/console || true
+    busybox insmod \$_KD/net/netfilter/nft_masq.ko 2>/dev/console || true
     modprobe virtio_net          2>/dev/null || true
     modprobe virtio_blk          2>/dev/null || true
     modprobe tun                 2>/dev/null || true
     modprobe jbd2                2>/dev/null || true
     modprobe ext4                2>/dev/null || true
-    # virtiofs for AVF host directory sharing (pelagos volumes, $HOME bind-mounts).
-    # =m in Ubuntu 6.8 HWE; absent on old images, silently skipped in that case.
-    modprobe virtiofs            2>/dev/null || true
-    # Bridge networking + nftables for pelagos container networking (-p / bridge mode).
-    # These are =m in Ubuntu 6.8 HWE; loaded here so pelagos run works immediately
-    # after boot.  Silently skipped on old images that predate #172.
-    modprobe llc                 2>/dev/null || true
-    modprobe stp                 2>/dev/null || true
-    modprobe bridge              2>/dev/null || true
-    modprobe libcrc32c           2>/dev/null || true
-    modprobe nf_defrag_ipv4      2>/dev/null || true
-    modprobe nf_defrag_ipv6      2>/dev/null || true
-    modprobe nfnetlink           2>/dev/null || true
-    modprobe nf_conntrack        2>/dev/null || true
-    modprobe nf_nat              2>/dev/null || true
-    modprobe nft_nat             2>/dev/null || true
-    modprobe nft_chain_nat       2>/dev/null || true
-    modprobe nft_masq            2>/dev/null || true
-    modprobe nf_tables           2>/dev/null || true
-    modprobe veth                2>/dev/null || true
     # Create /dev/net/tun device node.  The tun kernel module registers
     # the device (char major 10, minor 200) but does not create the node
     # automatically without udevd/mdev.  pasta requires /dev/net/tun to
