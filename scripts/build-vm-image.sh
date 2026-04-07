@@ -885,6 +885,11 @@ if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
     modprobe virtio_pci          2>/dev/null || true
     modprobe virtio_console      2>/dev/null || true
     modprobe virtio-rng          2>/dev/null || true
+    # Seed the kernel entropy pool from the virtio-rng device immediately after
+    # loading the module.  Without this explicit seed step, musl's getrandom()
+    # blocks (printing a warning) until the kernel accumulates enough entropy on
+    # its own, which delays the first container or image command noticeably.
+    busybox dd if=/dev/hwrng of=/dev/urandom bs=512 count=1 2>/dev/null || true
     # vsock: CONFIG_VSOCK=m in Ubuntu 6.11 HWE (a module, not built-in).
     # busybox modprobe's dependency chain fails because it tries to load vsock.ko
     # as a dependency for vmw_vsock_virtio_transport but gets a "Unknown symbol"
