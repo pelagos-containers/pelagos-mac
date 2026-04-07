@@ -390,6 +390,22 @@ enum ImageCmd {
         /// Image reference
         reference: String,
     },
+    /// Authenticate with a registry and store credentials in the VM
+    Login {
+        /// Registry hostname (e.g. public.ecr.aws, ghcr.io)
+        registry: String,
+        /// Registry username
+        #[arg(long, short = 'u')]
+        username: Option<String>,
+        /// Read password from stdin (recommended; avoids shell history)
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Remove stored credentials for a registry
+    Logout {
+        /// Registry hostname
+        registry: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -593,6 +609,16 @@ enum GuestCommand {
     /// Inspect a local OCI image; maps to `pelagos image ls --format json` filtered by reference.
     ImageInspect {
         reference: String,
+    },
+    /// Authenticate with a registry; maps to `pelagos image login`.
+    ImageLogin {
+        registry: String,
+        username: String,
+        password: String,
+    },
+    /// Remove stored credentials for a registry; maps to `pelagos image logout`.
+    ImageLogout {
+        registry: String,
     },
     /// Proxy a `pelagos compose` subcommand to the VM guest.
     Compose {
@@ -1227,6 +1253,26 @@ fn main() {
                 },
                 ImageCmd::Inspect { reference } => {
                     process::exit(inspect_image_command(stream, reference));
+                }
+                ImageCmd::Login {
+                    registry,
+                    username,
+                    password_stdin,
+                } => {
+                    process::exit(image_login_command(
+                        stream,
+                        registry,
+                        username.as_deref(),
+                        *password_stdin,
+                    ));
+                }
+                ImageCmd::Logout { registry } => {
+                    process::exit(passthrough_command(
+                        stream,
+                        GuestCommand::ImageLogout {
+                            registry: registry.clone(),
+                        },
+                    ));
                 }
             };
             process::exit(passthrough_command(stream, guest_cmd));
@@ -2129,6 +2175,59 @@ fn inspect_image_command(stream: UnixStream, reference: &str) -> i32 {
             1
         }
     }
+}
+
+/// Collect registry credentials on the host and forward as `ImageLogin` over vsock.
+///
+/// Reads the password from stdin when `--password-stdin` is set, prompts
+/// interactively otherwise.  The username is also prompted when not supplied
+/// via `--username`.  Credentials are forwarded to the guest as plain text
+/// inside the already-encrypted vsock channel; the guest never exposes them in
+/// a process argument list (it uses `--password-stdin` on its own pelagos call).
+fn image_login_command(
+    stream: UnixStream,
+    registry: &str,
+    username: Option<&str>,
+    password_stdin: bool,
+) -> i32 {
+    let username = match username {
+        Some(u) => u.to_string(),
+        None => {
+            eprint!("Username: ");
+            let mut u = String::new();
+            if io::stdin().read_line(&mut u).is_err() || u.trim().is_empty() {
+                eprintln!("error: username is required");
+                return 1;
+            }
+            u.trim().to_string()
+        }
+    };
+
+    let password = if password_stdin {
+        let mut p = String::new();
+        if io::stdin().read_line(&mut p).is_err() {
+            eprintln!("error: failed to read password from stdin");
+            return 1;
+        }
+        p.trim_end_matches('\n').trim_end_matches('\r').to_string()
+    } else {
+        match rpassword::prompt_password("Password: ") {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: failed to read password: {}", e);
+                return 1;
+            }
+        }
+    };
+
+    passthrough_command(
+        stream,
+        GuestCommand::ImageLogin {
+            registry: registry.to_string(),
+            username,
+            password,
+        },
+    )
 }
 
 /// Tar up the build context, send it to the guest, and relay build output.
@@ -3737,6 +3836,68 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["cmd"], "image_inspect");
         assert_eq!(v["reference"], "alpine:latest");
+    }
+
+    #[test]
+    fn image_login_serializes() {
+        let cmd = GuestCommand::ImageLogin {
+            registry: "public.ecr.aws".into(),
+            username: "AWS".into(),
+            password: "s3cr3t".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "image_login");
+        assert_eq!(v["registry"], "public.ecr.aws");
+        assert_eq!(v["username"], "AWS");
+        assert_eq!(v["password"], "s3cr3t");
+    }
+
+    #[test]
+    fn image_logout_serializes() {
+        let cmd = GuestCommand::ImageLogout {
+            registry: "public.ecr.aws".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "image_logout");
+        assert_eq!(v["registry"], "public.ecr.aws");
+    }
+
+    #[test]
+    fn image_login_wire_format() {
+        // Verify the JSON wire format matches what the guest expects to parse.
+        // The guest's GuestCommand uses serde tag="cmd", rename_all="snake_case",
+        // so the discriminant must be "image_login" and all fields present.
+        let cmd = GuestCommand::ImageLogin {
+            registry: "ghcr.io".into(),
+            username: "octocat".into(),
+            password: "ghp_token".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        // Round-trip through Value to check field names without importing guest crate.
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "image_login", "discriminant must be image_login");
+        assert_eq!(v["registry"], "ghcr.io");
+        assert_eq!(v["username"], "octocat");
+        assert_eq!(v["password"], "ghp_token");
+    }
+
+    #[test]
+    fn image_logout_wire_format() {
+        let cmd = GuestCommand::ImageLogout {
+            registry: "ghcr.io".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            v["cmd"], "image_logout",
+            "discriminant must be image_logout"
+        );
+        assert_eq!(v["registry"], "ghcr.io");
+        // No extra fields.
+        assert!(v.get("username").is_none());
+        assert!(v.get("password").is_none());
     }
 
     #[test]

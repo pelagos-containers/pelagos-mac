@@ -288,6 +288,18 @@ pub enum GuestCommand {
         #[serde(default)]
         reference: String,
     },
+    /// Authenticate with a registry; maps to `pelagos image login`.
+    /// The password is collected on the host and forwarded so the guest never
+    /// needs to prompt interactively over vsock.
+    ImageLogin {
+        registry: String,
+        username: String,
+        password: String,
+    },
+    /// Remove stored credentials for a registry; maps to `pelagos image logout`.
+    ImageLogout {
+        registry: String,
+    },
     /// Proxy a `pelagos compose` subcommand.
     ///
     /// The compose file and all bind-mount paths must be accessible inside the
@@ -812,6 +824,16 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
             GuestCommand::ImageInspect { reference } => {
                 handle_image_inspect(&mut writer, &reference)?;
             }
+            GuestCommand::ImageLogin {
+                registry,
+                username,
+                password,
+            } => {
+                handle_image_login(&mut writer, &registry, &username, &password)?;
+            }
+            GuestCommand::ImageLogout { registry } => {
+                handle_image_logout(&mut writer, &registry)?;
+            }
             GuestCommand::Compose {
                 subcommand,
                 file,
@@ -1203,6 +1225,114 @@ fn spawn_and_stream(writer: &mut impl Write, mut cmd: Command) -> std::io::Resul
 }
 
 // ---------------------------------------------------------------------------
+// spawn_and_stream_with_stdin — like spawn_and_stream but writes bytes to stdin
+// ---------------------------------------------------------------------------
+
+/// Like `spawn_and_stream` but writes `stdin_data` to the child's stdin before
+/// streaming its output.  Used by `handle_image_login` so the password never
+/// appears in the process argument list.
+fn spawn_and_stream_with_stdin(
+    writer: &mut impl Write,
+    mut cmd: Command,
+    stdin_data: &[u8],
+) -> std::io::Result<()> {
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            send_response(
+                writer,
+                &GuestResponse::Error {
+                    error: e.to_string(),
+                },
+            )?;
+            return Ok(());
+        }
+    };
+
+    // Write the password to stdin then close it so the child doesn't block
+    // waiting for more input.
+    if let Some(mut stdin_pipe) = child.stdin.take() {
+        stdin_pipe.write_all(stdin_data)?;
+        // Dropping closes the pipe.
+    }
+
+    let stdout_pipe = child.stdout.take().unwrap();
+    let stderr_pipe = child.stderr.take().unwrap();
+
+    use std::sync::mpsc;
+    #[derive(Debug)]
+    enum Chunk {
+        Out(String),
+        Err(String),
+        Done,
+    }
+    let (tx, rx) = mpsc::channel::<Chunk>();
+
+    let tx_out = tx.clone();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout_pipe);
+        for line in reader.lines() {
+            match line {
+                Ok(l) => {
+                    let _ = tx_out.send(Chunk::Out(l + "\n"));
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = tx_out.send(Chunk::Done);
+    });
+
+    let tx_err = tx.clone();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr_pipe);
+        for line in reader.lines() {
+            match line {
+                Ok(l) => {
+                    let _ = tx_err.send(Chunk::Err(l + "\n"));
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = tx_err.send(Chunk::Done);
+    });
+
+    let mut done_count = 0;
+    while done_count < 2 {
+        match rx.recv() {
+            Ok(Chunk::Out(data)) => {
+                send_response(
+                    writer,
+                    &GuestResponse::Stream {
+                        stream: StreamKind::Stdout,
+                        data,
+                    },
+                )?;
+            }
+            Ok(Chunk::Err(data)) => {
+                send_response(
+                    writer,
+                    &GuestResponse::Stream {
+                        stream: StreamKind::Stderr,
+                        data,
+                    },
+                )?;
+            }
+            Ok(Chunk::Done) => done_count += 1,
+            Err(_) => break,
+        }
+    }
+
+    let status = child.wait()?;
+    let code = status.code().unwrap_or(-1);
+    send_response(writer, &GuestResponse::Exit { exit: code })?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // run_detached — reads container name then drops stdout pipe immediately
 // ---------------------------------------------------------------------------
 
@@ -1501,6 +1631,32 @@ fn handle_image_inspect(writer: &mut impl Write, reference: &str) -> std::io::Re
     let _ = reference;
     let mut cmd = Command::new(pelagos_bin());
     cmd.arg("image").arg("ls").arg("--format").arg("json");
+    spawn_and_stream(writer, cmd)
+}
+
+fn handle_image_login(
+    writer: &mut impl Write,
+    registry: &str,
+    username: &str,
+    password: &str,
+) -> std::io::Result<()> {
+    // Pass the password via stdin so it never appears in the process argument
+    // list (visible in `ps`).  The host collected it securely and forwarded it
+    // over the vsock connection.
+    let mut cmd = Command::new(pelagos_bin());
+    cmd.arg("image")
+        .arg("login")
+        .arg("--username")
+        .arg(username)
+        .arg("--password-stdin")
+        .arg(registry)
+        .stdin(std::process::Stdio::piped());
+    spawn_and_stream_with_stdin(writer, cmd, password.as_bytes())
+}
+
+fn handle_image_logout(writer: &mut impl Write, registry: &str) -> std::io::Result<()> {
+    let mut cmd = Command::new(pelagos_bin());
+    cmd.arg("image").arg("logout").arg(registry);
     spawn_and_stream(writer, cmd)
 }
 
@@ -3039,6 +3195,37 @@ mod tests {
         match cmd {
             GuestCommand::ImageInspect { reference } => {
                 assert_eq!(reference, "alpine:latest");
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn image_login_deserializes() {
+        // Must parse the exact JSON the host serializes (cmd=image_login).
+        let json = r#"{"cmd":"image_login","registry":"public.ecr.aws","username":"AWS","password":"tok3n"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        match cmd {
+            GuestCommand::ImageLogin {
+                registry,
+                username,
+                password,
+            } => {
+                assert_eq!(registry, "public.ecr.aws");
+                assert_eq!(username, "AWS");
+                assert_eq!(password, "tok3n");
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn image_logout_deserializes() {
+        let json = r#"{"cmd":"image_logout","registry":"public.ecr.aws"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        match cmd {
+            GuestCommand::ImageLogout { registry } => {
+                assert_eq!(registry, "public.ecr.aws");
             }
             other => panic!("unexpected: {:?}", other),
         }
