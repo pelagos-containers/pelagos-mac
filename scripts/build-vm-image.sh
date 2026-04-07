@@ -639,6 +639,9 @@ if [ ! -f "$INITRAMFS_OUT" ] \
         # Use the Ubuntu modules.dep so modprobe resolves all dependency chains.
         cp "$UBUNTU_MODULES/modules.dep"     "$INITRD_TMP/lib/modules/$KVER/modules.dep"     2>/dev/null || true
         cp "$UBUNTU_MODULES/modules.dep.bin" "$INITRD_TMP/lib/modules/$KVER/modules.dep.bin" 2>/dev/null || true
+        # Ubuntu 6.11+ stores modules as .ko.zst but we stage them as .ko (decompressed).
+        # Strip the .zst suffix from modules.dep so busybox modprobe resolves paths correctly.
+        sed -i '' 's/\.ko\.zst/.ko/g' "$INITRD_TMP/lib/modules/$KVER/modules.dep" 2>/dev/null || true
         echo "  updated modules.dep from Ubuntu modules"
     else
         # Alpine lts fallback: all virtio drivers are modules, so we must stage them.
@@ -882,7 +885,15 @@ if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
     modprobe virtio_pci          2>/dev/null || true
     modprobe virtio_console      2>/dev/null || true
     modprobe virtio-rng          2>/dev/null || true
-    modprobe vmw_vsock_virtio_transport 2>/dev/null || true
+    # vsock: CONFIG_VSOCK=m in Ubuntu 6.11 HWE (a module, not built-in).
+    # busybox modprobe's dependency chain fails because it tries to load vsock.ko
+    # as a dependency for vmw_vsock_virtio_transport but gets a "Unknown symbol"
+    # error (CRC mismatch from .ko.zst → .ko decompression). Use busybox insmod
+    # directly to bypass the dependency chain and load each module in order.
+    _KVER=\$(uname -r)
+    busybox insmod /lib/modules/\$_KVER/kernel/net/vmw_vsock/vsock.ko 2>/dev/console || true
+    busybox insmod /lib/modules/\$_KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko 2>/dev/console || true
+    busybox insmod /lib/modules/\$_KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko 2>/dev/console || true
     modprobe overlay             2>/dev/null || true
     modprobe virtio_net          2>/dev/null || true
     modprobe virtio_blk          2>/dev/null || true
