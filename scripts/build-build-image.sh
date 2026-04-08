@@ -474,6 +474,16 @@ if [ -n "\$KVER" ]; then
         mkdir -p "\$dir"
         copy_ko "\$ko" "\$dir"
     done
+    # hw_random / virtio-rng — seeds the kernel entropy pool from the AVF
+    # virtio entropy device so that getrandom() does not block at first call.
+    for ko in \
+        "\$MODDIR/drivers/char/hw_random/rng-core.ko" \
+        "\$MODDIR/drivers/char/hw_random/virtio-rng.ko"
+    do
+        dir="\$OUTDIR/ubuntu-modules/\$(dirname \${ko#\$MODDIR/})"
+        mkdir -p "\$dir"
+        copy_ko "\$ko" "\$dir"
+    done
     # veth — virtual ethernet pairs for container bridge networking
     for ko in \
         "\$MODDIR/drivers/net/veth.ko"
