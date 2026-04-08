@@ -78,8 +78,10 @@ picks it up without any manual copy. The `brew uninstall` is required when the
 version number has not changed — Homebrew skips reinstall otherwise.
 
 **Do not** use `brew reinstall pelagos-mac` or `brew install` against the remote
-`pelagos-containers/tap` formula — its checksums are pinned to GitHub release
-assets and will never match a local build.
+`pelagos-containers/tap` formula. Its checksums are pinned to GitHub release
+assets and will never match a local build. `brew reinstall` uninstalls first,
+then installs — if the install fails (checksum mismatch is guaranteed for local
+builds), the binary is gone with no easy recovery.
 
 ### Cross-compiling the guest
 
