@@ -58,6 +58,29 @@ linker-signed copy that lacks `com.apple.security.virtualization`. Without it,
 macOS silently kills the VM daemon the moment it calls into Virtualization.framework.
 The log shows nothing; `vm status` says "stopped". Always re-sign after every build.
 
+### Installing locally for testing
+
+`cargo build` + `sign.sh` produces a working binary at
+`target/aarch64-apple-darwin/release/pelagos`, but to install it as the
+system `pelagos` (replacing the Homebrew-managed binary) use `build-release.sh`:
+
+```bash
+bash scripts/build-release.sh   # build, sign, pack tarballs, update local tap formula
+
+brew uninstall pelagos-mac 2>/dev/null || true
+HOMEBREW_DEVELOPER=1 HOMEBREW_NO_INSTALL_FROM_API=1 brew install skeptomai/tap/pelagos-mac
+```
+
+`build-release.sh` writes the formula to `dist/tap/Formula/pelagos-mac.rb` and
+auto-syncs it to the brew tap at
+`/opt/homebrew/Library/Taps/skeptomai/homebrew-tap/`. The install step then
+picks it up without any manual copy. The `brew uninstall` is required when the
+version number has not changed — Homebrew skips reinstall otherwise.
+
+**Do not** use `brew reinstall pelagos-mac` or `brew install` against the remote
+`pelagos-containers/tap` formula — its checksums are pinned to GitHub release
+assets and will never match a local build.
+
 ### Cross-compiling the guest
 
 ```bash
