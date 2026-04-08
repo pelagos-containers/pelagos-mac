@@ -607,9 +607,10 @@ if [ ! -f "$INITRAMFS_OUT" ] \
         else
             echo "  WARNING: overlay.ko not found in $UBUNTU_MODULES" >&2
         fi
-        # virtiofs, bridge, nftables modules (optional — warn but don't abort if missing,
-        # since they are absent on old ubuntu-modules trees built before this fix)
+        # virtiofs, bridge, nftables, hw_random modules (optional — warn but don't abort if
+        # missing, since they are absent on old ubuntu-modules trees built before this fix)
         for rel_ko in \
+            drivers/char/hw_random/virtio-rng.ko \
             fs/fuse/virtiofs.ko \
             net/llc/llc.ko \
             net/802/stp.ko \
@@ -884,7 +885,47 @@ if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
     # probed before any device driver (console, net, vsock) can attach.
     modprobe virtio_pci          2>/dev/null || true
     modprobe virtio_console      2>/dev/null || true
-    modprobe virtio-rng          2>/dev/null || true
+    # Load virtio-rng and seed the kernel entropy pool.
+    #
+    # Why this is complex:
+    #   - modprobe fails when rng-core is built into the kernel (=y) rather than
+    #     a module (=m), because modules.dep lists it as a dependency that can't
+    #     be resolved as a .ko file.  This varies between kernel configs.
+    #   - busybox insmod with an explicit path bypasses the dependency chain and
+    #     works regardless of what is built-in.
+    #   - After loading, we must wait for the hwrng device to register before
+    #     reading from it; the registration is asynchronous.
+    #   - Writing to /dev/urandom credits entropy to the kernel CRNG, eliminating
+    #     the 20-30 second delay before musl's getrandom() unblocks.
+    #
+    # Strategy: try modprobe first (handles future kernels where rng-core is a
+    # module), fall back to insmod with explicit path.
+    _KVER=\$(uname -r)
+    _VIRTIO_RNG_KO="/lib/modules/\$_KVER/kernel/drivers/char/hw_random/virtio-rng.ko"
+    if modprobe virtio-rng 2>/dev/null; then
+        echo "[pelagos-init] virtio-rng loaded via modprobe"
+    elif [ -f "\$_VIRTIO_RNG_KO" ]; then
+        busybox insmod "\$_VIRTIO_RNG_KO" 2>/dev/console && \
+            echo "[pelagos-init] virtio-rng loaded via insmod"
+    else
+        echo "[pelagos-init] WARNING: virtio-rng.ko not found at \$_VIRTIO_RNG_KO — entropy pool will not be pre-seeded (getrandom may block)" >/dev/console
+    fi
+    # Wait up to 2 seconds for the hwrng device to register after module load,
+    # then seed /dev/urandom.  A missing /dev/hwrng after the wait means the
+    # virtio entropy device is not available; log it and continue.
+    _RNG_SEEDED=0
+    for _i in 1 2 3 4; do
+        if [ -c /dev/hwrng ]; then
+            busybox dd if=/dev/hwrng of=/dev/urandom bs=512 count=1 2>/dev/null && _RNG_SEEDED=1
+            break
+        fi
+        busybox sleep 0.5 2>/dev/null || true
+    done
+    if [ "\$_RNG_SEEDED" = "1" ]; then
+        echo "[pelagos-init] entropy pool seeded from /dev/hwrng"
+    else
+        echo "[pelagos-init] WARNING: /dev/hwrng not available after virtio-rng load — entropy pool unseeded, getrandom() may block on first use" >/dev/console
+    fi
     # vsock: CONFIG_VSOCK=m in Ubuntu 6.11 HWE (a module, not built-in).
     # busybox modprobe's dependency chain fails because it tries to load vsock.ko
     # as a dependency for vmw_vsock_virtio_transport but gets a "Unknown symbol"

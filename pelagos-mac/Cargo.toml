@@ -17,3 +17,4 @@ env_logger.workspace = true
 thiserror.workspace = true
 libc.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
+rpassword = "7.4.0"
