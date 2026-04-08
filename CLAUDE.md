@@ -200,7 +200,9 @@ For every task, fix, or meaningful change:
    fully resolved by this PR**. For partial work use `Related to #N` or
    `Part of #N`. GitHub auto-closes on `Closes`/`Fixes`/`Resolves` at merge —
    using these for partially-addressed issues permanently loses the issue.
-5. Merge via the PR (squash or merge commit — either is fine).
+5. Merge via the PR using a **merge commit** (`gh pr merge --merge`). Never squash.
+   Squashing destroys the per-commit history on main, making `git bisect` and blame
+   harder. Preserve every commit.
 
 Branch naming: `feat/`, `fix/`, `chore/`, `docs/` prefixes.
 
