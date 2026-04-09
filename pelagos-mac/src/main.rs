@@ -2196,6 +2196,27 @@ fn vm_init(profile: &str, vm_data: Option<&std::path::Path>, force: bool) -> std
         ));
     }
 
+    // ── 3b. stop any running VM so the new initramfs takes effect ─────────
+    if force {
+        if let Ok(state) = state::StateDir::open_profile(profile) {
+            if let Some(pid) = state.running_pid() {
+                println!("Stopping running VM (pid {}) …", pid);
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(15);
+                while std::time::Instant::now() < deadline {
+                    if state.running_pid().is_none() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                if state.running_pid().is_some() {
+                    log::warn!("VM daemon (pid {}) did not exit within 15 s", pid);
+                }
+            }
+        }
+    }
+
     // Copy root.img only if the destination doesn't already exist or --force.
     // The image is a fresh sparse placeholder (~0 bytes on-disk); use cp to
     // preserve sparseness rather than reading/writing every zero byte.
@@ -2239,7 +2260,7 @@ fn vm_init(profile: &str, vm_data: Option<&std::path::Path>, force: bool) -> std
     };
     println!();
     println!("VM initialised. To verify:");
-    println!("  {}   # should print 'pong'", ping_cmd);
+    println!("  {}   # cold-boots the VM with the new image, should print 'pong'", ping_cmd);
     println!("  {}  # should print 'hello'", run_cmd);
 
     Ok(())
