@@ -36,7 +36,7 @@ jobs:
         run: bash scripts/build-vm-image.sh
 
       # build-release.sh checks for out/ubuntu-vmlinuz specifically.
-      # In CI we only have out/vmlinuz (Alpine LTS kernel); symlink it.
+      # In CI we only have out/vmlinuz (Alpine LTS kernel); alias it.
       - name: Alias kernel artifact for build-release.sh
         run: cp out/vmlinuz out/ubuntu-vmlinuz
 
@@ -59,3 +59,106 @@ jobs:
             --generate-notes \
             "dist/pelagos-mac-${VERSION}-aarch64-apple-darwin.tar.gz" \
             "dist/pelagos-mac-vm-${VERSION}.tar.gz"
+
+  update-tap:
+    name: Update Homebrew tap formula
+    needs: [release]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch release asset sha256s
+        id: sha
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          BASE="https://github.com/pelagos-containers/pelagos-mac/releases/download/v${VERSION}"
+          BIN_URL="${BASE}/pelagos-mac-${VERSION}-aarch64-apple-darwin.tar.gz"
+          VM_URL="${BASE}/pelagos-mac-vm-${VERSION}.tar.gz"
+          BIN_SHA=$(curl -fsSL "$BIN_URL" | sha256sum | awk '{print $1}')
+          VM_SHA=$(curl -fsSL  "$VM_URL"  | sha256sum | awk '{print $1}')
+          echo "bin_sha=${BIN_SHA}" >> "$GITHUB_OUTPUT"
+          echo "vm_sha=${VM_SHA}"   >> "$GITHUB_OUTPUT"
+
+      - name: Render updated formula
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          BIN_SHA="${{ steps.sha.outputs.bin_sha }}"
+          VM_SHA="${{ steps.sha.outputs.vm_sha }}"
+          cat > pelagos-mac.rb << 'FORMULA_EOF'
+          # pelagos-mac Homebrew formula
+          #
+          # Installs:
+          #   pelagos         — macOS CLI (boots VM, proxies commands over vsock)
+          #   pelagos-docker  — Docker CLI compatibility shim
+          #   pelagos-tui     — Terminal UI for container management
+          #
+          # VM image artifacts (kernel + initramfs + disk placeholder) are installed
+          # to #{share}/pelagos-mac.  Run `pelagos vm init` once after install to
+          # write ~/.local/share/pelagos/vm.conf pointing at those artifacts.
+          #
+          # Usage:
+          #   brew tap pelagos-containers/tap
+          #   brew install pelagos-containers/tap/pelagos-mac
+          #   pelagos vm init
+          FORMULA_EOF
+
+          # Render the class body with shell variable interpolation
+          cat >> pelagos-mac.rb << FORMULA_EOF
+
+          class PelagosMac < Formula
+            desc "Linux container runtime for Apple Silicon via Virtualization.framework"
+            homepage "https://github.com/pelagos-containers/pelagos-mac"
+            version "${VERSION}"
+
+            url "https://github.com/pelagos-containers/pelagos-mac/releases/download/v\#{version}/pelagos-mac-\#{version}-aarch64-apple-darwin.tar.gz"
+            sha256 "${BIN_SHA}"
+
+            resource "vm" do
+              url "https://github.com/pelagos-containers/pelagos-mac/releases/download/v${VERSION}/pelagos-mac-vm-${VERSION}.tar.gz"
+              sha256 "${VM_SHA}"
+            end
+
+            def install
+              bin.install "pelagos"
+              bin.install "pelagos-docker"
+              bin.install "pelagos-tui"
+              resource("vm").stage { (share/"pelagos-mac").install Dir["*"] }
+            end
+
+            def caveats
+              <<~EOS
+                Run once to initialise the VM configuration:
+                  pelagos vm init
+
+                This writes ~/.local/share/pelagos/vm.conf pointing at the VM
+                artifacts installed to \#{share}/pelagos-mac.
+
+                Then verify and run a container:
+                  pelagos ping
+                  pelagos run alpine echo hello
+              EOS
+            end
+
+            test do
+              assert_match "pelagos", shell_output("\#{bin}/pelagos --help 2>&1")
+            end
+          end
+          FORMULA_EOF
+
+      - name: Push updated formula to homebrew-tap
+        env:
+          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          FILE_SHA=$(gh api repos/pelagos-containers/homebrew-tap/contents/Formula/pelagos-mac.rb \
+            --jq '.sha')
+          gh api --method PUT \
+            "repos/pelagos-containers/homebrew-tap/contents/Formula/pelagos-mac.rb" \
+            --field message="chore: update pelagos-mac formula to v${VERSION}" \
+            --field content="$(base64 -w0 pelagos-mac.rb)" \
+            --field sha="${FILE_SHA}"

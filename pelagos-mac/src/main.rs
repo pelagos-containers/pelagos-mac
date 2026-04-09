@@ -428,6 +428,17 @@ enum VmCommands {
     },
     /// List all configured VM profiles and their running state
     Ls,
+    /// Initialise the VM configuration from installed artifacts (run once after install)
+    Init {
+        /// Directory containing vmlinuz, initramfs.gz, and root.img.
+        /// Defaults to the Homebrew share dir ($(brew --prefix)/share/pelagos-mac)
+        /// then ~/.local/share/pelagos/.
+        #[arg(long)]
+        vm_data: Option<PathBuf>,
+        /// Overwrite an existing vm.conf without prompting
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -743,6 +754,14 @@ fn main() {
         Commands::Vm {
             sub: VmCommands::Ls,
         } => vm_ls(),
+        Commands::Vm {
+            sub: VmCommands::Init { vm_data, force },
+        } => {
+            if let Err(e) = vm_init(&profile, vm_data.as_deref(), force) {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
+        }
         Commands::Vm {
             sub: VmCommands::Shell,
         } => {
@@ -2026,7 +2045,11 @@ fn vm_ls() {
 
     println!(
         "{:<col_profile$}  {:<col_access$}  {:>col_mem$}  {:>col_cpu$}  {:<col_status$}",
-        "PROFILE", "ACCESS", "MEMORY", "CPUS", "STATUS",
+        "PROFILE",
+        "ACCESS",
+        "MEMORY",
+        "CPUS",
+        "STATUS",
         col_profile = col_profile,
         col_access = col_access,
         col_mem = col_mem,
@@ -2035,7 +2058,11 @@ fn vm_ls() {
     );
     println!(
         "{:-<col_profile$}  {:-<col_access$}  {:->col_mem$}  {:->col_cpu$}  {:-<col_status$}",
-        "", "", "", "", "",
+        "",
+        "",
+        "",
+        "",
+        "",
         col_profile = col_profile,
         col_access = col_access,
         col_mem = col_mem,
@@ -2062,7 +2089,11 @@ fn vm_ls() {
         };
         println!(
             "{:<col_profile$}  {:<col_access$}  {:>col_mem$}  {:>col_cpu$}  {:<col_status$}",
-            name, access, mem, cpus, status,
+            name,
+            access,
+            mem,
+            cpus,
+            status,
             col_profile = col_profile,
             col_access = col_access,
             col_mem = col_mem,
@@ -2070,6 +2101,148 @@ fn vm_ls() {
             col_status = col_status,
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// vm init
+// ---------------------------------------------------------------------------
+
+/// Initialise the VM configuration for the given profile.
+///
+/// Searches for VM artifacts in:
+///   1. `vm_data` if provided
+///   2. `$(binary)/../share/pelagos-mac/`  — Homebrew pkgshare
+///   3. `$(binary)/../../../out/`            — dev build tree
+///
+/// The kernel and initrd can stay in the (possibly read-only) source directory.
+/// `root.img` is copied to the profile state dir so it is always writable.
+/// A `vm.conf` is written to the profile state dir pointing at these paths.
+fn vm_init(profile: &str, vm_data: Option<&std::path::Path>, force: bool) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+
+    // ── 1. locate source directory ────────────────────────────────────────
+    let src_dir: PathBuf = if let Some(p) = vm_data {
+        p.to_path_buf()
+    } else {
+        let binary = std::env::current_exe()
+            .map_err(|e| Error::new(ErrorKind::NotFound, format!("cannot locate binary: {}", e)))?;
+        let bin_dir = binary
+            .parent()
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "binary has no parent directory"))?;
+
+        // Check Homebrew pkgshare first, then dev out/.
+        let candidates = [
+            bin_dir.join("../share/pelagos-mac"),
+            bin_dir.join("../../../out"),
+        ];
+        candidates
+            .into_iter()
+            .find(|d| d.join("vmlinuz").exists() || d.join("ubuntu-vmlinuz").exists())
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::NotFound,
+                    "VM artifacts not found. Specify --vm-data <dir> or run \
+                     'brew install pelagos-containers/tap/pelagos-mac' first.",
+                )
+            })?
+    };
+
+    let src_dir = src_dir.canonicalize().map_err(|e| {
+        Error::new(
+            ErrorKind::NotFound,
+            format!("vm-data directory {}: {}", src_dir.display(), e),
+        )
+    })?;
+
+    // ── 2. resolve artifact paths in source dir ───────────────────────────
+    let kernel = ["vmlinuz", "ubuntu-vmlinuz"]
+        .iter()
+        .map(|n| src_dir.join(n))
+        .find(|p| p.exists())
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotFound,
+                format!("vmlinuz not found in {}", src_dir.display()),
+            )
+        })?;
+
+    let initrd = ["initramfs.gz", "initramfs-custom.gz"]
+        .iter()
+        .map(|n| src_dir.join(n))
+        .find(|p| p.exists());
+
+    let src_disk = src_dir.join("root.img");
+    if !src_disk.exists() {
+        return Err(Error::new(
+            ErrorKind::NotFound,
+            format!("root.img not found in {}", src_dir.display()),
+        ));
+    }
+
+    // ── 3. prepare profile state dir and disk path ────────────────────────
+    let state_dir = state::profile_dir(profile)?;
+    std::fs::create_dir_all(&state_dir)?;
+
+    let dst_disk = state_dir.join("root.img");
+    let vm_conf = state_dir.join("vm.conf");
+
+    if vm_conf.exists() && !force {
+        return Err(Error::new(
+            ErrorKind::AlreadyExists,
+            format!(
+                "vm.conf already exists at {}. Use --force to overwrite.",
+                vm_conf.display()
+            ),
+        ));
+    }
+
+    // Copy root.img only if the destination doesn't already exist or --force.
+    // The image is a fresh sparse placeholder (~0 bytes on-disk); use cp to
+    // preserve sparseness rather than reading/writing every zero byte.
+    if !dst_disk.exists() || force {
+        print!("Copying root.img to {} … ", state_dir.display());
+        let _ = std::io::stdout().flush();
+        std::fs::copy(&src_disk, &dst_disk)?;
+        println!("done");
+    } else {
+        println!(
+            "root.img already present at {} — reusing",
+            dst_disk.display()
+        );
+    }
+
+    // ── 4. write vm.conf ──────────────────────────────────────────────────
+    let mut conf = format!(
+        "# vm.conf — written by pelagos vm init\n\
+         kernel = {}\n\
+         disk   = {}\n",
+        kernel.display(),
+        dst_disk.display(),
+    );
+    if let Some(ref initrd) = initrd {
+        conf.push_str(&format!("initrd = {}\n", initrd.display()));
+    }
+
+    std::fs::write(&vm_conf, &conf)?;
+    println!("Wrote {}", vm_conf.display());
+
+    // ── 5. next-step guidance ─────────────────────────────────────────────
+    let ping_cmd = if profile == "default" {
+        "pelagos ping".to_string()
+    } else {
+        format!("pelagos --profile {} ping", profile)
+    };
+    let run_cmd = if profile == "default" {
+        "pelagos run alpine echo hello".to_string()
+    } else {
+        format!("pelagos --profile {} run alpine echo hello", profile)
+    };
+    println!();
+    println!("VM initialised. To verify:");
+    println!("  {}   # should print 'pong'", ping_cmd);
+    println!("  {}  # should print 'hello'", run_cmd);
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2087,7 +2260,7 @@ struct DiscoveredArtifacts {
 /// Search order:
 ///   1. `~/.local/share/pelagos/`          — XDG data dir (manually placed or previously used)
 ///   2. `$(binary)/../share/pelagos-mac/`  — Homebrew pkgshare
-///   3. `$(binary)/../../../../out/`        — dev build tree
+///   3. `$(binary)/../../../out/`            — dev build tree
 ///
 /// Within each directory, both naming conventions are tried:
 ///   kernel : `vmlinuz`, `ubuntu-vmlinuz`
@@ -2105,7 +2278,7 @@ fn discover_vm_artifacts() -> Option<DiscoveredArtifacts> {
         dirs.push(base);
     }
     dirs.push(bin_dir.join("../share/pelagos-mac"));
-    dirs.push(bin_dir.join("../../../../out"));
+    dirs.push(bin_dir.join("../../../out"));
 
     for dir in &dirs {
         let kernel = ["vmlinuz", "ubuntu-vmlinuz"]
