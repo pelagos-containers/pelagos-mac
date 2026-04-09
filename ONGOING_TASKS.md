@@ -1,6 +1,6 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-03-28 — core monitoring stack running end-to-end; pelagos-dns + nft_masq.ko in initramfs; git SHA: 4fe43fb*
+*Last updated: 2026-04-09 — build VM verified on Ubuntu 24.04 + kernel 6.11; integration suite 313/0/7; pelagos v0.60.8*
 
 ---
 
@@ -60,13 +60,12 @@ in ~16s; full console replay works.
 
 ---
 
-## Epic #119 — pelagos builder VM + full test suite verified ✅ (PR #125/#129/#131/#136)
+## Epic #119 — pelagos builder VM + full test suite verified ✅ (PR #125/#129/#131/#136/#208)
 
-Ubuntu 22.04 aarch64 VM running as `--profile build`. Boots in ~16s, SSH-ready.
-`cargo build --release` verified: pelagos v0.59.0, ELF64 AArch64, 1m 50s.
-`cargo test` (full suite): **297/303 passed, 0 failed, 6 ignored** (ignored tests
-require external services: docker registry, Go toolchain). All container, networking,
-cgroup, seccomp, namespace, and overlayfs integration tests pass.
+Ubuntu 24.04 aarch64 VM running as `--profile build`. Boots in ~16s, SSH-ready.
+`cargo build --release` verified: pelagos v0.60.8, ELF64 AArch64, 1m 50s.
+`cargo test` (full suite): **313 passed, 0 failed, 7 ignored** on Ubuntu 24.04 + kernel 6.11.
+All container, networking, cgroup, seccomp, namespace, and overlayfs integration tests pass.
 
 Fixes required to reach full pass:
 - pelagos#128: `SYS_chmod` → `SYS_fchmodat` in integration tests (aarch64 syscall table)
