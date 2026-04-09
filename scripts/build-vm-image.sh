@@ -955,6 +955,13 @@ if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
     busybox insmod \$_KD/fs/fuse/virtiofs.ko 2>/dev/console || true
     # veth — virtual ethernet pairs (no deps)
     busybox insmod \$_KD/drivers/net/veth.ko 2>/dev/console || true
+    if ! grep -q "^veth " /proc/modules 2>/dev/null; then
+        if grep -q "drivers/net/veth.ko" /lib/modules/\$_KVER/modules.builtin 2>/dev/null; then
+            echo "[pelagos-init] veth is built-in (CONFIG_VETH=y)"
+        else
+            echo "[pelagos-init] WARNING: veth not loaded and not built-in — container bridge networking will fail" >/dev/console
+        fi
+    fi
     # bridge + deps: llc → stp → bridge
     busybox insmod \$_KD/net/llc/llc.ko 2>/dev/console || true
     busybox insmod \$_KD/net/802/stp.ko 2>/dev/console || true
