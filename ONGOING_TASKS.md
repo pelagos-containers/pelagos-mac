@@ -1,6 +1,6 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-04-09 — build VM verified on Ubuntu 24.04 + kernel 6.11; integration suite 313/0/7; pelagos v0.60.8*
+*Last updated: 2026-04-09 — distribution pipeline complete; v0.6.5 released; brew install + vm init + run verified end-to-end*
 
 ---
 
@@ -92,6 +92,17 @@ to any client connecting at any time. `pelagos vm console [--profile build]` wor
 
 ## Remaining Work
 
+### Completed this session (2026-04-09)
+
+- **Distribution pipeline — issues #118/#137** ✅ (v0.6.5)
+  - `pelagos vm init` subcommand: locates VM artifacts (Homebrew pkgshare or dev `out/`), copies `root.img` to writable state dir, writes `vm.conf`
+  - `update-tap` job in `.github/workflows/release.yml`: on tag push, fetches sha256s of released tarballs, renders Homebrew formula, pushes to `pelagos-containers/homebrew-tap` via GitHub API
+  - `veth.ko` staged in Alpine modloop fallback path (CI path); previously missing → `pelagos run` failed with "Unknown device type" after brew install
+  - Explicit post-insmod diagnostic in init script: distinguishes `CONFIG_VETH=y` (built-in, silent pass) from genuinely absent (WARNING to /dev/console); consistent with virtio-rng pattern from #211
+  - End-to-end verified: `brew install pelagos-containers/tap/pelagos-mac → pelagos vm init → pelagos ping → pelagos run alpine echo hello` all work from a clean Homebrew install
+  - `docs/INSTALL.md` created; README updated to lead with Homebrew install, fix version (v0.4.0 → v0.6.5), remove stale `skeptomai/tap` references
+  - Closed #118, #137
+
 ### Completed this session (2026-03-28)
 
 - **`pelagos compose` proxy** ✅ (PR #198, open)
@@ -144,7 +155,6 @@ to any client connecting at any time. `pelagos vm console [--profile build]` wor
 
 - **Home monitoring stack** — core stack (prometheus + alertmanager + grafana) running end-to-end. Full 8-service stack (`compose.reml`) needs `.env` with real credentials (MIKROTIK_PASSWORD, TRUENAS_API_KEY, PLEX_TOKEN, GF_SMTP_PASSWORD). Once credentials in place: verify all exporters up, import Grafana dashboards from k8s setup.
 - **Epic #135 — pelagos-ui** — Tauri + Svelte macOS management GUI (new). M1: container list. Blocked on #98 (JSON ps output).
-- **Release CI workflow (#118)** — self-hosted runner + `release.yml` to build, sign, and publish binaries on tag push.
 - **Port forwarding** ✅ — `pelagos run -p 8080:80 nginx:alpine` + `curl http://localhost:8080/`
   works end-to-end via smoltcp relay + DNAT. Two **pelagos bugs** remain that prevent it
   from working cleanly out of the box without manual intervention:

@@ -19,13 +19,18 @@ build environment, and the devcontainer workflow.
 
 ## Quick start
 
-```bash
-# First time: build the binary and VM image
-cargo build --release -p pelagos-mac
-bash scripts/sign.sh            # mandatory after every build
-bash scripts/build-vm-image.sh  # build the Alpine container VM
+**Install via Homebrew** (see [INSTALL.md](INSTALL.md) for full details):
 
-# Run a container (boots the VM automatically on first use)
+```bash
+brew tap pelagos-containers/tap
+brew install pelagos-containers/tap/pelagos-mac
+pelagos vm init
+```
+
+**Verify it works:**
+
+```bash
+pelagos ping                             # → pong
 pelagos run --rm alpine echo "hello from Linux"
 
 # Check what is running

@@ -4,11 +4,29 @@ macOS CLI for the [pelagos](https://github.com/pelagos-containers/pelagos) Linux
 runtime. Runs pelagos containers on Apple Silicon by managing a lightweight Linux VM
 via Apple's Virtualization Framework.
 
+## Install
+
+Requires macOS 13.5+ (Ventura), Apple Silicon.
+
+```bash
+brew tap pelagos-containers/tap
+brew install pelagos-containers/tap/pelagos-mac
+pelagos vm init
+pelagos ping                       # → pong
+pelagos run alpine echo hello      # → hello
+```
+
+`pelagos vm init` copies the VM disk image to `~/.local/share/pelagos/` and writes
+`vm.conf`. Run it once after install and once after each upgrade.
+
+See [docs/INSTALL.md](docs/INSTALL.md) for upgrade instructions and the
+build-from-source path for contributors.
+
 ## Status
 
-**v0.4.0 — functional.** VS Code devcontainer support works end-to-end. 27/27
-devcontainer e2e tests pass (suites A–F). Build VM boots clean in ~16s via Ubuntu
-6.8 HWE kernel; `pelagos vm console` replays full boot log.
+**v0.6.5 — stable.** VS Code devcontainer support works end-to-end. 27/27
+devcontainer e2e tests pass. Ubuntu 24.04 build VM + kernel 6.11: 313/313
+integration tests pass. Homebrew tap auto-updates on release.
 
 ## Architecture
 
@@ -32,13 +50,7 @@ Pure Rust throughout. No Go, no Lima, no gRPC daemon, no privileged helpers, no
 Homebrew networking prerequisites. See [docs/DESIGN.md](docs/DESIGN.md) for the
 full rationale.
 
-## Requirements
-
-- macOS 13.5+ (Ventura), Apple Silicon
-- Xcode Command Line Tools
-- Rust toolchain (`rustup`)
-
-## Building
+## Building (contributors)
 
 ```bash
 # 1. Build host binary
@@ -58,45 +70,14 @@ linker-signed copy that lacks `com.apple.security.virtualization`. Without it,
 macOS silently kills the VM daemon the moment it calls into Virtualization.framework.
 The log shows nothing; `vm status` says "stopped". Always re-sign after every build.
 
-### Installing locally for testing
-
-`cargo build` + `sign.sh` produces a working binary at
-`target/aarch64-apple-darwin/release/pelagos`, but to install it as the
-system `pelagos` (replacing the Homebrew-managed binary) use `build-release.sh`:
-
-```bash
-bash scripts/build-release.sh   # build, sign, pack tarballs, update local tap formula
-
-brew uninstall pelagos-mac 2>/dev/null || true
-HOMEBREW_DEVELOPER=1 HOMEBREW_NO_INSTALL_FROM_API=1 brew install skeptomai/tap/pelagos-mac
-```
-
-`build-release.sh` writes the formula to `dist/tap/Formula/pelagos-mac.rb` and
-auto-syncs it to the brew tap at
-`/opt/homebrew/Library/Taps/skeptomai/homebrew-tap/`. The install step then
-picks it up without any manual copy. The `brew uninstall` is required when the
-version number has not changed — Homebrew skips reinstall otherwise.
-
-**Do not** use `brew reinstall pelagos-mac` or `brew install` against the remote
-`pelagos-containers/tap` formula. Its checksums are pinned to GitHub release
-assets and will never match a local build. `brew reinstall` uninstalls first,
-then installs — if the install fails (checksum mismatch is guaranteed for local
-builds), the binary is gone with no easy recovery.
-
-### Cross-compiling the guest
-
-```bash
-make build-guest
-```
-
-The guest is built as a static musl binary (`aarch64-unknown-linux-musl`) and baked
-into the VM image by `build-vm-image.sh`.
+See [docs/INSTALL.md](docs/INSTALL.md) for all prerequisites and the full
+contributor setup walkthrough.
 
 ## VM profiles
 
 pelagos-mac runs one or more Linux VMs simultaneously, each identified by a
 profile name. The `default` profile is the Alpine container VM. The `build`
-profile is an Ubuntu 22.04 VM for native aarch64 development.
+profile is an Ubuntu 24.04 VM for native aarch64 development.
 
 ```bash
 # See all VMs and their state
@@ -160,7 +141,8 @@ bash scripts/test-devcontainer-e2e.sh --suite D   # postCreateCommand
 
 | Doc | Contents |
 |---|---|
-| [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | **Start here** — running containers, VM management, build VM, devcontainers |
+| [docs/INSTALL.md](docs/INSTALL.md) | **Install guide** — Homebrew, upgrade, and build-from-source |
+| [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | Running containers, VM management, build VM, devcontainers |
 | [docs/DESIGN.md](docs/DESIGN.md) | Architecture rationale, options evaluated, security analysis |
 | [docs/NETWORK_OPTIONS.md](docs/NETWORK_OPTIONS.md) | VM networking options and smoltcp relay design |
 | [docs/VM_IMAGE_DESIGN.md](docs/VM_IMAGE_DESIGN.md) | Kernel selection, initramfs, module loading |
