@@ -56,7 +56,7 @@ KERNEL_OUT="$OUT/vmlinuz"
 UBUNTU_VMLINUZ="$OUT/ubuntu-vmlinuz"
 UBUNTU_MODULES="$OUT/ubuntu-modules"
 
-PELAGOS_VERSION="0.60.6"
+PELAGOS_VERSION="0.60.8"
 PELAGOS_BIN="$WORK/pelagos-${PELAGOS_VERSION}-aarch64-linux"
 PELAGOS_URL="https://github.com/pelagos-containers/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-aarch64-linux"
 # If a local build exists, use it instead of downloading.
@@ -745,6 +745,29 @@ if [ ! -f "$INITRAMFS_OUT" ] \
             fi
         done
         echo "  staged ext4 + jbd2 + mbcache modules"
+
+        # nftables + netfilter: required for container networking (DNAT/masquerade/port-forward)
+        for ko_rel in \
+            lib/libcrc32c.ko \
+            net/ipv4/netfilter/nf_defrag_ipv4.ko \
+            net/ipv6/netfilter/nf_defrag_ipv6.ko \
+            net/netfilter/nfnetlink.ko \
+            net/netfilter/nf_conntrack.ko \
+            net/netfilter/nf_nat.ko \
+            net/netfilter/nf_tables.ko \
+            net/netfilter/nft_nat.ko \
+            net/netfilter/nft_chain_nat.ko \
+            net/netfilter/nft_masq.ko; do
+            src="$MODLOOP_DIR/modules/$KVER/kernel/$ko_rel"
+            dst="$INITRD_TMP/lib/modules/$KVER/kernel/$ko_rel"
+            if [ -f "$src" ]; then
+                mkdir -p "$(dirname "$dst")"
+                cp "$src" "$dst"
+            else
+                echo "  WARNING: $ko_rel not found in modloop — nftables rules will fail" >&2
+            fi
+        done
+        echo "  staged nftables + netfilter modules"
 
         for meta in modules.dep modules.dep.bin modules.alias modules.alias.bin \
                     modules.builtin modules.builtin.bin modules.builtin.modinfo \
