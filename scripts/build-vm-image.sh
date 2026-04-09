@@ -698,6 +698,15 @@ if [ ! -f "$INITRAMFS_OUT" ] \
             echo "  WARNING: tun.ko not found in modloop" >&2
         fi
 
+        VETH_KO="$NETMOD_BASE/drivers/net/veth.ko"
+        if [ -f "$VETH_KO" ]; then
+            mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/net"
+            cp "$VETH_KO" "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/net/veth.ko"
+            echo "  staged veth.ko"
+        else
+            echo "  WARNING: veth.ko not found in modloop — container bridge networking will be unavailable" >&2
+        fi
+
         OVERLAY_KO="$NETMOD_BASE/fs/overlayfs/overlay.ko"
         if [ -f "$OVERLAY_KO" ]; then
             mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/fs/overlayfs"
