@@ -56,11 +56,14 @@ KERNEL_OUT="$OUT/vmlinuz"
 UBUNTU_VMLINUZ="$OUT/ubuntu-vmlinuz"
 UBUNTU_MODULES="$OUT/ubuntu-modules"
 
-PELAGOS_VERSION="0.60.8"
+PELAGOS_VERSION="0.60.9"
 PELAGOS_BIN="$WORK/pelagos-${PELAGOS_VERSION}-aarch64-linux"
 PELAGOS_URL="https://github.com/pelagos-containers/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-aarch64-linux"
+PELAGOS_DNS_BIN="$WORK/pelagos-dns-${PELAGOS_VERSION}-aarch64-linux"
+PELAGOS_DNS_URL="https://github.com/pelagos-containers/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-dns-aarch64-linux"
 # If a local build exists, use it instead of downloading.
 PELAGOS_LOCAL_BUILD="$HOME/Projects/pelagos/target/aarch64-unknown-linux-musl/release/pelagos"
+PELAGOS_DNS_LOCAL_BUILD="$HOME/Projects/pelagos/target/aarch64-unknown-linux-musl/release/pelagos-dns"
 
 PASST_PKG="passt-2025.01.21-r0"
 PASST_APK="$WORK/${PASST_PKG}.apk"
@@ -288,6 +291,18 @@ elif [ ! -f "$PELAGOS_BIN" ]; then
     echo "  Downloaded: $PELAGOS_BIN"
 else
     echo "  (cached: $PELAGOS_BIN)"
+fi
+
+if [ -f "$PELAGOS_DNS_LOCAL_BUILD" ]; then
+    cp "$PELAGOS_DNS_LOCAL_BUILD" "$PELAGOS_DNS_BIN"
+    chmod 755 "$PELAGOS_DNS_BIN"
+    echo "  Using local build: $PELAGOS_DNS_LOCAL_BUILD"
+elif [ ! -f "$PELAGOS_DNS_BIN" ]; then
+    curl -L --progress-bar -o "$PELAGOS_DNS_BIN" "$PELAGOS_DNS_URL"
+    chmod 755 "$PELAGOS_DNS_BIN"
+    echo "  Downloaded: $PELAGOS_DNS_BIN"
+else
+    echo "  (cached: $PELAGOS_DNS_BIN)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -536,12 +551,10 @@ if [[ "$USE_UBUNTU_MODULES" -eq 0 ]]; then
     echo "  kernel version: $KVER (Alpine lts — run build-build-image.sh to upgrade to Ubuntu kernel)"
 fi
 
-PELAGOS_DNS_BIN="$HOME/Projects/pelagos/target/aarch64-unknown-linux-musl/release/pelagos-dns"
-
 if [ ! -f "$INITRAMFS_OUT" ] \
     || [ "$GUEST_BIN"        -nt "$INITRAMFS_OUT" ] \
     || [ "$PELAGOS_BIN"      -nt "$INITRAMFS_OUT" ] \
-    || { [ -f "$PELAGOS_DNS_BIN" ] && [ "$PELAGOS_DNS_BIN" -nt "$INITRAMFS_OUT" ]; } \
+    || [ "$PELAGOS_DNS_BIN"  -nt "$INITRAMFS_OUT" ] \
     || [ "$0"                -nt "$INITRAMFS_OUT" ]; then
 
     NETMOD_BASE="$MODLOOP_DIR/modules/$KVER/kernel"
@@ -786,15 +799,10 @@ if [ ! -f "$INITRAMFS_OUT" ] \
     chmod 755 "$INITRD_TMP/usr/local/bin/pelagos-guest"
     cp "$PELAGOS_BIN" "$INITRD_TMP/usr/local/bin/pelagos"
     chmod 755 "$INITRD_TMP/usr/local/bin/pelagos"
-    # pelagos-dns: container name resolution daemon (co-located with pelagos binary).
-    PELAGOS_DNS_BIN="$HOME/Projects/pelagos/target/aarch64-unknown-linux-musl/release/pelagos-dns"
-    if [ -f "$PELAGOS_DNS_BIN" ]; then
-        cp "$PELAGOS_DNS_BIN" "$INITRD_TMP/usr/local/bin/pelagos-dns"
-        chmod 755 "$INITRD_TMP/usr/local/bin/pelagos-dns"
-        echo "  Staged pelagos-dns"
-    else
-        echo "  WARNING: pelagos-dns binary not found at $PELAGOS_DNS_BIN — container hostname DNS will not work" >&2
-    fi
+    # pelagos-dns: container name resolution daemon — required for container hostname resolution.
+    cp "$PELAGOS_DNS_BIN" "$INITRD_TMP/usr/local/bin/pelagos-dns"
+    chmod 755 "$INITRD_TMP/usr/local/bin/pelagos-dns"
+    echo "  Staged pelagos-dns"
 
     # Add dropbear SSH server and its runtime library dependencies.
     mkdir -p "$INITRD_TMP/usr/sbin"
