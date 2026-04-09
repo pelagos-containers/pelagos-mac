@@ -1,8 +1,10 @@
 # VM Lifecycle
 
-pelagos-mac runs a single persistent Linux VM as a background daemon.
-The VM boots once and stays alive between container invocations, giving
-warm-start latency of ~100 ms for subsequent commands.
+pelagos-mac runs one or more persistent Linux VMs as background daemons.
+Each VM is identified by a **profile** name. The `default` profile is the
+Alpine container VM; additional profiles (e.g. `build`) run other operating
+systems for different purposes. Each VM boots once and stays alive between
+invocations, giving warm-start latency of ~100 ms for subsequent commands.
 
 ---
 
@@ -25,11 +27,36 @@ Cold boot takes ~1–2 s. All subsequent commands reuse the running VM.
 ## Status & control
 
 ```bash
-pelagos vm status     # running (pid 12345)  OR  stopped (exit 1)
-pelagos vm stop       # SIGTERM the daemon; waits up to 15 s for exit
+# Show all configured profiles and their state (recommended starting point)
+pelagos vm ls
+
+# Single-profile status/stop (defaults to "default" profile)
+pelagos vm status                          # running (pid …)  OR  stopped
+pelagos vm stop                            # stop the default container VM
+
+# Same commands for a named profile
+pelagos vm status --profile build          # running (pid …)  OR  stopped
+pelagos vm stop   --profile build          # cleanly stop the build VM
 ```
 
+`vm stop` sends SIGTERM and waits up to 15 s for the daemon to exit.
 After `vm stop`, the next command triggers a cold boot automatically.
+
+### vm ls — profile overview
+
+`pelagos vm ls` scans all configured profiles and prints a table:
+
+```
+PROFILE     ACCESS       MEMORY   CPUS  STATUS
+----------  ----------  -------  -----  --------------------
+default     vsock/shell  2048 MB      2  running (pid 6495)
+build       ssh         4096 MB      4  running (pid 58661)
+debian      ssh         2048 MB      2  stopped
+```
+
+Profiles are discovered by scanning `~/.local/share/pelagos/profiles/` plus the
+root data directory (the `default` profile). A profile shows as `stopped` if no
+daemon PID file exists or the recorded PID is no longer alive.
 
 ---
 
@@ -39,13 +66,24 @@ Three modes for getting a shell or running commands directly in the VM:
 
 | Command | Transport | Notes |
 |---|---|---|
-| `pelagos vm shell` | vsock | Busybox `/bin/sh`; fastest |
+| `pelagos vm shell` | vsock | Busybox `/bin/sh`; fastest; default profile only |
 | `pelagos vm console` | hvc0 serial | Raw boot console; Ctrl-] to detach |
 | `pelagos vm ssh [-- cmd]` | SSH (dropbear) | Full SSH; supports port-forwarding |
 
 All three auto-start the daemon if needed.
 
-Convenience wrappers (mirror `vm-shell.sh`):
+`vm shell` uses the vsock control plane and only works for profiles with
+`ping_mode = vsock` (the Alpine container VM). For SSH-based profiles like
+`build`, use `vm ssh`:
+
+```bash
+pelagos vm shell                           # shell into default (Alpine) VM
+pelagos vm ssh                             # SSH into default VM
+pelagos vm ssh --profile build             # SSH into build (Ubuntu) VM
+pelagos vm ssh --profile build -- uname -a
+```
+
+Convenience wrappers:
 
 ```bash
 scripts/vm-shell.sh

@@ -58,6 +58,31 @@ linker-signed copy that lacks `com.apple.security.virtualization`. Without it,
 macOS silently kills the VM daemon the moment it calls into Virtualization.framework.
 The log shows nothing; `vm status` says "stopped". Always re-sign after every build.
 
+### Installing locally for testing
+
+`cargo build` + `sign.sh` produces a working binary at
+`target/aarch64-apple-darwin/release/pelagos`, but to install it as the
+system `pelagos` (replacing the Homebrew-managed binary) use `build-release.sh`:
+
+```bash
+bash scripts/build-release.sh   # build, sign, pack tarballs, update local tap formula
+
+brew uninstall pelagos-mac 2>/dev/null || true
+HOMEBREW_DEVELOPER=1 HOMEBREW_NO_INSTALL_FROM_API=1 brew install skeptomai/tap/pelagos-mac
+```
+
+`build-release.sh` writes the formula to `dist/tap/Formula/pelagos-mac.rb` and
+auto-syncs it to the brew tap at
+`/opt/homebrew/Library/Taps/skeptomai/homebrew-tap/`. The install step then
+picks it up without any manual copy. The `brew uninstall` is required when the
+version number has not changed — Homebrew skips reinstall otherwise.
+
+**Do not** use `brew reinstall pelagos-mac` or `brew install` against the remote
+`pelagos-containers/tap` formula. Its checksums are pinned to GitHub release
+assets and will never match a local build. `brew reinstall` uninstalls first,
+then installs — if the install fails (checksum mismatch is guaranteed for local
+builds), the binary is gone with no easy recovery.
+
 ### Cross-compiling the guest
 
 ```bash
@@ -69,21 +94,30 @@ into the VM image by `build-vm-image.sh`.
 
 ## VM profiles
 
-Named profiles run different VM configurations from the same binary. The
-default profile runs the Alpine pelagos VM for containers. The `build` profile
-runs an Ubuntu 22.04 VM for native aarch64 development:
+pelagos-mac runs one or more Linux VMs simultaneously, each identified by a
+profile name. The `default` profile is the Alpine container VM. The `build`
+profile is an Ubuntu 22.04 VM for native aarch64 development.
 
 ```bash
-bash scripts/build-build-image.sh   # provision Ubuntu build VM (one-time)
-bash scripts/build-vm-start.sh      # start it and wait for SSH
-pelagos --profile build vm ssh      # connect
-pelagos --profile build vm ssh -- rustc --version
+# See all VMs and their state
+pelagos vm ls
+
+# Container VM (default) — used for all pelagos run/exec/ps commands
+pelagos vm shell                           # vsock shell into Alpine VM
+pelagos vm ssh                             # SSH into Alpine VM
+
+# Build VM — native compilation environment
+bash scripts/build-build-image.sh         # provision Ubuntu build VM (one-time)
+bash scripts/build-vm-start.sh            # start and wait for SSH-ready
+pelagos vm ssh --profile build            # SSH in
+pelagos vm ssh --profile build -- rustc --version
+pelagos vm stop --profile build           # stop when done (frees 4 GB RAM)
 ```
 
-The key distinction: the Alpine VM uses **vsock → pelagos-guest** as its
-control plane (for container commands). The Ubuntu build VM uses
-**SSH → openssh-server**. `pelagos ping` handles both via `ping_mode` in
-`vm.conf` — see [docs/VM_LIFECYCLE.md](docs/VM_LIFECYCLE.md#vm-profiles-and-control-planes).
+The Alpine VM uses **vsock → pelagos-guest** as its control plane. The Ubuntu
+build VM uses **SSH → openssh-server**. `vm shell` only works for the Alpine VM;
+use `vm ssh --profile build` for Ubuntu. See
+[docs/VM_LIFECYCLE.md](docs/VM_LIFECYCLE.md#the-two-vm-model) for the full breakdown.
 
 ## Using with VS Code Dev Containers
 
@@ -126,10 +160,12 @@ bash scripts/test-devcontainer-e2e.sh --suite D   # postCreateCommand
 
 | Doc | Contents |
 |---|---|
+| [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | **Start here** — running containers, VM management, build VM, devcontainers |
 | [docs/DESIGN.md](docs/DESIGN.md) | Architecture rationale, options evaluated, security analysis |
 | [docs/NETWORK_OPTIONS.md](docs/NETWORK_OPTIONS.md) | VM networking options and smoltcp relay design |
 | [docs/VM_IMAGE_DESIGN.md](docs/VM_IMAGE_DESIGN.md) | Kernel selection, initramfs, module loading |
-| [docs/VM_LIFECYCLE.md](docs/VM_LIFECYCLE.md) | VM start/stop/status and daemon model |
+| [docs/VM_LIFECYCLE.md](docs/VM_LIFECYCLE.md) | VM start/stop/status, profiles, and daemon model |
+| [docs/VM_PROFILES.md](docs/VM_PROFILES.md) | Alpine vs Ubuntu profiles — dividing lines and when to use each |
 | [docs/VM_DEBUGGING.md](docs/VM_DEBUGGING.md) | Common failures and recovery procedures |
 | [docs/DEVCONTAINER_GUIDE.md](docs/DEVCONTAINER_GUIDE.md) | VS Code devcontainer setup |
 | [docs/DEVCONTAINER_REQUIREMENTS.md](docs/DEVCONTAINER_REQUIREMENTS.md) | devcontainer requirements and test matrix |

@@ -426,6 +426,8 @@ enum VmCommands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra: Vec<String>,
     },
+    /// List all configured VM profiles and their running state
+    Ls,
 }
 
 #[derive(Subcommand)]
@@ -738,6 +740,9 @@ fn main() {
         Commands::Vm {
             sub: VmCommands::Status,
         } => vm_status(&profile),
+        Commands::Vm {
+            sub: VmCommands::Ls,
+        } => vm_ls(),
         Commands::Vm {
             sub: VmCommands::Shell,
         } => {
@@ -1970,6 +1975,100 @@ fn vm_status(profile: &str) {
         Some(pid) => {
             println!("running (pid {})", pid);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// vm ls — enumerate all profiles and their running state
+// ---------------------------------------------------------------------------
+
+fn vm_ls() {
+    let base = match state::pelagos_base() {
+        Ok(b) => b,
+        Err(e) => {
+            log::error!("state dir: {}", e);
+            process::exit(1);
+        }
+    };
+
+    // Collect (profile_name, VmProfileConfig, Option<u32 pid>) for every profile.
+    // Always start with "default" (the root data dir), then add named profiles.
+    let mut profiles: Vec<(String, state::VmProfileConfig, Option<u32>)> = Vec::new();
+
+    let default_state = state::StateDir::open_profile("default").ok();
+    let default_pid = default_state.as_ref().and_then(|s| s.running_pid());
+    let default_cfg = state::VmProfileConfig::load("default").unwrap_or_default();
+    profiles.push(("default".to_string(), default_cfg, default_pid));
+
+    // Scan ~/.local/share/pelagos/profiles/ for named profiles.
+    let profiles_dir = base.join("profiles");
+    if let Ok(rd) = std::fs::read_dir(&profiles_dir) {
+        let mut named: Vec<String> = rd
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        named.sort();
+        for name in named {
+            let s = state::StateDir::open_profile(&name).ok();
+            let pid = s.as_ref().and_then(|s| s.running_pid());
+            let cfg = state::VmProfileConfig::load(&name).unwrap_or_default();
+            profiles.push((name, cfg, pid));
+        }
+    }
+
+    // Column widths.
+    let col_profile = 10usize;
+    let col_access = 10usize;
+    let col_mem = 7usize;
+    let col_cpu = 5usize;
+    let col_status = 20usize;
+
+    println!(
+        "{:<col_profile$}  {:<col_access$}  {:>col_mem$}  {:>col_cpu$}  {:<col_status$}",
+        "PROFILE", "ACCESS", "MEMORY", "CPUS", "STATUS",
+        col_profile = col_profile,
+        col_access = col_access,
+        col_mem = col_mem,
+        col_cpu = col_cpu,
+        col_status = col_status,
+    );
+    println!(
+        "{:-<col_profile$}  {:-<col_access$}  {:->col_mem$}  {:->col_cpu$}  {:-<col_status$}",
+        "", "", "", "", "",
+        col_profile = col_profile,
+        col_access = col_access,
+        col_mem = col_mem,
+        col_cpu = col_cpu,
+        col_status = col_status,
+    );
+
+    for (name, cfg, pid) in &profiles {
+        let access = match cfg.ping_mode {
+            state::PingMode::Ssh => "ssh",
+            state::PingMode::Vsock => "vsock/shell",
+        };
+        let mem = cfg
+            .memory
+            .map(|m| format!("{} MB", m))
+            .unwrap_or_else(|| "-".to_string());
+        let cpus = cfg
+            .cpus
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let status = match pid {
+            Some(p) => format!("running (pid {})", p),
+            None => "stopped".to_string(),
+        };
+        println!(
+            "{:<col_profile$}  {:<col_access$}  {:>col_mem$}  {:>col_cpu$}  {:<col_status$}",
+            name, access, mem, cpus, status,
+            col_profile = col_profile,
+            col_access = col_access,
+            col_mem = col_mem,
+            col_cpu = col_cpu,
+            col_status = col_status,
+        );
     }
 }
 
