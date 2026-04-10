@@ -2130,9 +2130,12 @@ fn vm_init(profile: &str, vm_data: Option<&std::path::Path>, force: bool) -> std
             .parent()
             .ok_or_else(|| Error::new(ErrorKind::NotFound, "binary has no parent directory"))?;
 
-        // Check Homebrew pkgshare first, then dev out/.
+        // Check Homebrew formula layout (bin/../share/pelagos-mac), then cask
+        // layout (staged_path/share/pelagos-mac where binary sits at
+        // staged_path root), then dev out/.
         let candidates = [
             bin_dir.join("../share/pelagos-mac"),
+            bin_dir.join("share/pelagos-mac"),
             bin_dir.join("../../../out"),
         ];
         candidates
