@@ -33,14 +33,27 @@ subsequent command reuses the running VM.
 
 ```bash
 brew upgrade pelagos-containers/tap/pelagos-mac
-pelagos vm stop         # stop old VM daemon
-pelagos vm init --force # re-init with new kernel + initramfs
+pelagos vm init --force   # stops old VM, re-inits with new kernel + initramfs
 pelagos ping
 ```
 
-`--force` overwrites the existing `vm.conf` and replaces `root.img` with the
-fresh placeholder from the new release. Any cached container images on the old
-disk are lost; they will be re-pulled on next use.
+`--force` stops any running VM, overwrites `vm.conf`, and replaces `root.img`
+with the fresh placeholder from the new release. Any cached container images on
+the old disk are lost; they will be re-pulled on next use.
+
+### Uninstall
+
+```bash
+pelagos vm stop                    # stop the VM if running
+brew uninstall pelagos-containers/tap/pelagos-mac
+rm -rf ~/.local/share/pelagos      # removes OCI cache, vm.conf, and all state
+```
+
+`brew uninstall` removes the binaries and VM artifacts under `/opt/homebrew/`.
+The state directory (`~/.local/share/pelagos/`) is not managed by Homebrew and
+must be removed manually. It contains the writable disk image (OCI layer cache)
+and `vm.conf` — omit the `rm` if you want to preserve cached images for a
+reinstall.
 
 ---
 

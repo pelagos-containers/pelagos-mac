@@ -141,6 +141,16 @@ jobs:
                 Then verify and run a container:
                   pelagos ping
                   pelagos run alpine echo hello
+
+                To upgrade:
+                  brew upgrade pelagos-containers/tap/pelagos-mac
+                  pelagos vm init --force   # stops old VM, re-inits with new image
+                  pelagos ping
+
+                To uninstall completely:
+                  pelagos vm stop
+                  brew uninstall pelagos-containers/tap/pelagos-mac
+                  rm -rf ~/.local/share/pelagos   # OCI cache + vm.conf (not removed by brew)
               EOS
             end
 
