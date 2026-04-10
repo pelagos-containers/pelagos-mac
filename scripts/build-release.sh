@@ -65,7 +65,11 @@ echo "[release] building pelagos-tui..."
 cargo build -p pelagos-tui --release 2>&1 | grep -E "Compiling|Finished|^error"
 
 echo "[release] signing pelagos..."
-bash "$REPO/scripts/sign.sh"
+if codesign -dv "$REPO/target/aarch64-apple-darwin/release/pelagos" 2>&1 | grep -q "Developer ID"; then
+    echo "[release] Developer ID signature already present — skipping ad-hoc sign"
+else
+    bash "$REPO/scripts/sign.sh"
+fi
 
 # ---------------------------------------------------------------------------
 # Pack
