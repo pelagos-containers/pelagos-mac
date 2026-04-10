@@ -328,7 +328,22 @@ pub fn run(args: DaemonArgs) -> ! {
     }
 
     // Accept loop: use poll(2) with 1-second timeout so SIGTERM is checked promptly.
+    let mut loop_tick: u32 = 0;
     loop {
+        // Every 30 s check whether our own binary still exists.  If it has been
+        // removed (e.g. `brew uninstall`) we shut down so we don't silently
+        // consume resources on machines that rarely reboot.
+        loop_tick = loop_tick.wrapping_add(1);
+        if loop_tick.is_multiple_of(30) {
+            let binary_gone = std::env::current_exe()
+                .map(|p| !p.exists())
+                .unwrap_or(false);
+            if binary_gone {
+                log::info!("binary removed from disk — shutting down");
+                shutdown.store(true, Ordering::Relaxed);
+            }
+        }
+
         if shutdown.load(Ordering::Relaxed) {
             log::info!("shutdown requested, stopping VM...");
             dispatcher.send(DispatchCmd::Shutdown);
