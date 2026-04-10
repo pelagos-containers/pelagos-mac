@@ -2202,8 +2202,7 @@ fn vm_init(profile: &str, vm_data: Option<&std::path::Path>, force: bool) -> std
             if let Some(pid) = state.running_pid() {
                 println!("Stopping running VM (pid {}) …", pid);
                 unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(15);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
                 while std::time::Instant::now() < deadline {
                     if state.running_pid().is_none() {
                         break;
@@ -2260,7 +2259,10 @@ fn vm_init(profile: &str, vm_data: Option<&std::path::Path>, force: bool) -> std
     };
     println!();
     println!("VM initialised. To verify:");
-    println!("  {}   # cold-boots the VM with the new image, should print 'pong'", ping_cmd);
+    println!(
+        "  {}   # cold-boots the VM with the new image, should print 'pong'",
+        ping_cmd
+    );
     println!("  {}  # should print 'hello'", run_cmd);
 
     Ok(())
