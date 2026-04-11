@@ -55,6 +55,9 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" "$KEYCHAIN"
           rm certificate.p12
 
+      - name: Build pelagos-mac binary
+        run: cargo build --release -p pelagos-mac
+
       - name: Sign and notarize
         env:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
