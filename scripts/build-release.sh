@@ -55,21 +55,20 @@ done
 # ---------------------------------------------------------------------------
 # Build + sign
 # ---------------------------------------------------------------------------
-echo "[release] building pelagos..."
-cargo build -p pelagos-mac --release 2>&1 | grep -E "Compiling|Finished|^error"
+if codesign -dv "$REPO/target/aarch64-apple-darwin/release/pelagos" 2>&1 | grep -q "Developer ID"; then
+    echo "[release] Developer ID binary present — skipping rebuild and ad-hoc sign"
+else
+    echo "[release] building pelagos..."
+    cargo build -p pelagos-mac --release 2>&1 | grep -E "Compiling|Finished|^error"
+    echo "[release] signing pelagos..."
+    bash "$REPO/scripts/sign.sh"
+fi
 
 echo "[release] building pelagos-docker..."
 cargo build -p pelagos-docker --release 2>&1 | grep -E "Compiling|Finished|^error"
 
 echo "[release] building pelagos-tui..."
 cargo build -p pelagos-tui --release 2>&1 | grep -E "Compiling|Finished|^error"
-
-echo "[release] signing pelagos..."
-if codesign -dv "$REPO/target/aarch64-apple-darwin/release/pelagos" 2>&1 | grep -q "Developer ID"; then
-    echo "[release] Developer ID signature already present — skipping ad-hoc sign"
-else
-    bash "$REPO/scripts/sign.sh"
-fi
 
 # ---------------------------------------------------------------------------
 # Pack
