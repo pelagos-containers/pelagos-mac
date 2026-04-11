@@ -69,6 +69,8 @@ xcrun notarytool submit "$TMPZIP" \
     --issuer "$ISSUER" \
     --wait
 
+touch "$REPO/target/aarch64-apple-darwin/release/.developer-id-signed"
+
 echo ""
 echo "[notarize] done. Binary is signed and notarized (status: Accepted)."
 echo "  Run 'bash scripts/build-release.sh' to pack the release tarballs."

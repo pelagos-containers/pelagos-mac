@@ -55,7 +55,7 @@ done
 # ---------------------------------------------------------------------------
 # Build + sign
 # ---------------------------------------------------------------------------
-if codesign -dv "$REPO/target/aarch64-apple-darwin/release/pelagos" 2>&1 | grep -q "Developer ID"; then
+if [[ -f "$REPO/target/aarch64-apple-darwin/release/.developer-id-signed" ]]; then
     echo "[release] Developer ID binary present — skipping rebuild and ad-hoc sign"
 else
     echo "[release] building pelagos..."
