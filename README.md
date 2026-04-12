@@ -90,9 +90,9 @@ pelagos vm ssh                             # SSH into Alpine VM
 # Build VM — native compilation environment
 bash scripts/build-build-image.sh         # provision Ubuntu build VM (one-time)
 bash scripts/build-vm-start.sh            # start and wait for SSH-ready
-pelagos vm ssh --profile build            # SSH in
-pelagos vm ssh --profile build -- rustc --version
-pelagos vm stop --profile build           # stop when done (frees 4 GB RAM)
+pelagos --profile build vm ssh            # SSH in
+pelagos --profile build vm ssh -- rustc --version
+pelagos --profile build vm stop           # stop when done (frees 4 GB RAM)
 ```
 
 The Alpine VM uses **vsock → pelagos-guest** as its control plane. The Ubuntu
@@ -141,6 +141,7 @@ bash scripts/test-devcontainer-e2e.sh --suite D   # postCreateCommand
 
 | Doc | Contents |
 |---|---|
+| [CONTRIBUTING.md](CONTRIBUTING.md) | **Contributor setup** — two-repo split, build workflow, daily dev loop |
 | [docs/INSTALL.md](docs/INSTALL.md) | **Install guide** — Homebrew, upgrade, and build-from-source |
 | [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | Running containers, VM management, build VM, devcontainers |
 | [docs/DESIGN.md](docs/DESIGN.md) | Architecture rationale, options evaluated, security analysis |
