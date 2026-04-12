@@ -361,13 +361,20 @@ chroot "\$MNT" env HOME=/root \
     bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
              | sh -s -- -y --default-toolchain stable --no-modify-path'
 
-# Make rustc/cargo available system-wide for login and non-login shells.
-# Use '. /root/.cargo/env' rather than baking in $PATH — the OUTER_EOF heredoc
-# is unquoted so $PATH would expand to the macOS host PATH at provisioning time.
+# Make rustc/cargo available system-wide for all shell types:
+#
+#   /etc/environment      — non-interactive SSH (e.g. `vm ssh -- "cargo build"`)
+#                           read by PAM; does not support shell expansion
+#   /etc/profile.d/rust.sh — login shells
+#   /root/.bashrc          — non-login interactive shells
+#
+# /etc/environment uses literal string assignment — no shell expansion, so we
+# hard-code the cargo bin path rather than sourcing /root/.cargo/env.
+sed -i 's|^PATH="\(.*\)"$|PATH="/root/.cargo/bin:\1"|' "\$MNT/etc/environment"
+
 printf '%s\n' '. /root/.cargo/env' > "\$MNT/etc/profile.d/rust.sh"
 chmod +x "\$MNT/etc/profile.d/rust.sh"
 
-# Append to root's .bashrc so non-login interactive shells also get cargo.
 printf '\n# Rust toolchain\nsource /root/.cargo/env\n' >> "\$MNT/root/.bashrc"
 
 # git needs an explicit CA bundle path on Ubuntu 22.04 — without this, git

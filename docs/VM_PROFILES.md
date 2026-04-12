@@ -62,11 +62,11 @@ attempt to cross-compile from macOS — the Linux standard library is not
 available there, and `cargo check --target aarch64-unknown-linux-gnu` will
 fail immediately.
 
-**Two critical facts about the build VM environment:**
+**One critical fact about the build VM environment:**
 
-1. **Rust toolchain PATH.** The toolchain lives at `/root/.cargo/bin` and is
-   NOT in the default SSH PATH. Every non-interactive SSH command must begin
-   with `source /root/.cargo/env`.
+1. **Rust toolchain PATH.** `/root/.cargo/bin` is in PATH for all session
+   types — interactive, login, and non-interactive SSH — via `/etc/environment`,
+   `profile.d/rust.sh`, and `.bashrc`.
 
 2. **virtiofs mount.** The macOS home directory is available inside the VM
    at `/mnt` via a virtiofs share tagged `share0`. It is auto-mounted by a
@@ -77,16 +77,13 @@ fail immediately.
 
 ```bash
 # Full release build
-pelagos --profile build vm ssh -- \
-  "source /root/.cargo/env; cd /mnt/Projects/pelagos && cargo build --release"
+pelagos --profile build vm ssh -- "cd /mnt/Projects/pelagos && cargo build --release"
 
 # Clippy
-pelagos --profile build vm ssh -- \
-  "source /root/.cargo/env; cd /mnt/Projects/pelagos && cargo clippy -- -D warnings"
+pelagos --profile build vm ssh -- "cd /mnt/Projects/pelagos && cargo clippy -- -D warnings"
 
 # Unit tests
-pelagos --profile build vm ssh -- \
-  "source /root/.cargo/env; cd /mnt/Projects/pelagos && cargo test --lib"
+pelagos --profile build vm ssh -- "cd /mnt/Projects/pelagos && cargo test --lib"
 ```
 
 **Interactive session (iterative development):**
@@ -94,7 +91,6 @@ pelagos --profile build vm ssh -- \
 ```bash
 pelagos --profile build vm ssh
 # Inside the VM:
-source /root/.cargo/env
 cd /mnt/Projects/pelagos
 cargo build --release
 ```
