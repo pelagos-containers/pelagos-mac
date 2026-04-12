@@ -55,6 +55,56 @@ The two kernel cmdline flags are necessary for Ubuntu + AVF stability:
 Suited for: long-running builds that need a persistent toolchain, workflows
 where direct shell access (not container-mediated) is more natural.
 
+### Building pelagos in the build VM
+
+This is the standard workflow for compiling pelagos on macOS. Do not
+attempt to cross-compile from macOS — the Linux standard library is not
+available there, and `cargo check --target aarch64-unknown-linux-gnu` will
+fail immediately.
+
+**Two critical facts about the build VM environment:**
+
+1. **Rust toolchain PATH.** The toolchain lives at `/root/.cargo/bin` and is
+   NOT in the default SSH PATH. Every non-interactive SSH command must begin
+   with `source /root/.cargo/env`.
+
+2. **virtiofs mount.** The macOS home directory is available inside the VM
+   at `/mnt` via a virtiofs share tagged `share0`. It may not be auto-mounted
+   on fresh sessions. If `/mnt` is empty, run `mount -t virtiofs share0 /mnt`
+   before accessing source files. The pelagos source tree is therefore at
+   `/mnt/Projects/pelagos`.
+
+**Non-interactive commands (scripting / CI):**
+
+```bash
+# Full release build
+pelagos --profile build vm ssh -- \
+  "source /root/.cargo/env; cd /mnt/Projects/pelagos && cargo build --release"
+
+# Clippy
+pelagos --profile build vm ssh -- \
+  "source /root/.cargo/env; cd /mnt/Projects/pelagos && cargo clippy -- -D warnings"
+
+# Unit tests
+pelagos --profile build vm ssh -- \
+  "source /root/.cargo/env; cd /mnt/Projects/pelagos && cargo test --lib"
+```
+
+**Interactive session (iterative development):**
+
+```bash
+pelagos --profile build vm ssh
+# Inside the VM:
+mount -t virtiofs share0 /mnt   # if not already mounted
+source /root/.cargo/env
+cd /mnt/Projects/pelagos
+cargo build --release
+```
+
+Build artifacts land on the macOS filesystem (via virtiofs) and persist
+across VM restarts. The VM disk only holds the installed toolchain and
+Ubuntu system packages — not build output.
+
 ---
 
 ## The Dividing Lines
