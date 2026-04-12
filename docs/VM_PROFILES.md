@@ -69,10 +69,9 @@ fail immediately.
    with `source /root/.cargo/env`.
 
 2. **virtiofs mount.** The macOS home directory is available inside the VM
-   at `/mnt` via a virtiofs share tagged `share0`. It may not be auto-mounted
-   on fresh sessions. If `/mnt` is empty, run `mount -t virtiofs share0 /mnt`
-   before accessing source files. The pelagos source tree is therefore at
-   `/mnt/Projects/pelagos`.
+   at `/mnt` via a virtiofs share tagged `share0`. It is auto-mounted by a
+   systemd unit (`mnt.mount`) on boot — no manual step needed. The pelagos
+   source tree is therefore at `/mnt/Projects/pelagos`.
 
 **Non-interactive commands (scripting / CI):**
 
@@ -95,7 +94,6 @@ pelagos --profile build vm ssh -- \
 ```bash
 pelagos --profile build vm ssh
 # Inside the VM:
-mount -t virtiofs share0 /mnt   # if not already mounted
 source /root/.cargo/env
 cd /mnt/Projects/pelagos
 cargo build --release
