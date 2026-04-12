@@ -266,7 +266,7 @@ chroot "\$MNT" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-instal
     iproute2 nftables iptables openssh-server sudo \
     systemd systemd-sysv systemd-timesyncd \
     pkg-config libssl-dev \
-    rsync file strace \
+    rsync file strace zstd \
     initramfs-tools \
     linux-image-6.11.0-29-generic linux-modules-6.11.0-29-generic
 
@@ -337,6 +337,31 @@ printf '127.0.1.1\tubuntu-build\n' >> "\$MNT/etc/hosts"
 # so it must be explicitly loaded.  /etc/modules is read by systemd-modules-load.
 printf 'overlay\n' >> "\$MNT/etc/modules"
 
+# ---- virtiofs mount ----
+
+# Mount the AVF host directory share (tag: share0) at /mnt on boot.
+# AVF exposes the macOS home directory via virtiofs; the tag is "share0".
+# A systemd .mount unit named after the mount point handles this automatically.
+mkdir -p "\$MNT/etc/systemd/system"
+cat > "\$MNT/etc/systemd/system/mnt.mount" << 'MOUNTUNIT'
+[Unit]
+Description=Mount virtiofs share0 at /mnt
+DefaultDependencies=no
+After=local-fs-pre.target
+Before=local-fs.target
+
+[Mount]
+What=share0
+Where=/mnt
+Type=virtiofs
+Options=defaults
+
+[Install]
+WantedBy=local-fs.target
+MOUNTUNIT
+mkdir -p "\$MNT/etc/systemd/system/local-fs.target.wants"
+ln -sf /etc/systemd/system/mnt.mount "\$MNT/etc/systemd/system/local-fs.target.wants/mnt.mount"
+
 # Disable predictable interface renaming (belt-and-suspenders alongside
 # net.ifnames=0 in the kernel cmdline).  Without this, udev renames eth0
 # to enp0sN, bringing it down while networkd is trying to configure it.
@@ -363,14 +388,17 @@ chroot "\$MNT" env HOME=/root \
 
 # Make rustc/cargo available system-wide for all shell types:
 #
-#   /etc/environment      — non-interactive SSH (e.g. `vm ssh -- "cargo build"`)
+#   /etc/environment      — non-interactive SSH (e.g. vm ssh -- "cargo build")
 #                           read by PAM; does not support shell expansion
 #   /etc/profile.d/rust.sh — login shells
 #   /root/.bashrc          — non-login interactive shells
 #
 # /etc/environment uses literal string assignment — no shell expansion, so we
 # hard-code the cargo bin path rather than sourcing /root/.cargo/env.
-sed -i 's|^PATH="\(.*\)"$|PATH="/root/.cargo/bin:\1"|' "\$MNT/etc/environment"
+# Guard with grep so repeated provisioning runs don't prepend the path twice.
+if ! grep -q '/root/.cargo/bin' "\$MNT/etc/environment"; then
+    sed -i 's|^PATH="\(.*\)"$|PATH="/root/.cargo/bin:\1"|' "\$MNT/etc/environment"
+fi
 
 printf '%s\n' '. /root/.cargo/env' > "\$MNT/etc/profile.d/rust.sh"
 chmod +x "\$MNT/etc/profile.d/rust.sh"
@@ -420,19 +448,19 @@ if [ -n "\$KVER" ]; then
     #   nftables       — port-forward DNAT rules (pelagos network.rs)
     #
     # Ubuntu 24.04 (6.11+) ships modules as .ko.zst (zstd-compressed).
-    # Earlier Ubuntu releases used plain .ko.  copy_ko() handles both: it tries
-    # .ko first, then .ko.zst (decompressing to .ko via zstd -d).  zstd is
-    # installed below for the .ko.zst case.
-    apk add -q --no-progress zstd 2>/dev/null || true
+    # Earlier Ubuntu releases used plain .ko.  copy_ko() handles both.
+    # zstd is decompressed via chroot into the Ubuntu image — the Alpine
+    # initramfs does not have a working apk database so apk add zstd fails.
     copy_ko() {
-        local src="\$1"   # full path including .ko extension
+        local src="\$1"   # full path including .ko extension (host-side, under \$MNT)
         local dest_dir="\$2"
         local name="\$(basename \$src)"
         if [ -f "\$src" ]; then
             cp "\$src" "\$dest_dir/\$name"
             echo "  module: \$name"
         elif [ -f "\${src}.zst" ]; then
-            zstd -d -q "\${src}.zst" -o "\$dest_dir/\$name"
+            chroot "\$MNT" zstd -d -q "\${src#\$MNT}.zst" -o "/tmp/\$name"
+            mv "\$MNT/tmp/\$name" "\$dest_dir/\$name"
             echo "  module: \$name (from .ko.zst)"
         fi
     }
