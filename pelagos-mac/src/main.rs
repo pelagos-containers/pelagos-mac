@@ -2120,6 +2120,45 @@ fn vm_ls() {
 fn vm_init(profile: &str, vm_data: Option<&std::path::Path>, force: bool) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind};
 
+    // ── 0. running-VM guard ───────────────────────────────────────────────
+    // If the VM is currently running, vm_init must not proceed without --force.
+    //
+    // Without this guard, root.img can be unlinked on disk while the daemon
+    // still holds it open (Unix unlink-while-open).  exists() returns false on
+    // the unlinked path, so the copy-root.img branch fires and overwrites the
+    // user's OCI image cache with a blank placeholder.
+    if !force {
+        if let Ok(state) = state::StateDir::open_profile(profile) {
+            if let Some(pid) = state.running_pid() {
+                let stop_cmd = if profile == "default" {
+                    "pelagos vm stop".to_string()
+                } else {
+                    format!("pelagos --profile {} vm stop", profile)
+                };
+                let init_cmd = if profile == "default" {
+                    "pelagos vm init".to_string()
+                } else {
+                    format!("pelagos --profile {} vm init", profile)
+                };
+                let force_cmd = if profile == "default" {
+                    "pelagos vm init --force".to_string()
+                } else {
+                    format!("pelagos --profile {} vm init --force", profile)
+                };
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    format!(
+                        "VM is currently running (pid {pid}). Stop it first:\n\n  \
+                         {stop_cmd}\n  \
+                         {init_cmd}\n\n\
+                         To wipe the disk and start fresh (destroys all cached OCI images):\n  \
+                         {force_cmd}   (stops the VM automatically)",
+                    ),
+                ));
+            }
+        }
+    }
+
     // ── 1. locate source directory ────────────────────────────────────────
     let src_dir: PathBuf = if let Some(p) = vm_data {
         p.to_path_buf()
@@ -2140,7 +2179,7 @@ fn vm_init(profile: &str, vm_data: Option<&std::path::Path>, force: bool) -> std
         ];
         candidates
             .into_iter()
-            .find(|d| d.join("vmlinuz").exists() || d.join("ubuntu-vmlinuz").exists())
+            .find(|d| d.join("root.img").exists())
             .ok_or_else(|| {
                 Error::new(
                     ErrorKind::NotFound,
@@ -2157,23 +2196,11 @@ fn vm_init(profile: &str, vm_data: Option<&std::path::Path>, force: bool) -> std
         )
     })?;
 
-    // ── 2. resolve artifact paths in source dir ───────────────────────────
-    let kernel = ["vmlinuz", "ubuntu-vmlinuz"]
-        .iter()
-        .map(|n| src_dir.join(n))
-        .find(|p| p.exists())
-        .ok_or_else(|| {
-            Error::new(
-                ErrorKind::NotFound,
-                format!("vmlinuz not found in {}", src_dir.display()),
-            )
-        })?;
-
-    let initrd = ["initramfs.gz", "initramfs-custom.gz"]
-        .iter()
-        .map(|n| src_dir.join(n))
-        .find(|p| p.exists());
-
+    // ── 2. resolve disk path in source dir ───────────────────────────────
+    // Kernel and initrd are NOT resolved here — they are discovered at runtime
+    // by daemon_args_from_cli() via discover_vm_artifacts().  Writing absolute
+    // keg-versioned paths to vm.conf would cause stale-path failures after
+    // `brew upgrade` + `brew cleanup`.
     let src_disk = src_dir.join("root.img");
     if !src_disk.exists() {
         return Err(Error::new(
@@ -2235,16 +2262,21 @@ fn vm_init(profile: &str, vm_data: Option<&std::path::Path>, force: bool) -> std
     }
 
     // ── 4. write vm.conf ──────────────────────────────────────────────────
-    let mut conf = format!(
+    // Only the disk path is written here.  Kernel and initrd are discovered at
+    // runtime from the Homebrew pkgshare by discover_vm_artifacts(), so pinning
+    // them to a specific keg version would cause stale-path failures after
+    // `brew upgrade` + `brew cleanup`.
+    //
+    // To use a custom kernel, add `kernel = /path/to/vmlinuz` manually.
+    // Existing vm.conf files that already contain `kernel =` continue to work —
+    // VmProfileConfig.kernel is Option<PathBuf> and takes precedence.
+    let conf = format!(
         "# vm.conf — written by pelagos vm init\n\
-         kernel = {}\n\
-         disk   = {}\n",
-        kernel.display(),
+         # kernel and initrd are discovered automatically from the Homebrew pkgshare.\n\
+         # Add 'kernel = /path' here only to override with a custom kernel.\n\
+         disk = {}\n",
         dst_disk.display(),
     );
-    if let Some(ref initrd) = initrd {
-        conf.push_str(&format!("initrd = {}\n", initrd.display()));
-    }
 
     std::fs::write(&vm_conf, &conf)?;
     println!("Wrote {}", vm_conf.display());
@@ -2283,53 +2315,81 @@ struct DiscoveredArtifacts {
 
 /// Probe well-known locations for VM artifacts (kernel, initrd, disk image).
 ///
-/// Search order:
-///   1. `~/.local/share/pelagos/`          — XDG data dir (manually placed or previously used)
-///   2. `$(binary)/../share/pelagos-mac/`  — Homebrew pkgshare
-///   3. `$(binary)/../../../out/`            — dev build tree
+/// Search order for **kernel / initrd** (Homebrew-owned, read-only):
+///   1. `$(binary)/../share/pelagos-mac/`  — Homebrew formula pkgshare
+///   2. `$(binary)/share/pelagos-mac/`     — Homebrew cask staged layout
+///   3. `$(binary)/../../../out/`           — dev build tree
 ///
-/// Within each directory, both naming conventions are tried:
-///   kernel : `vmlinuz`, `ubuntu-vmlinuz`
-///   initrd : `initramfs.gz`, `initramfs-custom.gz`
-///   disk   : `root.img`
+/// Search order for **disk** (user-owned, writable):
+///   1. `~/.local/share/pelagos/`          — XDG data dir written by `vm init`
+///   2. Same artifact dirs as above         — blank placeholder on fresh install
 ///
-/// Returns the first directory that contains at least a kernel and a disk image.
+/// Kernel and disk are discovered independently so that the kernel can live in
+/// the Homebrew pkgshare while the disk lives in the user's XDG data dir.
+/// This prevents stale-path failures after `brew upgrade` + `brew cleanup`.
+///
+/// Returns `None` only if no kernel can be found anywhere.  A missing disk is
+/// non-fatal at this stage; the daemon will error at boot time.
 fn discover_vm_artifacts() -> Option<DiscoveredArtifacts> {
     let binary = std::env::current_exe().ok()?;
     let bin_dir = binary.parent()?;
 
-    // Collect candidate directories, skipping any that fail to resolve.
-    let mut dirs: Vec<PathBuf> = Vec::new();
+    // Candidate directories for kernel/initrd (Homebrew-owned files).
+    let kernel_dirs: Vec<PathBuf> = vec![
+        bin_dir.join("../share/pelagos-mac"),
+        bin_dir.join("share/pelagos-mac"),
+        bin_dir.join("../../../out"),
+    ];
+
+    // Find kernel from Homebrew pkgshare / dev tree.
+    let (kernel, kernel_dir) = kernel_dirs
+        .iter()
+        .find_map(|dir| {
+            let k = ["vmlinuz", "ubuntu-vmlinuz"]
+                .iter()
+                .map(|n| dir.join(n))
+                .find(|p| p.exists())?;
+            Some((k, dir.clone()))
+        })?;
+
+    // Initrd lives alongside the kernel.
+    let initrd = ["initramfs.gz", "initramfs-custom.gz"]
+        .iter()
+        .map(|n| kernel_dir.join(n))
+        .find(|p| p.exists());
+
+    // Candidate directories for disk (user-owned writable image).
+    // XDG data dir is checked first; artifact dirs are fallback for fresh
+    // installs before `vm init` has been run.
+    let mut disk_dirs: Vec<PathBuf> = Vec::new();
     if let Ok(base) = state::pelagos_base() {
-        dirs.push(base);
+        disk_dirs.push(base);
     }
-    dirs.push(bin_dir.join("../share/pelagos-mac"));
-    dirs.push(bin_dir.join("../../../out"));
+    disk_dirs.extend(kernel_dirs);
 
-    for dir in &dirs {
-        let kernel = ["vmlinuz", "ubuntu-vmlinuz"]
-            .iter()
-            .map(|n| dir.join(n))
-            .find(|p| p.exists());
-        let disk = dir.join("root.img");
-
-        let (Some(kernel), true) = (kernel, disk.exists()) else {
-            continue;
-        };
-
-        let initrd = ["initramfs.gz", "initramfs-custom.gz"]
-            .iter()
-            .map(|n| dir.join(n))
-            .find(|p| p.exists());
-
-        log::debug!("auto-discovered VM artifacts in {}", dir.display());
-        return Some(DiscoveredArtifacts {
-            kernel,
-            initrd,
-            disk,
+    let disk = disk_dirs
+        .iter()
+        .map(|dir| dir.join("root.img"))
+        .find(|p| p.exists())
+        .unwrap_or_else(|| {
+            // No disk found anywhere — return a plausible default path so the
+            // daemon can emit a clear "file not found" error at boot rather than
+            // a cryptic "no disk image" from the CLI.
+            let base = state::pelagos_base()
+                .unwrap_or_else(|_| PathBuf::from("/tmp"));
+            base.join("root.img")
         });
-    }
-    None
+
+    log::debug!(
+        "auto-discovered VM artifacts: kernel={} disk={}",
+        kernel.display(),
+        disk.display()
+    );
+    Some(DiscoveredArtifacts {
+        kernel,
+        initrd,
+        disk,
+    })
 }
 
 // ---------------------------------------------------------------------------
