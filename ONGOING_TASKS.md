@@ -1,6 +1,6 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-04-09 — distribution pipeline complete; v0.6.5 released; brew install + vm init + run verified end-to-end*
+*Last updated: 2026-04-14 — build VM provisioning fixed + verified; contributor docs added; two PRs open*
 
 ---
 
@@ -91,6 +91,52 @@ to any client connecting at any time. `pelagos vm console [--profile build]` wor
 ---
 
 ## Remaining Work
+
+### Completed this session (2026-04-12 / 2026-04-14)
+
+- **pelagos-ui v0.1.6 tap update** ✅
+  - CI had built+notarized the DMG but tap update job failed (expired TAP_GITHUB_TOKEN)
+  - Manually computed SHA256 of existing DMG, updated homebrew-tap cask via GitHub API
+  - Removed obsolete `postflight` quarantine strip (notarized apps don't need it)
+  - Deleted two stale v0.1.6 draft releases; promoted pelagos-mac v0.6.14 from draft to latest
+
+- **`pelagos image pull` auth error hint** ✅ — pelagos PR #201 (open, `fix/image-auth-error-hint`)
+  - Raw `OciDistributionError` messages (e.g. "error sending request for url") gave no
+    indication of auth failure
+  - Added `oci_err()` helper in `src/cli/image.rs` that matches on error variant and appends
+    `pelagos image login <registry>` hint for auth-related failures
+  - Tested three cases: ECR rate limit (no spurious hint), DNS failure (no hint), ghcr.io 401 (hint)
+
+- **build-build-image.sh provisioning bugs fixed** ✅ — pelagos-mac PR #227 (open)
+  - Backtick in unquoted heredoc comment → `vm: command not found` noise on every run
+  - `apk add zstd` silently failed (Alpine initramfs has no apk database) → Ubuntu 24.04
+    `.ko.zst` modules could not be decompressed; fixed by using `chroot $MNT zstd`
+  - PATH prepend in `/etc/environment` was not idempotent → added grep guard
+  - `mnt.mount` systemd unit for virtiofs share was missing from provisioning script;
+    was only in the old disk from a forgotten manual step; added explicitly
+  - Also fixed: backtick in comment caused `vm: command not found` on every provisioning run
+
+- **Build VM rebuilt from scratch and verified** ✅
+  - Clean single PATH entry, virtiofs auto-mounted at `/mnt`, `cargo check` passes
+    with no `source /root/.cargo/env` prefix required
+
+- **Contributor documentation** ✅ — pelagos-mac PR #227
+  - `CONTRIBUTING.md` (new): two-repo split, full setup sequence, daily dev workflow,
+    key doc references
+  - `docs/INSTALL.md`: added Ubuntu build VM section (one-time provisioning + daily use)
+  - `README.md`: fixed wrong CLI syntax (`pelagos vm ssh --profile build` →
+    `pelagos --profile build vm ssh`), added CONTRIBUTING.md to docs table
+  - `docs/VM_PROFILES.md`: added `vm shell` vs `vm ssh` section; added build VM
+    workflow section; fixed virtiofs mount claim (auto-mounted, no manual step)
+  - `docs/ARCHITECTURE_MENTAL_MODEL.md`: False Assumption 2 now honestly acknowledges
+    build VM is used in practice
+
+### Open PRs (as of 2026-04-14)
+
+| PR | Repo | Branch | Status |
+|---|---|---|---|
+| #201 | pelagos | `fix/image-auth-error-hint` | Open, ready to merge |
+| #227 | pelagos-mac | `docs/build-vm-and-ssh-clarifications` | Open, ready to merge |
 
 ### Completed this session (2026-04-09)
 

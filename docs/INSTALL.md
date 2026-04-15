@@ -104,6 +104,52 @@ The built binary runs directly from the workspace:
 It auto-discovers VM artifacts in `out/` when run from the workspace root (or
 when `out/` is in `../../../out` relative to the binary location).
 
+### Ubuntu build VM (for compiling pelagos)
+
+pelagos (the Linux container runtime that runs inside the VM) must be
+compiled on Linux — not cross-compiled from macOS. The `build` profile is
+a persistent Ubuntu 24.04 VM that serves as the native compilation
+environment. It is a one-time setup.
+
+**Why not cross-compile from macOS?** The Linux standard library is not
+available on macOS. `cargo check --target aarch64-unknown-linux-gnu` fails
+immediately on a macOS host.
+
+**First-time provisioning** (downloads Ubuntu 24.04, installs Rust toolchain,
+takes several minutes):
+
+```bash
+bash scripts/build-build-image.sh
+```
+
+This provisions `out/build.img` (a 20 GB Ubuntu disk image) and writes
+`~/.local/share/pelagos/profiles/build/vm.conf`. Only needs to be run
+once, or after a kernel/toolchain update.
+
+**Daily use:**
+
+```bash
+# Start the build VM (takes ~30 s for SSH to be ready on first boot)
+bash scripts/build-vm-start.sh
+
+# Build pelagos non-interactively
+pelagos --profile build vm ssh -- "cd /mnt/Projects/pelagos && cargo build --release"
+
+# Or open an interactive shell
+pelagos --profile build vm ssh
+
+# Stop when done (frees 4 GB RAM)
+pelagos --profile build vm stop
+```
+
+The macOS home directory is available at `/mnt` inside the build VM via
+virtiofs (auto-mounted by systemd on boot). The pelagos source tree is at
+`/mnt/Projects/pelagos`. Build artifacts land on the macOS filesystem and
+persist across VM restarts.
+
+See [VM_PROFILES.md](VM_PROFILES.md) for the full breakdown of the two VM
+profiles (Alpine container VM vs Ubuntu build VM) and how they differ.
+
 ### Testing
 
 ```bash

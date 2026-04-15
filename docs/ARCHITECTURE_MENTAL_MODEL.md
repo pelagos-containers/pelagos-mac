@@ -42,7 +42,7 @@ any Alpine-specific constraints.
 
 ## False Assumption 2: "We need a persistent build VM to compile pelagos"
 
-The reasoning that led here:
+The original reasoning that led here:
 
 1. Alpine uses musl libc (not glibc)
 2. pelagos links against libseccomp and libcap which require glibc
@@ -54,20 +54,18 @@ not link against libseccomp or libcap. It uses the pure-Rust
 `seccompiler` crate and raw `SYS_capset` syscalls. Both pelagos and
 pelagos-guest are static musl binaries, released as such.
 
-The correct answer: pelagos can be built inside a `rust:alpine` container
-in the default Alpine VM. No glibc needed. The source tree is mounted
-from macOS via virtiofs (`-v`). Build artifacts land on the macOS
-filesystem and persist across container restarts.
+**The architectural answer:** pelagos can be built inside a
+`debian:bookworm-slim` container in the default Alpine VM — no persistent
+VM is architecturally required. The source tree mounts from macOS via
+virtiofs; build artifacts land on the macOS filesystem and persist across
+container restarts.
 
-```bash
-pelagos run --rm \
-  -v $HOME/Projects/pelagos:/workspace \
-  -w /workspace \
-  debian:bookworm-slim \
-  bash -c "apt-get install -y build-essential libseccomp-dev libcap-dev && cargo build"
-```
-
-No persistent VM needed. The default Alpine VM runs this fine.
+**What we actually use:** The `build` profile (Ubuntu persistent VM) exists
+and is used in practice, not because it is architecturally necessary but
+because direct SSH access with a persistent toolchain is a more natural
+interactive workflow than running a container for every build. Both paths
+are valid; the build profile is simply more convenient for iterative
+development. See `VM_PROFILES.md` for the full comparison.
 
 ---
 
@@ -78,7 +76,7 @@ is a custom image — not a persistent VM. Write a Remfile:
 
 ```
 FROM debian:bookworm-slim
-RUN apt-get install -y build-essential libseccomp-dev libcap-dev pkg-config curl git
+RUN apt-get install -y build-essential pkg-config curl git
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ```
 
@@ -91,11 +89,16 @@ pelagos build -t my-build-env:latest
 Use it repeatedly:
 
 ```bash
-pelagos run --rm -v $HOME/Projects/pelagos:/workspace -w /workspace my-build-env:latest cargo build
+pelagos run -v $HOME/Projects/pelagos:/workspace my-build-env:latest \
+  sh -c "cd /workspace && cargo build"
 ```
 
 The toolchain is baked into the image. Source and artifacts persist on
 macOS via virtiofs. The default Alpine VM handles all of it.
+
+This is the architecturally clean answer. In practice the `build` profile
+is often more ergonomic for interactive work — but it is a convenience
+choice, not a requirement.
 
 ---
 

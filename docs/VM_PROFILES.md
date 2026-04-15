@@ -55,6 +55,50 @@ The two kernel cmdline flags are necessary for Ubuntu + AVF stability:
 Suited for: long-running builds that need a persistent toolchain, workflows
 where direct shell access (not container-mediated) is more natural.
 
+### Building pelagos in the build VM
+
+This is the standard workflow for compiling pelagos on macOS. Do not
+attempt to cross-compile from macOS — the Linux standard library is not
+available there, and `cargo check --target aarch64-unknown-linux-gnu` will
+fail immediately.
+
+**One critical fact about the build VM environment:**
+
+1. **Rust toolchain PATH.** `/root/.cargo/bin` is in PATH for all session
+   types — interactive, login, and non-interactive SSH — via `/etc/environment`,
+   `profile.d/rust.sh`, and `.bashrc`.
+
+2. **virtiofs mount.** The macOS home directory is available inside the VM
+   at `/mnt` via a virtiofs share tagged `share0`. It is auto-mounted by a
+   systemd unit (`mnt.mount`) on boot — no manual step needed. The pelagos
+   source tree is therefore at `/mnt/Projects/pelagos`.
+
+**Non-interactive commands (scripting / CI):**
+
+```bash
+# Full release build
+pelagos --profile build vm ssh -- "cd /mnt/Projects/pelagos && cargo build --release"
+
+# Clippy
+pelagos --profile build vm ssh -- "cd /mnt/Projects/pelagos && cargo clippy -- -D warnings"
+
+# Unit tests
+pelagos --profile build vm ssh -- "cd /mnt/Projects/pelagos && cargo test --lib"
+```
+
+**Interactive session (iterative development):**
+
+```bash
+pelagos --profile build vm ssh
+# Inside the VM:
+cd /mnt/Projects/pelagos
+cargo build --release
+```
+
+Build artifacts land on the macOS filesystem (via virtiofs) and persist
+across VM restarts. The VM disk only holds the installed toolchain and
+Ubuntu system packages — not build output.
+
 ---
 
 ## The Dividing Lines
@@ -73,6 +117,80 @@ where direct shell access (not container-mediated) is more natural.
 The key architectural difference: `default` routes everything through the
 pelagos vsock protocol; `build` bypasses it entirely and is a conventional
 SSH-accessible VM. They solve different problems.
+
+---
+
+## `vm shell` vs `vm ssh`
+
+Two commands provide interactive access; they work differently and apply
+to different profiles.
+
+### `pelagos vm shell`
+
+```bash
+pelagos vm shell                        # default profile
+pelagos --profile myprofile vm shell    # any vsock profile
+```
+
+Sends a `Shell` command over vsock to pelagos-guest, which forks a shell
+inside the VM. **Requires vsock + pelagos-guest** — works only for profiles
+with `ping_mode = vsock` (i.e. the `default` Alpine profile).
+
+Does **not** require an SSH key. No SSH involved at all.
+
+### `pelagos vm ssh`
+
+```bash
+pelagos vm ssh                          # default profile
+pelagos --profile build vm ssh          # build profile (most common use)
+pelagos --profile build vm ssh -- "cmd" # run a non-interactive command
+```
+
+Runs a real SSH session routed through the smoltcp NAT relay proxy — the
+host has no direct route to the VM's 192.168.105.2 address, so SSH is
+tunnelled through a local proxy port that pelagos manages. Works for **any**
+profile that has an SSH daemon, including the `default` Alpine profile
+(dropbear) and the `build` Ubuntu profile (openssh).
+
+**Requires `~/.local/share/pelagos/vm_key`** — an ed25519 key pair generated
+by `build-vm-image.sh` and baked into the VM image as `root/.ssh/authorized_keys`.
+The key is a global artifact shared by all profiles.
+
+### The key after a brew install or upgrade
+
+`vm_key` is **not shipped** in the Homebrew formula — it is generated once
+locally by `build-vm-image.sh` and lives only on the developer's machine.
+After a fresh install or a brew upgrade that replaces the VM image, the
+key baked into the new initramfs was generated in CI and is not available.
+
+To restore `vm ssh` access after a brew upgrade:
+
+```bash
+# Rebuild the default VM image locally — generates a new key pair and
+# bakes the public half into the initramfs:
+bash scripts/build-vm-image.sh
+
+# Re-initialise so the daemon picks up the new initramfs:
+pelagos vm stop
+pelagos vm init --force
+pelagos ping
+```
+
+The `build` profile's `build.img` has its `authorized_keys` updated by
+`build-build-image.sh` from the same key, so running `build-vm-image.sh`
+first (which sets the key) before `build-build-image.sh` keeps everything
+in sync.
+
+### Summary
+
+| | `vm shell` | `vm ssh` |
+|---|---|---|
+| Transport | vsock → pelagos-guest | SSH → smoltcp relay → VM port 22 |
+| Requires key | No | Yes (`~/.local/share/pelagos/vm_key`) |
+| Works on `default` (Alpine) | Yes | Yes (dropbear) |
+| Works on `build` (Ubuntu) | **No** (no pelagos-guest) | Yes (openssh) |
+| Non-interactive commands | No | Yes (`-- "cmd"`) |
+| Primary use case | Quick Alpine shell | Build VM access, scripted commands |
 
 ---
 
