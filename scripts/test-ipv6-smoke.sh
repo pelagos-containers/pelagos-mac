@@ -47,8 +47,12 @@ PELAGOS="$BINARY --profile $PROFILE --kernel $KERNEL --initrd $INITRD --disk $DI
 
 echo "=== IPv6 smoke test ==="
 
-# Stop the smoke VM when the script exits (pass or fail).
-cleanup() { $BINARY --profile "$PROFILE" vm stop 2>/dev/null || true; }
+ECHO_SERVER_PID=""
+# Stop the smoke VM and any background helpers when the script exits.
+cleanup() {
+    $BINARY --profile "$PROFILE" vm stop 2>/dev/null || true
+    [ -n "$ECHO_SERVER_PID" ] && kill "$ECHO_SERVER_PID" 2>/dev/null || true
+}
 trap cleanup EXIT
 
 # --- preflight ---------------------------------------------------------------
@@ -136,6 +140,27 @@ elif echo "$PING6_ULA" | grep -qE "[1-9] (packets )?received"; then
 else
     fail "ping6 $GW_ULA failed"
     echo "    output: $(echo "$PING6_ULA" | tail -3)"
+fi
+
+# --- Phase 3: IPv6 UDP proxy -------------------------------------------------
+# Start a Python UDP echo server on host ::1.  The VM sends a datagram to
+# ::1:<PORT> via the relay; the relay proxies it from the host, the echo
+# The relay echoes UDP datagrams to its own ULA address (fd00::1) locally —
+# no external server or host IPv6 required.  This tests the full IPv6 UDP
+# frame receive + reply synthesis path through the relay.
+echo ""
+echo "--- Phase 3: IPv6 UDP (VM → relay fd00::1 local echo) ---"
+
+UDP_PORT=15353
+
+printf "  IPv6 UDP round-trip to relay fd00::1:%d... " "$UDP_PORT"
+UDP_OUT=$($PELAGOS vm ssh -- \
+    "echo -n ping6udp | nc -u -w 5 fd00::1 $UDP_PORT 2>/dev/null" 2>/dev/null || true)
+if [ "$UDP_OUT" = "ping6udp" ]; then
+    pass "UDP echo via relay: got expected reply"
+else
+    fail "UDP echo via relay: expected 'ping6udp', got '${UDP_OUT}'"
+    echo "    (relay log tail: $(tail -3 ~/.local/share/pelagos/profiles/${PROFILE}/daemon.log 2>/dev/null))"
 fi
 
 # --- summary -----------------------------------------------------------------

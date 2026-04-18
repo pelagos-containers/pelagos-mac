@@ -454,6 +454,9 @@ fn pre_scan_frames(
         if handle_udp_frame(device.relay_fd, &frame) {
             continue;
         }
+        if handle_udp_frame_v6(device.relay_fd, &frame) {
+            continue;
+        }
 
         // For TCP SYNs, ensure a listener exists on the destination port.
         if let Some(dst_port) = tcp_syn_dst_port(&frame) {
@@ -1229,6 +1232,145 @@ fn send_udp_reply(
 fn udp_proxy_once(data: &[u8], dest: SocketAddr) -> Result<Vec<u8>, std::io::Error> {
     let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
     let sock = UdpSocket::bind(bind_addr)?;
+    sock.set_read_timeout(Some(Duration::from_secs(2)))?;
+    sock.send_to(data, dest)?;
+    let mut buf = vec![0u8; 8192];
+    let (n, _) = sock.recv_from(&mut buf)?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+// ---------------------------------------------------------------------------
+// IPv6 UDP raw handler (Phase 3)
+// ---------------------------------------------------------------------------
+
+/// If `frame` is an IPv6 UDP datagram, proxy it to the real host destination
+/// and send the reply back to the VM.  Returns true if the frame was consumed.
+///
+/// IPv6 UDP checksum is mandatory (RFC 2460 §8.1).  Extension headers are not
+/// supported — frames with a next-header other than 17 (UDP) pass through.
+fn handle_udp_frame_v6(relay_fd: RawFd, frame: &[u8]) -> bool {
+    // Ethernet(14) + IPv6(40) + UDP(8) = 62 bytes minimum.
+    if frame.len() < 62 {
+        return false;
+    }
+    if frame[12] != 0x86 || frame[13] != 0xdd {
+        return false;
+    }
+    // IPv6 next header: 17 = UDP.  Extension headers are not handled.
+    if frame[14 + 6] != 17 {
+        return false;
+    }
+    let udp_off = 14 + 40; // = 54
+    let udp_len = u16::from_be_bytes([frame[udp_off + 4], frame[udp_off + 5]]) as usize;
+    if udp_len < 8 || udp_off + udp_len > frame.len() {
+        return false;
+    }
+
+    let src_port = u16::from_be_bytes([frame[udp_off],     frame[udp_off + 1]]);
+    let dst_port = u16::from_be_bytes([frame[udp_off + 2], frame[udp_off + 3]]);
+    let src_ip: [u8; 16] = frame[14 +  8..14 + 24].try_into().unwrap();
+    let dst_ip: [u8; 16] = frame[14 + 24..14 + 40].try_into().unwrap();
+    let payload = frame[udp_off + 8..udp_off + udp_len].to_vec();
+
+    let dest_addr = SocketAddr::new(
+        std::net::IpAddr::V6(std::net::Ipv6Addr::from(dst_ip)),
+        dst_port,
+    );
+
+    log::info!("nat_relay: IPv6 UDP frame: src_port={} dst={}", src_port, dest_addr);
+
+    let src_mac: [u8; 6] = frame[6..12].try_into().unwrap();
+    let dst_mac: [u8; 6] = frame[0..6].try_into().unwrap();
+
+    // UDP destined to the relay's own ULA address (fd00::1) is handled locally.
+    // fd00::1 is the relay endpoint — there is no external host to proxy to.
+    // Echo the payload back so the VM can use fd00::1 as a reachability probe.
+    if dst_ip == GATEWAY_IP6_ULA_BYTES {
+        log::info!("nat_relay: UDP6 to fd00::1 — echoing locally");
+        send_udp_reply_v6(relay_fd, &src_mac, &dst_mac, &payload,
+                          src_ip, dst_ip, src_port, dst_port);
+        return true;
+    }
+
+    std::thread::Builder::new()
+        .name(format!("udp6-{dst_port}"))
+        .spawn(move || match udp_proxy_once_v6(&payload, dest_addr) {
+            Ok(reply) => send_udp_reply_v6(
+                relay_fd, &src_mac, &dst_mac, &reply,
+                src_ip, dst_ip, src_port, dst_port,
+            ),
+            Err(e) => log::debug!("nat_relay: UDP6 proxy to {} failed: {}", dest_addr, e),
+        })
+        .ok();
+
+    true
+}
+
+/// Synthesize an IPv6 UDP reply Ethernet frame and send it back to the VM.
+#[allow(clippy::too_many_arguments)]
+fn send_udp_reply_v6(
+    relay_fd: RawFd,
+    orig_src_mac: &[u8; 6],   // Ethernet src of the original request (VM MAC)
+    orig_dst_mac: &[u8; 6],   // Ethernet dst of the original request (relay MAC)
+    reply_payload: &[u8],
+    orig_src_ip: [u8; 16],
+    orig_dst_ip: [u8; 16],
+    orig_src_port: u16,
+    orig_dst_port: u16,
+) {
+    let udp_len = 8 + reply_payload.len();
+    let mut reply = vec![0u8; 14 + 40 + udp_len];
+
+    // Ethernet: swap src/dst MACs.
+    reply[..6].copy_from_slice(orig_src_mac);   // dst ← VM MAC
+    reply[6..12].copy_from_slice(orig_dst_mac); // src ← relay MAC
+    reply[12] = 0x86;
+    reply[13] = 0xdd;
+
+    // IPv6 header (fixed 40 bytes).
+    reply[14] = 0x60; // version=6, TC=0, flow=0
+    let payload_len = udp_len as u16;
+    reply[18] = (payload_len >> 8) as u8;
+    reply[19] = (payload_len & 0xff) as u8;
+    reply[20] = 17;  // next header = UDP
+    reply[21] = 64;  // hop limit
+    reply[22..38].copy_from_slice(&orig_dst_ip); // src ← original dst
+    reply[38..54].copy_from_slice(&orig_src_ip); // dst ← original src
+
+    // UDP header.
+    let udp_off = 54;
+    reply[udp_off]     = (orig_dst_port >> 8) as u8;
+    reply[udp_off + 1] = (orig_dst_port & 0xff) as u8;
+    reply[udp_off + 2] = (orig_src_port >> 8) as u8;
+    reply[udp_off + 3] = (orig_src_port & 0xff) as u8;
+    reply[udp_off + 4] = (payload_len >> 8) as u8;
+    reply[udp_off + 5] = (payload_len & 0xff) as u8;
+    // Checksum slot zeroed; computed below.
+    reply[udp_off + 8..].copy_from_slice(reply_payload);
+
+    // IPv6 UDP checksum is mandatory (RFC 2460 §8.1, RFC 768).
+    // Pseudo-header: new-src(16) + new-dst(16) + UDP-length(4) + 0x00 0x00 0x00 17
+    let mut pseudo: Vec<u8> = Vec::with_capacity(40 + udp_len);
+    pseudo.extend_from_slice(&orig_dst_ip);                        // new src
+    pseudo.extend_from_slice(&orig_src_ip);                        // new dst
+    pseudo.extend_from_slice(&(udp_len as u32).to_be_bytes());
+    pseudo.extend_from_slice(&[0x00, 0x00, 0x00, 17u8]);
+    pseudo.extend_from_slice(&reply[udp_off..]);
+    let cksum = inet_checksum(&pseudo);
+    // RFC 768: transmit 0xffff when the computed value is zero.
+    let cksum = if cksum == 0 { 0xffff } else { cksum };
+    reply[udp_off + 6] = (cksum >> 8) as u8;
+    reply[udp_off + 7] = (cksum & 0xff) as u8;
+
+    unsafe {
+        libc::send(relay_fd, reply.as_ptr() as _, reply.len(), 0);
+    }
+}
+
+/// Send a single IPv6 UDP datagram to `dest` and return the reply.
+fn udp_proxy_once_v6(data: &[u8], dest: SocketAddr) -> Result<Vec<u8>, std::io::Error> {
+    let sock = UdpSocket::bind("[::]:0")?;
     sock.set_read_timeout(Some(Duration::from_secs(2)))?;
     sock.send_to(data, dest)?;
     let mut buf = vec![0u8; 8192];
