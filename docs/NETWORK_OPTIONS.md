@@ -397,3 +397,91 @@ market share and the framework has a security track record.
   install step. Replaced by the zero-dependency smoltcp relay.
 - **Option 4 (Bridged):** Wrong security model for developer container tooling.
 - **Option 7 (Kexts):** Dead.
+
+---
+
+## IPv6 Status and Phase 4 Design Decision
+
+*Added 2026-04-18. Tracks issue #229.*
+
+### What works today (Phases 1–3)
+
+The relay is dual-stack. The VM has a static ULA address (`fd00::2/64`) and a
+dynamic EUI-64 link-local. The relay holds `fd00::1/64` and a dynamic gateway LL.
+
+| Traffic | How it works | Status |
+|---|---|---|
+| `ping6 fd00::1` or `ping6 <gateway-LL>` | Relay synthesises reply directly | ✅ Works |
+| `ping6 <external>` from VM | Not answered — would fake reachability | ✅ Correctly rejected |
+| UDP from VM to external IPv6 host | Proxied via `UdpSocket::bind("[::]:0")` on host | ✅ Works if host has IPv6 |
+| UDP from VM to `fd00::1` | Echoed locally by relay | ✅ Works |
+| TCP from VM to external IPv6 host | smoltcp completes handshake, data dead-ends | ❌ Not proxied |
+| `ping6 <external>` from container | Packet routed to relay, relay drops it | ❌ No path out |
+
+The VZ MLD snooping constraint applies to all of the above: the relay cannot receive
+IPv6 frames via multicast unless VZ's virtual switch has already registered the relay
+as a member of the relevant solicited-node group. The workaround — advertising a
+multicast MAC as the TLLA in NDP Neighbor Advertisements — is in place for all relay
+addresses. Any new relay address requires the same treatment.
+
+### Phase 4: outbound IPv6 to the internet
+
+Three approaches, each with different tradeoffs:
+
+#### Option A — pf NAT66 (kernel)
+
+Add a `pf` anchor rule that rewrites the source of packets from `fd00::2` to the
+host's real global IPv6 address before they leave `en0`.
+
+```
+# /etc/pf.anchors/pelagos-nat66
+nat on en0 inet6 from fd00::/64 to any -> (en0)
+```
+
+**Pros:** Works for all protocols (TCP, UDP, ICMPv6) without any per-protocol relay
+code. Performance is kernel-level.
+
+**Cons:** Requires `sudo pfctl` to load the anchor — a privileged operation.
+Installs a persistent system-level rule that outlives the VM. Requires the host
+to have a real global IPv6 address; won't work on IPv4-only networks. Adds a
+`pf` dependency that contradicts the zero-external-dependency design principle.
+
+#### Option B — tun interface + userspace SNAT
+
+Create a `utun` interface on the host, assign an IPv6 address to it, configure
+the relay to write outbound VM packets into the tun fd with a rewritten source
+address, and let the host kernel route them out.
+
+**Pros:** Fully userspace, no `pf` involvement. Works for all protocols.
+
+**Cons:** `utun` creation on macOS requires the `com.apple.net.utun-control` IOCTL,
+which works from unprivileged processes but is not straightforward. Managing the
+tun fd inside the relay's poll loop adds significant complexity. The source address
+must be an address the host kernel accepts as a legitimate local source, which
+requires also assigning it to the tun interface.
+
+#### Option C — per-protocol raw-socket proxy (incremental)
+
+Extend the existing per-protocol proxy pattern:
+- ICMPv6 echo to external: open a raw IPv6 ICMP socket, send the probe, wait for
+  real reply, forward back to VM. macOS raw ICMPv6 sockets require no privilege
+  for echo (`SOCK_DGRAM` + `IPPROTO_ICMPV6`).
+- TCP outbound: full bidirectional proxy (connect to real destination from host,
+  splice with smoltcp TCP socket). Harder than UDP because TCP is stateful and
+  bidirectional.
+
+**Pros:** No privilege, no new dependencies, no system-level rules. Incremental —
+ICMPv6 echo can be done today; TCP is a separate effort.
+
+**Cons:** Each protocol requires explicit implementation. Does not handle protocols
+the relay doesn't know about (future protocols, raw IP, etc.).
+
+### Current position
+
+Option C (per-protocol) for ICMPv6 echo is low-hanging fruit and can be done without
+any design risk. Option A (pf NAT66) solves everything at once but requires privilege
+and adds a system dependency. Option B (tun) is the best long-term answer if general
+protocol coverage is needed without privilege, but the implementation cost is high.
+
+No decision has been made. Phase 4 is deferred pending alignment on which approach
+fits the zero-dependency architecture goal.

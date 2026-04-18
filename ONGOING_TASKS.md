@@ -151,8 +151,30 @@ to any client connecting at any time. `pelagos vm console [--profile build]` wor
   - Phase 2: `pelagos image ls|pull|rm|tag|inspect` CLI subcommands; `ls` defaults to human-readable table, `--json` for machine output; `inspect` filters client-side by reference
   - Phase 3: TUI image screen (`I`): browse, pull (`p`), delete with confirm (`d`), inspect JSON overlay (`Enter`), `R` pre-fills run palette with selected image
 
+### Completed this session (2026-04-18)
+
+- **IPv6 / dual-stack NAT relay — issue #229** (PR open, branch `feat/ipv6-relay`)
+  - Phase 1: smoltcp dual-stack (`proto-ipv6`); dynamic gateway LL derived from VM MAC
+    (`fe80::00ff:fe{MAC[3..5]}`) to work around VZ MLD snooping; ICMPv6 echo handler;
+    NDP Neighbor Advertisement handler; 14 unit tests.
+  - Phase 2: ULA addressing — relay holds `fd00::1/64`, VM assigned `fd00::2/64` in init script;
+    manual NA handler for ULA (same VZ MLD snooping constraint as LL).
+  - Phase 3: IPv6 UDP raw handler (`handle_udp_frame_v6`); `fd00::1` UDP echoed locally;
+    external destinations proxied via `[::]:0` host socket.
+  - Bug fix: `icmpv6_echo_reply` previously faked replies to ANY destination, including external
+    internet addresses — silently lying about IPv6 reachability. Now restricted to relay's own
+    addresses only.
+  - Smoke test: `scripts/test-ipv6-smoke.sh` — 6/6 passing (Phase 1 LL echo, Phase 2 ULA echo,
+    Phase 3 UDP round-trip).
+  - **Phase 4 blocked**: outbound IPv6 TCP (VM→internet) and ICMPv6/UDP to external destinations
+    require either pf NAT66, a tun interface with userspace SNAT, or per-protocol raw-socket
+    proxying. Design decision needed before implementation. See `docs/NETWORK_OPTIONS.md §IPv6`.
+
 ### Next priorities
 
+- **Phase 4 — IPv6 outbound (issue #229)**: design decision required. Options: pf NAT66 (kernel,
+  privileged), tun+SNAT (userspace, no privilege), per-protocol raw socket proxy (no privilege,
+  incremental). See `docs/NETWORK_OPTIONS.md §IPv6` for full analysis.
 - **Home monitoring stack** — core stack (prometheus + alertmanager + grafana) running end-to-end. Full 8-service stack (`compose.reml`) needs `.env` with real credentials (MIKROTIK_PASSWORD, TRUENAS_API_KEY, PLEX_TOKEN, GF_SMTP_PASSWORD). Once credentials in place: verify all exporters up, import Grafana dashboards from k8s setup.
 - **Epic #135 — pelagos-ui** — Tauri + Svelte macOS management GUI (new). M1: container list. Blocked on #98 (JSON ps output).
 - **Port forwarding** ✅ — `pelagos run -p 8080:80 nginx:alpine` + `curl http://localhost:8080/`
