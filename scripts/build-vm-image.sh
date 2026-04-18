@@ -1136,7 +1136,20 @@ busybox ip link set lo up
 busybox ip link set eth0 up
 busybox ip addr add 192.168.105.2/24 dev eth0
 busybox ip route add default via 192.168.105.1
-echo "[pelagos-init] network: static 192.168.105.2/24"
+# Join the gateway's solicited-node multicast group (ff02::1:ff00:01) by assigning a
+# secondary IPv6 address whose last 3 bytes are 00:00:01.  The kernel automatically
+# emits an MLD Report for ff02::1:ff00:01 when this address is added, which VZ's
+# virtual switch records via MLD snooping.  Once VZ sees the VM as a member of
+# ff02::1:ff00:01, it delivers two critical frame types to the nat_relay socket:
+#   1. NDP Neighbor Solicitations for the gateway (fe80::ff:fe00:1) — dst ff02::1:ff00:01
+#   2. ICMPv6 echo requests sent with Ethernet dst 33:33:ff:00:00:01 (the TLLA
+#      advertised by the relay in its Neighbor Advertisement)
+# Without this, VZ's MLD snooping drops all ff02::1:ff00:01 multicast before it
+# reaches the relay because the relay's own MLD Reports are ignored (treated as
+# router-port traffic, not host-port traffic).
+# fdfe:: is a valid ULA prefix (fc00::/7); /128 avoids polluting the routing table.
+busybox ip -6 addr add fdfe::1/128 dev eth0 2>/dev/null || true
+echo "[pelagos-init] network: static 192.168.105.2/24 + joined ff02::1:ff00:01 via fdfe::1/128"
 # Enable IP forwarding unconditionally — this is a container runtime VM.
 # pelagos port-forwarding uses nftables DNAT in PREROUTING to redirect
 # host-port connections to the container IP, which requires ip_forward=1

@@ -44,7 +44,9 @@ use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{DeviceCapabilities, Medium};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
+use smoltcp::wire::{
+    EthernetAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv6Address,
+};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -118,6 +120,16 @@ struct AvfDevice {
     /// Any frame that arrives *during* `iface.poll()` is also pushed here
     /// so it gets the full pre-scan treatment on the next cycle.
     pending_frames: VecDeque<Vec<u8>>,
+    /// VM's MAC address, learned from the source MAC of the first received frame.
+    /// VZ's virtual switch only forwards unicast frames back to the VM (broadcast
+    /// and multicast sent by the relay are dropped by the switch).  Once we have
+    /// the guest MAC we use it as the Ethernet dst for keepalive and NDP frames.
+    guest_mac: Option<[u8; 6]>,
+    /// Dynamic gateway IPv6 link-local, computed from guest_mac via
+    /// `gateway_ip6_for_vm_mac`.  None until the first MAC is learned.
+    gateway_ip6_ll: Option<[u8; 16]>,
+    /// Solicited-node multicast MAC for gateway_ip6_ll.  None until first MAC.
+    gateway_ip6_mcast_mac: Option<[u8; 6]>,
 }
 
 impl AvfDevice {
@@ -126,6 +138,9 @@ impl AvfDevice {
             relay_fd,
             rx_buf: vec![0u8; 64 * 1024],
             pending_frames: VecDeque::new(),
+            guest_mac: None,
+            gateway_ip6_ll: None,
+            gateway_ip6_mcast_mac: None,
         }
     }
 }
@@ -179,7 +194,10 @@ impl smoltcp::phy::Device for AvfDevice {
         }
 
         // Any frame arriving *during* iface.poll() bypassed pre_scan.
-        // Buffer it for the next cycle so SYN detection can run on it.
+        // Handle NDP and ICMPv6 echo inline (same as pre_scan_frames) so they
+        // are not handed to smoltcp, which cannot resolve the guest MAC via NDP
+        // (VZ MLD snooping blocks solicited-node NS from reaching the relay).
+        // Buffer everything else for the next cycle so SYN detection can run.
         let r = unsafe {
             libc::recv(
                 self.relay_fd,
@@ -189,8 +207,18 @@ impl smoltcp::phy::Device for AvfDevice {
             )
         };
         if r > 0 {
-            self.pending_frames
-                .push_back(self.rx_buf[..r as usize].to_vec());
+            let frame = self.rx_buf[..r as usize].to_vec();
+            if frame.len() >= 14 {
+                let et = u16::from_be_bytes([frame[12], frame[13]]);
+                log::trace!("nat_relay: recv-during-poll frame len={} ethertype=0x{:04x} dst_mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    r, et, frame[0], frame[1], frame[2], frame[3], frame[4], frame[5]);
+            }
+            if !ndp_neighbor_advertisement(self.relay_fd, &frame,
+                    self.gateway_ip6_ll.as_ref(), self.gateway_ip6_mcast_mac.as_ref())
+                && !icmpv6_echo_reply(self.relay_fd, &frame)
+            {
+                self.pending_frames.push_back(frame);
+            }
         }
         None
     }
@@ -236,10 +264,41 @@ struct TcpConn {
 // Main relay loop
 // ---------------------------------------------------------------------------
 
-/// Gateway IP: the relay pretends to be a router at this address.
+/// Gateway IPv4: the relay pretends to be a router at this address.
 const GATEWAY_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 168, 105, 1);
 /// Fabricated MAC for the gateway (locally administered, unicast).
 const GATEWAY_MAC: EthernetAddress = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+/// Gateway link-local IPv6 address derived from GATEWAY_MAC via EUI-64.
+///
+/// MAC  02:00:00:00:00:01
+///   Flip U/L bit (bit 1 of first byte): 0x02 → 0x00
+///   Insert ff:fe:  00:00:00:ff:fe:00:00:01
+///   Prepend fe80:  fe80::00ff:fe00:0001  (i.e. fe80::ff:fe00:1)
+const GATEWAY_IP6_LL: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0x00ff, 0xfe00, 0x0000, 0x0001);
+/// Compute the dynamic gateway IPv6 link-local address for a given VM MAC.
+///
+/// VZ's virtual switch uses MLD snooping: it only delivers IPv6 multicast to
+/// a port if that port has sent an MLD Membership Report for that group.  The
+/// relay's own MLD Reports are ignored (relay is on the "router port").  The
+/// VM, however, automatically joins the solicited-node multicast group for its
+/// own link-local address — and VZ delivers that group to the relay too.
+///
+/// By choosing a gateway address whose last 3 bytes match VM_MAC[3..6], the
+/// gateway's solicited-node group is identical to the VM's own group.  VZ then
+/// delivers both NDP NS frames and ICMPv6 echo requests (sent to the gateway's
+/// solicited-node multicast MAC) to the relay.
+///
+/// Formula: fe80::00ff:fe{MAC[3]}:{MAC[4]}{MAC[5]}
+fn gateway_ip6_for_vm_mac(vm_mac: [u8; 6]) -> [u8; 16] {
+    [0xfe, 0x80, 0, 0, 0, 0, 0, 0,
+     0x00, 0x00, 0x00, 0xff, 0xfe, vm_mac[3], vm_mac[4], vm_mac[5]]
+}
+
+/// Compute the solicited-node multicast MAC for the dynamic gateway LL.
+/// Result: 33:33:ff:{VM_MAC[3]}:{VM_MAC[4]}:{VM_MAC[5]}
+fn gateway_ip6_mcast_mac_for_vm_mac(vm_mac: [u8; 6]) -> [u8; 6] {
+    [0x33, 0x33, 0xff, vm_mac[3], vm_mac[4], vm_mac[5]]
+}
 
 /// Receive buffer per smoltcp TCP socket (bytes).
 /// Large enough to avoid stalling downloads during poll-loop iterations.
@@ -289,10 +348,77 @@ fn pre_scan_frames(
         }
         let len = r as usize;
         let frame = frame_buf[..len].to_vec();
+        if frame.len() >= 14 {
+            let et = u16::from_be_bytes([frame[12], frame[13]]);
+            log::trace!("nat_relay: recv frame len={} ethertype=0x{:04x} dst_mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                len, et, frame[0], frame[1], frame[2], frame[3], frame[4], frame[5]);
+            // Learn guest MAC from ARP frames (Ethertype 0x0806).
+            // ARP is the first unicast protocol the VM uses — the src MAC in the
+            // ARP request is definitely the VM's real eth0 MAC.
+            // Do NOT learn from MLD (0x86dd with dst 33:33:00:00:00:16) because
+            // VZ sends MLD Membership Reports with its own internal proxy MAC.
+            if et == 0x0806 {
+                let src: [u8; 6] = frame[6..12].try_into().unwrap();
+                if src[0] & 0x01 == 0 && src != [0u8; 6] && device.guest_mac != Some(src) {
+                    log::info!("nat_relay: learned guest MAC from ARP: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                        src[0], src[1], src[2], src[3], src[4], src[5]);
+                    device.guest_mac = Some(src);
+                    let gw6 = gateway_ip6_for_vm_mac(src);
+                    log::info!("nat_relay: gateway IPv6 LL = fe80::00ff:fe{:02x}:{:02x}{:02x}",
+                        src[3], src[4], src[5]);
+                    device.gateway_ip6_ll = Some(gw6);
+                    device.gateway_ip6_mcast_mac = Some(gateway_ip6_mcast_mac_for_vm_mac(src));
+                }
+            }
+        }
 
         // Handle ICMP echo requests inline — reply and discard.
         if icmp_echo_reply(device.relay_fd, &frame) {
             continue;
+        }
+        // Handle ICMPv6 echo requests inline — reply and discard.
+        if icmpv6_echo_reply(device.relay_fd, &frame) {
+            continue;
+        }
+        // Handle NDP Neighbor Solicitations targeting the gateway — reply and discard.
+        if ndp_neighbor_advertisement(device.relay_fd, &frame,
+                device.gateway_ip6_ll.as_ref(), device.gateway_ip6_mcast_mac.as_ref()) {
+            continue;
+        }
+        // Detect DAD NS (source IPv6 = ::, ICMPv6 type = 135).
+        // The VM sends DAD when its link-local address comes up.  This frame
+        // reaches the relay because the VM has joined its own solicited-node
+        // multicast group (VZ MLD snooping forwards it).  Use it as a timing
+        // trigger to immediately send a UNA for the gateway so the VM's
+        // neighbor cache is seeded before it first tries to contact fe80::ff:fe00:1.
+        //
+        // IMPORTANT: VZ also sends MLD Membership Reports on behalf of the VM
+        // using an internal proxy MAC (different from the VM's eth0 MAC).
+        // Guest MAC learned from MLD frames would be wrong.  The NDP DAD frame
+        // itself is sent by the VM's kernel with the actual eth0 MAC, so we
+        // always extract the src MAC from the DAD frame directly and update
+        // device.guest_mac to ensure the UNA is unicast to the right address.
+        if is_dad_ns(&frame) {
+            if frame.len() >= 12 {
+                let ndp_src_mac: [u8; 6] = frame[6..12].try_into().unwrap();
+                if ndp_src_mac[0] & 0x01 == 0 && ndp_src_mac != [0u8; 6] {
+                    if device.guest_mac != Some(ndp_src_mac) {
+                        log::info!("nat_relay: updated guest MAC from DAD NS: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                            ndp_src_mac[0], ndp_src_mac[1], ndp_src_mac[2],
+                            ndp_src_mac[3], ndp_src_mac[4], ndp_src_mac[5]);
+                        device.guest_mac = Some(ndp_src_mac);
+                        let gw6 = gateway_ip6_for_vm_mac(ndp_src_mac);
+                        log::info!("nat_relay: gateway IPv6 LL = fe80::00ff:fe{:02x}:{:02x}{:02x} (from DAD NS)",
+                            ndp_src_mac[3], ndp_src_mac[4], ndp_src_mac[5]);
+                        device.gateway_ip6_ll = Some(gw6);
+                        device.gateway_ip6_mcast_mac = Some(gateway_ip6_mcast_mac_for_vm_mac(ndp_src_mac));
+                    }
+                }
+            }
+            log::debug!("nat_relay: DAD NS detected — sending immediate NDP NA for gateway");
+            if let (Some(gw6), Some(gw_mcast_mac)) = (device.gateway_ip6_ll, device.gateway_ip6_mcast_mac) {
+                send_ndp_unsolicited_na(device.relay_fd, device.guest_mac, &gw6, &gw_mcast_mac);
+            }
         }
 
         // Handle UDP datagrams inline — proxy to real host, reply in thread.
@@ -362,6 +488,80 @@ fn send_arp_keepalive(relay_fd: RawFd) {
     log::debug!("nat_relay: sent ARP keepalive for 192.168.105.2");
 }
 
+/// Send an Unsolicited Neighbor Advertisement (UNA) for GATEWAY_IP6_LL to
+/// the all-nodes multicast address (ff02::1).
+///
+/// Apple's VZ virtual switch performs MLD snooping.  If no node on the relay
+/// side has joined the solicited-node multicast group ff02::1:ff00:1, the
+/// switch will drop Neighbor Solicitation frames destined to that group before
+/// they reach the relay socket.  Sending periodic UNAs proactively populates
+/// the VM kernel's neighbor cache so it never needs to send an NS for the
+/// gateway link-local address in the first place — mirroring how IPv4 uses
+/// gratuitous ARP.
+///
+/// UNA format: NA (type 136) with S=0 (unsolicited), O=1 (override),
+/// target = GATEWAY_IP6_LL, Target Link-Layer Address option = GATEWAY_MAC.
+fn send_ndp_unsolicited_na(relay_fd: RawFd, guest_mac: Option<[u8; 6]>, gw6: &[u8; 16], gw_mcast_mac: &[u8; 6]) {
+    let gw_mac = GATEWAY_MAC.0;
+    let gw6 = *gw6;
+
+    // Prefer unicast Ethernet dst (guest MAC) so the frame is not subject to
+    // VZ's virtual-switch multicast/broadcast filtering.  Fall back to the
+    // all-nodes multicast address if the guest MAC is not yet known.
+    let all_nodes_mac: [u8; 6] = [0x33, 0x33, 0x00, 0x00, 0x00, 0x01];
+    let eth_dst = guest_mac.unwrap_or(all_nodes_mac);
+
+    let all_nodes_ip6: [u8; 16] = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+
+    // 14 (Eth) + 40 (IPv6) + 32 (ICMPv6 NA with TLLA option) = 86 bytes.
+    let icmpv6_len: u16 = 32;
+    let mut f = vec![0u8; 86];
+
+    // Ethernet.
+    f[0..6].copy_from_slice(&eth_dst);
+    f[6..12].copy_from_slice(&gw_mac);
+    f[12] = 0x86;
+    f[13] = 0xdd;
+
+    // IPv6 header.
+    f[14] = 0x60;
+    f[18] = (icmpv6_len >> 8) as u8;
+    f[19] = (icmpv6_len & 0xff) as u8;
+    f[20] = 58;  // ICMPv6
+    f[21] = 255; // hop limit
+    f[22..38].copy_from_slice(&gw6);      // src = GATEWAY_IP6_LL
+    f[38..54].copy_from_slice(&all_nodes_ip6); // dst = ff02::1
+
+    // ICMPv6 NA: type=136, code=0, flags O=1 (unsolicited: S=0).
+    let na_off = 54;
+    f[na_off] = 136;
+    f[na_off + 4] = 0x20; // O flag only (bit 29 of 32-bit flags field)
+    f[na_off + 8..na_off + 24].copy_from_slice(&gw6); // target
+    // Advertise dynamic gateway multicast MAC as TLLA (see ndp_neighbor_advertisement for rationale).
+    f[na_off + 24] = 2; // option: Target Link-Layer Address
+    f[na_off + 25] = 1; // length = 1 (8 bytes)
+    f[na_off + 26..na_off + 32].copy_from_slice(gw_mcast_mac);
+
+    // ICMPv6 pseudo-header checksum.
+    let mut pseudo: Vec<u8> = Vec::with_capacity(40 + 32);
+    pseudo.extend_from_slice(&gw6);
+    pseudo.extend_from_slice(&all_nodes_ip6);
+    pseudo.extend_from_slice(&(icmpv6_len as u32).to_be_bytes());
+    pseudo.extend_from_slice(&[0x00, 0x00, 0x00, 58u8]);
+    pseudo.extend_from_slice(&f[na_off..]);
+    let cksum = inet_checksum(&pseudo);
+    f[na_off + 2] = (cksum >> 8) as u8;
+    f[na_off + 3] = (cksum & 0xff) as u8;
+
+    let ret = unsafe { libc::send(relay_fd, f.as_ptr() as _, f.len(), 0) };
+    if ret < 0 {
+        log::debug!("nat_relay: send NDP unsolicited NA failed: {}", std::io::Error::last_os_error());
+    } else {
+        log::debug!("nat_relay: sent NDP unsolicited NA (eth_dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
+            eth_dst[0], eth_dst[1], eth_dst[2], eth_dst[3], eth_dst[4], eth_dst[5]);
+    }
+}
+
 fn run_relay(relay_fd: RawFd, relay_proxy_port: u16, inbound_rx: Receiver<(TcpStream, u16)>) {
     let mut device = AvfDevice::new(relay_fd);
 
@@ -374,6 +574,15 @@ fn run_relay(relay_fd: RawFd, relay_proxy_port: u16, inbound_rx: Receiver<(TcpSt
         addrs
             .push(IpCidr::new(IpAddress::Ipv4(GATEWAY_IP), 24))
             .ok();
+        // Link-local IPv6 address derived from GATEWAY_MAC via EUI-64:
+        //   MAC  02:00:00:00:00:01
+        //   → flip U/L bit: 00:00:00:ff:fe:00:00:01
+        //   → fe80::ff:fe00:1
+        // smoltcp handles NDP (Neighbor Solicitation/Advertisement) automatically
+        // once a link-local address is configured — no manual NS/NA synthesis needed.
+        addrs
+            .push(IpCidr::new(IpAddress::Ipv6(GATEWAY_IP6_LL), 64))
+            .ok();
     });
     // any_ip=true alone is not enough: smoltcp also requires a route to the
     // destination that resolves to one of our own IPs.  A default route
@@ -381,7 +590,11 @@ fn run_relay(relay_fd: RawFd, relay_proxy_port: u16, inbound_rx: Receiver<(TcpSt
     iface
         .routes_mut()
         .add_default_ipv4_route(GATEWAY_IP)
-        .expect("add default route");
+        .expect("add default IPv4 route");
+    iface
+        .routes_mut()
+        .add_default_ipv6_route(GATEWAY_IP6_LL)
+        .expect("add default IPv6 route");
 
     let mut sockets = SocketSet::new(vec![]);
 
@@ -413,6 +626,16 @@ fn run_relay(relay_fd: RawFd, relay_proxy_port: u16, inbound_rx: Receiver<(TcpSt
     let mut last_arp_keepalive = std::time::Instant::now()
         .checked_sub(ARP_KEEPALIVE_INTERVAL)
         .unwrap_or_else(std::time::Instant::now);
+
+    // NDP unsolicited NA: Periodically send an unsolicited NA so the VM's
+    // neighbor cache is seeded for the gateway link-local address.  Sent
+    // only after the gateway LL is computed from the VM MAC.  First NA at
+    // T+3 s and every 30 s thereafter (Linux base_reachable_time).
+    const NDP_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+    const NDP_KEEPALIVE_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+    let ndp_keepalive_start = std::time::Instant::now() + NDP_KEEPALIVE_INITIAL_DELAY;
+    let mut last_ndp_keepalive: std::time::Instant =
+        ndp_keepalive_start - NDP_KEEPALIVE_INTERVAL;
 
     log::info!(
         "nat_relay: poll loop started (proxy_port={})",
@@ -630,11 +853,20 @@ fn run_relay(relay_fd: RawFd, relay_proxy_port: u16, inbound_rx: Receiver<(TcpSt
             sockets.remove(handle);
         }
 
-        // ARP keepalive: send a proactive ARP request before the 60 s smoltcp
-        // neighbor cache expires so the entry stays warm through networkd startup.
+        // ARP keepalive: proactive ARP request to refresh smoltcp's cache.
         if last_arp_keepalive.elapsed() >= ARP_KEEPALIVE_INTERVAL {
             send_arp_keepalive(device.relay_fd);
             last_arp_keepalive = std::time::Instant::now();
+        }
+
+        // NDP keepalive: unsolicited NA to seed the VM's IPv6 neighbor cache.
+        if let (Some(gw6), Some(gw_mcast_mac)) = (device.gateway_ip6_ll, device.gateway_ip6_mcast_mac) {
+            if std::time::Instant::now() >= ndp_keepalive_start
+                && last_ndp_keepalive.elapsed() >= NDP_KEEPALIVE_INTERVAL
+            {
+                send_ndp_unsolicited_na(device.relay_fd, device.guest_mac, &gw6, &gw_mcast_mac);
+                last_ndp_keepalive = std::time::Instant::now();
+            }
         }
 
         let delay = iface
@@ -995,6 +1227,7 @@ fn icmp_echo_reply(relay_fd: RawFd, frame: &[u8]) -> bool {
     if frame[icmp_off] != 8 || frame[icmp_off + 1] != 0 {
         return false;
     }
+    log::info!("nat_relay: icmpv4 echo request received — synthesizing reply");
 
     let mut reply = frame.to_vec();
 
@@ -1048,6 +1281,210 @@ fn inet_checksum(data: &[u8]) -> u16 {
 }
 
 // ---------------------------------------------------------------------------
+// ICMPv6 echo reply synthesizer
+// ---------------------------------------------------------------------------
+
+/// If `frame` is an IPv6 ICMPv6 Echo Request (type 128), synthesize an Echo
+/// Reply (type 129) and write it back to `relay_fd`.  Returns true if handled.
+///
+/// ICMPv6 checksum covers a pseudo-header:
+///   src IPv6 (16 B) | dst IPv6 (16 B) | ICMPv6 length (4 B) | zeros (3 B) | next-header=58 (1 B)
+fn icmpv6_echo_reply(relay_fd: RawFd, frame: &[u8]) -> bool {
+    // Minimum: 14 (Ethernet) + 40 (IPv6) + 8 (ICMPv6 header) = 62 bytes.
+    if frame.len() < 62 {
+        return false;
+    }
+    // Ethertype must be 0x86dd (IPv6).
+    if frame[12] != 0x86 || frame[13] != 0xdd {
+        return false;
+    }
+    // IPv6 next header must be 58 (ICMPv6).  Extension headers are not handled.
+    if frame[14 + 6] != 58 {
+        return false;
+    }
+    // ICMPv6 type must be 128 (Echo Request).
+    let icmp_off = 14 + 40;
+    if frame[icmp_off] != 128 || frame[icmp_off + 1] != 0 {
+        return false;
+    }
+    log::info!("nat_relay: icmpv6 echo request received — synthesizing reply");
+
+    let mut reply = frame.to_vec();
+
+    // Ethernet dst = original src (VM MAC); src = GATEWAY_MAC (unicast, not the
+    // multicast TLLA the VM used as dst, which is invalid as an Ethernet src).
+    reply[..6].copy_from_slice(&frame[6..12]);    // dst ← original VM src MAC
+    reply[6..12].copy_from_slice(&GATEWAY_MAC.0); // src ← gateway unicast MAC
+
+    // Swap IPv6 src/dst (bytes 22–37 = src, 38–53 = dst within IPv6 header).
+    let src6_off = 14 + 8;
+    let dst6_off = 14 + 24;
+    let src6: [u8; 16] = frame[src6_off..src6_off + 16].try_into().unwrap();
+    let dst6: [u8; 16] = frame[dst6_off..dst6_off + 16].try_into().unwrap();
+    reply[src6_off..src6_off + 16].copy_from_slice(&dst6);
+    reply[dst6_off..dst6_off + 16].copy_from_slice(&src6);
+
+    // Set ICMPv6 type to 129 (Echo Reply), code stays 0.
+    reply[icmp_off] = 129;
+
+    // Recompute ICMPv6 checksum over pseudo-header + ICMPv6 message.
+    // Pseudo-header: new src (dst6) | new dst (src6) | ICMPv6 length (4 B) | 0x00 0x00 0x00 0x3a
+    reply[icmp_off + 2] = 0;
+    reply[icmp_off + 3] = 0;
+    let icmpv6_len = reply.len() - icmp_off;
+    let mut pseudo: Vec<u8> = Vec::with_capacity(40);
+    pseudo.extend_from_slice(&dst6); // new src IPv6
+    pseudo.extend_from_slice(&src6); // new dst IPv6
+    pseudo.extend_from_slice(&(icmpv6_len as u32).to_be_bytes());
+    pseudo.extend_from_slice(&[0x00, 0x00, 0x00, 58u8]); // next-header = 58
+    pseudo.extend_from_slice(&reply[icmp_off..]);
+    let cksum = inet_checksum(&pseudo);
+    reply[icmp_off + 2] = (cksum >> 8) as u8;
+    reply[icmp_off + 3] = (cksum & 0xff) as u8;
+
+    unsafe {
+        libc::send(relay_fd, reply.as_ptr() as _, reply.len(), 0);
+    }
+    true
+}
+
+/// Return true if `frame` is a DAD Neighbor Solicitation (ICMPv6 type 135
+/// with source IPv6 = :: — the unspecified address).
+///
+/// DAD NS frames are sent by the guest kernel when a new IPv6 address is
+/// tentative.  VZ forwards them to the relay because the guest has joined its
+/// own solicited-node multicast group.  We use this as a timing signal to
+/// send a Unsolicited NA for the gateway immediately, seeding the neighbor
+/// cache before the guest first tries to contact fe80::ff:fe00:1.
+fn is_dad_ns(frame: &[u8]) -> bool {
+    // 14 (Eth) + 40 (IPv6) + 24 (ICMPv6 NS min body) = 78 bytes minimum.
+    if frame.len() < 78 {
+        return false;
+    }
+    if frame[12] != 0x86 || frame[13] != 0xdd {
+        return false;
+    }
+    // Next header must be ICMPv6 (58).
+    if frame[14 + 6] != 58 {
+        log::trace!("nat_relay: is_dad_ns: IPv6 but next_hdr={} (not ICMPv6)", frame[14 + 6]);
+        return false;
+    }
+    // ICMPv6 type must be 135 (NS).
+    let icmp_type = frame[14 + 40];
+    if icmp_type != 135 {
+        log::trace!("nat_relay: is_dad_ns: ICMPv6 type={} (not NS)", icmp_type);
+        return false;
+    }
+    // Source IPv6 must be :: (all zeros) — the DAD unspecified source.
+    let src6 = &frame[14 + 8..14 + 24];
+    let is_dad = src6 == [0u8; 16];
+    log::trace!("nat_relay: is_dad_ns: NS, src6={:02x?} is_dad={}", src6, is_dad);
+    is_dad
+}
+
+/// If `frame` is an NDP Neighbor Solicitation (ICMPv6 type 135) targeting
+/// GATEWAY_IP6_LL, synthesize a Neighbor Advertisement (type 136) with the
+/// gateway MAC in the Target Link-Layer Address option and write it back to
+/// `relay_fd`. Returns true if the frame was handled.
+///
+/// Frame layout of the reply:
+///   14 (Ethernet) + 40 (IPv6) + 4 (type/code/cksum) + 4 (flags) + 16 (target) + 8 (option) = 86 bytes
+fn ndp_neighbor_advertisement(relay_fd: RawFd, frame: &[u8], gw_ip6_ll: Option<&[u8; 16]>, gw_mcast_mac: Option<&[u8; 6]>) -> bool {
+    let (gw6, tlla) = match (gw_ip6_ll, gw_mcast_mac) {
+        (Some(ll), Some(mac)) => (ll, mac),
+        _ => return false,
+    };
+    // Minimum NS without options: 14 (Eth) + 40 (IPv6) + 4 (hdr) + 4 (reserved) + 16 (target) = 78
+    if frame.len() < 78 {
+        return false;
+    }
+    // Ethertype must be 0x86dd (IPv6).
+    if frame[12] != 0x86 || frame[13] != 0xdd {
+        return false;
+    }
+    // IPv6 next header must be 58 (ICMPv6).
+    if frame[14 + 6] != 58 {
+        log::trace!("nat_relay: ndp: IPv6 but not ICMPv6 (next_hdr={})", frame[14 + 6]);
+        return false;
+    }
+    // ICMPv6 type must be 135 (Neighbor Solicitation), code must be 0.
+    let icmp_off = 14 + 40; // = 54
+    log::trace!("nat_relay: ndp: ICMPv6 type={} code={}", frame[icmp_off], frame[icmp_off + 1]);
+    if frame[icmp_off] != 135 || frame[icmp_off + 1] != 0 {
+        return false;
+    }
+    // Target address is at icmp_off + 8 (type + code + cksum + reserved = 8 bytes).
+    let target_off = icmp_off + 8;
+    let target: [u8; 16] = frame[target_off..target_off + 16].try_into().unwrap_or([0u8; 16]);
+    log::trace!("nat_relay: ndp: NS target={:?}, want={:?}", target, gw6);
+    if frame[target_off..target_off + 16] != *gw6 {
+        return false;
+    }
+    log::info!("nat_relay: NS for gateway received — sending NA (TLLA=dynamic gateway multicast MAC)");
+
+    let src_mac: [u8; 6] = frame[6..12].try_into().unwrap();
+    let src6: [u8; 16] = frame[14 + 8..14 + 24].try_into().unwrap();
+    let gw_mac = GATEWAY_MAC.0;
+    let gw6 = *gw6;
+
+    // NA reply: 14 (Eth) + 40 (IPv6) + 32 (ICMPv6 NA with one option) = 86 bytes.
+    // ICMPv6 NA breakdown: 4 (type/code/cksum) + 4 (R/S/O flags) + 16 (target) + 8 (option) = 32
+    let icmpv6_len: u16 = 32;
+    let mut reply = vec![0u8; 14 + 40 + 32];
+
+    // Ethernet: dst = guest MAC, src = gateway MAC.
+    reply[0..6].copy_from_slice(&src_mac);
+    reply[6..12].copy_from_slice(&gw_mac);
+    reply[12] = 0x86;
+    reply[13] = 0xdd;
+
+    // IPv6 header.
+    reply[14] = 0x60; // version 6, TC 0, flow label 0
+    reply[18] = (icmpv6_len >> 8) as u8;
+    reply[19] = (icmpv6_len & 0xff) as u8;
+    reply[20] = 58;  // next header = ICMPv6
+    reply[21] = 255; // hop limit (NDP requires 255)
+    reply[22..38].copy_from_slice(&gw6);  // src = GATEWAY_IP6_LL
+    reply[38..54].copy_from_slice(&src6); // dst = guest link-local
+
+    // ICMPv6 Neighbor Advertisement.
+    let na_off = 54;
+    reply[na_off]     = 136; // type = Neighbor Advertisement
+    reply[na_off + 1] = 0;   // code = 0
+    // reply[na_off + 2,3] = checksum (computed below)
+    // Flags: S=1 (solicited), O=1 (override) → bits 30,29 of 32-bit field → 0x60000000
+    reply[na_off + 4] = 0x60;
+    // Target address = GATEWAY_IP6_LL
+    reply[na_off + 8..na_off + 24].copy_from_slice(&gw6);
+    // Option: Target Link-Layer Address (type=2, length=1 → 8 bytes).
+    // We advertise the dynamic gateway multicast MAC instead of GATEWAY_MAC
+    // (02:00:00:00:00:01).  VZ's virtual switch delivers IPv6 multicast to the relay
+    // but silently drops IPv6 unicast.  By advertising the solicited-node multicast MAC
+    // as the TLLA, the VM will use a multicast Ethernet destination for ICMPv6 frames
+    // to the gateway, which VZ reliably forwards to the relay.
+    reply[na_off + 24] = 2; // option type
+    reply[na_off + 25] = 1; // length in units of 8 bytes
+    reply[na_off + 26..na_off + 32].copy_from_slice(tlla);
+
+    // ICMPv6 pseudo-header checksum: src IPv6 | dst IPv6 | length (4B) | 0x00 0x00 0x00 0x3a
+    let mut pseudo: Vec<u8> = Vec::with_capacity(40 + 32);
+    pseudo.extend_from_slice(&gw6);                              // src = gateway
+    pseudo.extend_from_slice(&src6);                             // dst = guest
+    pseudo.extend_from_slice(&(icmpv6_len as u32).to_be_bytes());
+    pseudo.extend_from_slice(&[0x00, 0x00, 0x00, 58u8]);
+    pseudo.extend_from_slice(&reply[na_off..]);
+    let cksum = inet_checksum(&pseudo);
+    reply[na_off + 2] = (cksum >> 8) as u8;
+    reply[na_off + 3] = (cksum & 0xff) as u8;
+
+    unsafe {
+        libc::send(relay_fd, reply.as_ptr() as _, reply.len(), 0);
+    }
+    log::info!("nat_relay: sent NDP NA for gateway link-local (TLLA=dynamic gateway multicast MAC)");
+    true
+}
+
+// ---------------------------------------------------------------------------
 // socketpair helpers
 // ---------------------------------------------------------------------------
 
@@ -1076,5 +1513,374 @@ fn set_sock_bufs(fd: RawFd, sndbuf: c_int, rcvbuf: c_int) {
             &rcvbuf as *const _ as *const libc::c_void,
             std::mem::size_of::<c_int>() as libc::socklen_t,
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    /// Build a minimal ICMPv4 Echo Request Ethernet frame.
+    fn make_icmpv4_echo_request(src_mac: [u8; 6], dst_mac: [u8; 6],
+                                src_ip: [u8; 4], dst_ip: [u8; 4],
+                                id: u16, seq: u16) -> Vec<u8> {
+        let mut f = vec![0u8; 14 + 20 + 8];
+        // Ethernet
+        f[..6].copy_from_slice(&dst_mac);
+        f[6..12].copy_from_slice(&src_mac);
+        f[12] = 0x08; f[13] = 0x00;
+        // IPv4: version+IHL, TTL=64, proto=1 (ICMP)
+        f[14] = 0x45;
+        f[14 + 8] = 64;
+        f[14 + 9] = 1;
+        f[14 + 12..14 + 16].copy_from_slice(&src_ip);
+        f[14 + 16..14 + 20].copy_from_slice(&dst_ip);
+        let hdr_cksum = inet_checksum(&f[14..14 + 20]);
+        f[14 + 10] = (hdr_cksum >> 8) as u8;
+        f[14 + 11] = (hdr_cksum & 0xff) as u8;
+        // ICMP: type=8 (request), code=0
+        f[34] = 8;
+        f[35] = 0;
+        f[36] = (id >> 8) as u8; f[37] = (id & 0xff) as u8;
+        f[38] = (seq >> 8) as u8; f[39] = (seq & 0xff) as u8;
+        let icmp_cksum = inet_checksum(&f[34..]);
+        f[36] = (icmp_cksum >> 8) as u8; // reuse id bytes since payload is empty
+        // Actually put checksum in correct field:
+        let mut f2 = vec![0u8; 14 + 20 + 8];
+        f2[..14].copy_from_slice(&f[..14]);
+        f2[14..34].copy_from_slice(&f[14..34]);
+        f2[34] = 8; f2[35] = 0;
+        f2[36] = (id >> 8) as u8; f2[37] = (id & 0xff) as u8;
+        f2[38] = (seq >> 8) as u8; f2[39] = (seq & 0xff) as u8;
+        let ck = inet_checksum(&f2[34..]);
+        f2[36] = (ck >> 8) as u8;
+        f2[37] = (ck & 0xff) as u8;
+        f2
+    }
+
+    /// Build a minimal ICMPv6 Echo Request Ethernet frame.
+    fn make_icmpv6_echo_request(src_mac: [u8; 6], dst_mac: [u8; 6],
+                                src_ip: [u8; 16], dst_ip: [u8; 16],
+                                id: u16, seq: u16) -> Vec<u8> {
+        // 14 (Ethernet) + 40 (IPv6) + 8 (ICMPv6 header, no payload)
+        let mut f = vec![0u8; 62];
+        // Ethernet
+        f[..6].copy_from_slice(&dst_mac);
+        f[6..12].copy_from_slice(&src_mac);
+        f[12] = 0x86; f[13] = 0xdd;
+        // IPv6: version=6, payload length=8, next header=58 (ICMPv6), hop limit=64
+        f[14] = 0x60; // version=6, traffic class=0, flow label=0
+        f[14 + 4] = 0x00;
+        f[14 + 5] = 0x08; // payload length = 8
+        f[14 + 6] = 58;   // next header = ICMPv6
+        f[14 + 7] = 64;   // hop limit
+        f[14 + 8..14 + 24].copy_from_slice(&src_ip);
+        f[14 + 24..14 + 40].copy_from_slice(&dst_ip);
+        // ICMPv6: type=128 (echo request), code=0, checksum=0 (filled below)
+        // identifier at offset 4-5, sequence at offset 6-7 within ICMPv6 header.
+        f[54] = 128; // type
+        f[55] = 0;   // code
+        // f[56,57] = checksum — leave as 0 for now
+        f[58] = (id >> 8) as u8; f[59] = (id & 0xff) as u8;   // identifier
+        f[60] = (seq >> 8) as u8; f[61] = (seq & 0xff) as u8;  // sequence
+        // Checksum: pseudo-header + ICMPv6 message (checksum field = 0).
+        let icmpv6_len: u32 = 8;
+        let mut pseudo = Vec::with_capacity(40);
+        pseudo.extend_from_slice(&src_ip);
+        pseudo.extend_from_slice(&dst_ip);
+        pseudo.extend_from_slice(&icmpv6_len.to_be_bytes());
+        pseudo.extend_from_slice(&[0x00, 0x00, 0x00, 58u8]);
+        pseudo.extend_from_slice(&f[54..62]);
+        let ck = inet_checksum(&pseudo);
+        f[56] = (ck >> 8) as u8;
+        f[57] = (ck & 0xff) as u8;
+        f
+    }
+
+    // ── inet_checksum ─────────────────────────────────────────────────────────
+
+    /// RFC 1071 §3 example: checksum of the four 16-bit words
+    /// 0x0001, 0xf203, 0xf4f5, 0xf6f7 should be 0x220d.
+    #[test]
+    fn test_inet_checksum_rfc1071_example() {
+        let data: &[u8] = &[0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7];
+        assert_eq!(inet_checksum(data), 0x220d);
+    }
+
+    #[test]
+    fn test_inet_checksum_all_zeros() {
+        assert_eq!(inet_checksum(&[0u8; 8]), 0xffff);
+    }
+
+    #[test]
+    fn test_inet_checksum_odd_length() {
+        // Single 0xff byte: sum = 0xff00, complement = 0x00ff.
+        assert_eq!(inet_checksum(&[0xff]), 0x00ff);
+    }
+
+    // ── ICMPv6 pseudo-header checksum ─────────────────────────────────────────
+
+    /// Verify pseudo-header checksum construction by round-tripping: build a
+    /// request frame with make_icmpv6_echo_request (which computes a checksum),
+    /// then verify the checksum field is correct by recomputing independently.
+    #[test]
+    fn test_icmpv6_echo_request_checksum_valid() {
+        let src_ip = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2u8];
+        let dst_ip = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xfe, 0, 0, 1, 0, 0u8];
+        let frame = make_icmpv6_echo_request(
+            [0xaa; 6], [0xbb; 6], src_ip, dst_ip, 0x1234, 0x0001,
+        );
+        // Extract the checksum from the frame.
+        let stored_ck = u16::from_be_bytes([frame[56], frame[57]]);
+        // Zero the checksum field and recompute.
+        let icmpv6_len: u32 = 8;
+        let mut pseudo = Vec::with_capacity(40);
+        pseudo.extend_from_slice(&src_ip);
+        pseudo.extend_from_slice(&dst_ip);
+        pseudo.extend_from_slice(&icmpv6_len.to_be_bytes());
+        pseudo.extend_from_slice(&[0x00, 0x00, 0x00, 58u8]);
+        let mut msg = frame[54..].to_vec();
+        msg[2] = 0; msg[3] = 0; // zero checksum field
+        pseudo.extend_from_slice(&msg);
+        assert_eq!(inet_checksum(&pseudo), stored_ck);
+    }
+
+    // ── icmp_echo_reply (IPv4) ────────────────────────────────────────────────
+
+    #[test]
+    fn test_icmpv4_echo_reply_swaps_addresses() {
+        let (fd_a, fd_b) = create_socketpair().unwrap();
+        let src_mac = [0x11u8; 6];
+        let dst_mac = [0x22u8; 6];
+        let src_ip = [192, 168, 105, 2];
+        let dst_ip = [192, 168, 105, 1];
+        let frame = make_icmpv4_echo_request(src_mac, dst_mac, src_ip, dst_ip, 1, 1);
+        assert!(icmp_echo_reply(fd_a, &frame));
+        let mut buf = vec![0u8; 1500];
+        let n = unsafe { libc::recv(fd_b, buf.as_mut_ptr() as _, buf.len(), 0) };
+        assert!(n > 0);
+        let reply = &buf[..n as usize];
+        // Ethernet: dst should be original src, src should be original dst.
+        assert_eq!(&reply[..6], &src_mac);
+        assert_eq!(&reply[6..12], &dst_mac);
+        // IPv4: src/dst swapped.
+        assert_eq!(&reply[14 + 12..14 + 16], &dst_ip);
+        assert_eq!(&reply[14 + 16..14 + 20], &src_ip);
+        // ICMP type = 0 (reply).
+        assert_eq!(reply[34], 0);
+        unsafe { libc::close(fd_a); libc::close(fd_b); }
+    }
+
+    #[test]
+    fn test_icmpv4_echo_reply_rejects_short_frame() {
+        let (fd_a, fd_b) = create_socketpair().unwrap();
+        assert!(!icmp_echo_reply(fd_a, &[0u8; 10]));
+        unsafe { libc::close(fd_a); libc::close(fd_b); }
+    }
+
+    // ── icmpv6_echo_reply ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_icmpv6_echo_reply_swaps_addresses() {
+        let (fd_a, fd_b) = create_socketpair().unwrap();
+        let src_mac = [0xaau8; 6];
+        let dst_mac = [0xbbu8; 6];
+        let src_ip = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2u8]; // fe80::2
+        let dst_ip = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xfe, 0, 0, 1, 0, 0u8]; // gateway LL
+        let frame = make_icmpv6_echo_request(src_mac, dst_mac, src_ip, dst_ip, 0x42, 0x01);
+
+        assert!(icmpv6_echo_reply(fd_a, &frame));
+
+        let mut buf = vec![0u8; 1500];
+        let n = unsafe { libc::recv(fd_b, buf.as_mut_ptr() as _, buf.len(), 0) };
+        assert!(n >= 62, "reply too short: {}", n);
+        let reply = &buf[..n as usize];
+
+        // Ethernet: dst ← original src, src ← original dst.
+        assert_eq!(&reply[..6], &src_mac, "Ethernet dst should be original src MAC");
+        assert_eq!(&reply[6..12], &GATEWAY_MAC.0, "Ethernet src should be GATEWAY_MAC");
+
+        // IPv6: src/dst swapped.
+        assert_eq!(&reply[14 + 8..14 + 24], &dst_ip, "IPv6 src should be original dst");
+        assert_eq!(&reply[14 + 24..14 + 40], &src_ip, "IPv6 dst should be original src");
+
+        // ICMPv6 type = 129 (Echo Reply).
+        assert_eq!(reply[54], 129, "ICMPv6 type should be 129 (Echo Reply)");
+        assert_eq!(reply[55], 0, "ICMPv6 code should be 0");
+
+        // Checksum: recompute and verify.
+        let icmpv6_len = (reply.len() - 54) as u32;
+        let mut pseudo = Vec::new();
+        pseudo.extend_from_slice(&dst_ip); // new src
+        pseudo.extend_from_slice(&src_ip); // new dst
+        pseudo.extend_from_slice(&icmpv6_len.to_be_bytes());
+        pseudo.extend_from_slice(&[0x00, 0x00, 0x00, 58u8]);
+        let mut msg = reply[54..].to_vec();
+        let stored_ck = u16::from_be_bytes([msg[2], msg[3]]);
+        msg[2] = 0; msg[3] = 0;
+        pseudo.extend_from_slice(&msg);
+        assert_eq!(inet_checksum(&pseudo), stored_ck, "ICMPv6 checksum invalid");
+
+        unsafe { libc::close(fd_a); libc::close(fd_b); }
+    }
+
+    #[test]
+    fn test_icmpv6_echo_reply_rejects_ipv4_frame() {
+        let (fd_a, fd_b) = create_socketpair().unwrap();
+        let frame = make_icmpv4_echo_request(
+            [0x11; 6], [0x22; 6], [10, 0, 0, 1], [10, 0, 0, 2], 1, 1,
+        );
+        assert!(!icmpv6_echo_reply(fd_a, &frame));
+        unsafe { libc::close(fd_a); libc::close(fd_b); }
+    }
+
+    #[test]
+    fn test_icmpv6_echo_reply_rejects_short_frame() {
+        let (fd_a, fd_b) = create_socketpair().unwrap();
+        assert!(!icmpv6_echo_reply(fd_a, &[0x86, 0xdd, 0, 0, 0, 0, 0, 0]));
+        unsafe { libc::close(fd_a); libc::close(fd_b); }
+    }
+
+    #[test]
+    fn test_icmpv6_echo_reply_rejects_non_echo_type() {
+        let (fd_a, fd_b) = create_socketpair().unwrap();
+        let src_ip = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2u8];
+        let dst_ip = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xfe, 0, 0, 1, 0, 0u8];
+        let mut frame = make_icmpv6_echo_request(
+            [0xaa; 6], [0xbb; 6], src_ip, dst_ip, 1, 1,
+        );
+        frame[54] = 135; // Neighbor Solicitation — should not be answered here
+        assert!(!icmpv6_echo_reply(fd_a, &frame));
+        unsafe { libc::close(fd_a); libc::close(fd_b); }
+    }
+
+    // ── ndp_neighbor_advertisement ────────────────────────────────────────────
+
+    /// Build a minimal NDP Neighbor Solicitation Ethernet frame.
+    fn make_ndp_ns(src_mac: [u8; 6], src_ip: [u8; 16], target_ip: [u8; 16]) -> Vec<u8> {
+        // 14 (Eth) + 40 (IPv6) + 4 (type/code/cksum) + 4 (reserved) + 16 (target) = 78
+        let icmpv6_payload_len: u16 = 24; // 4 + 4 + 16
+        let mut f = vec![0u8; 78];
+        // Ethernet: solicited-node multicast dst, guest src.
+        f[0..6].copy_from_slice(&[0x33, 0x33, 0xff,
+            target_ip[13], target_ip[14], target_ip[15]]);
+        f[6..12].copy_from_slice(&src_mac);
+        f[12] = 0x86; f[13] = 0xdd;
+        // IPv6 header.
+        f[14] = 0x60;
+        f[18] = (icmpv6_payload_len >> 8) as u8;
+        f[19] = (icmpv6_payload_len & 0xff) as u8;
+        f[20] = 58;  // ICMPv6
+        f[21] = 255; // hop limit
+        f[22..38].copy_from_slice(&src_ip);
+        // dst = solicited-node multicast for target
+        let mut snmc = [0u8; 16];
+        snmc[0] = 0xff; snmc[1] = 0x02;
+        snmc[11] = 0x01; snmc[12] = 0xff;
+        snmc[13] = target_ip[13]; snmc[14] = target_ip[14]; snmc[15] = target_ip[15];
+        f[38..54].copy_from_slice(&snmc);
+        // ICMPv6 NS: type=135, code=0, cksum=0, reserved=0, target addr.
+        f[54] = 135;
+        f[55] = 0;
+        // f[56,57] = checksum (computed below)
+        // f[58..62] = reserved (zeros)
+        f[62..78].copy_from_slice(&target_ip);
+        // Compute checksum over pseudo-header + ICMPv6 message.
+        let icmpv6_msg_len: u32 = icmpv6_payload_len as u32;
+        let mut pseudo: Vec<u8> = Vec::new();
+        pseudo.extend_from_slice(&src_ip);
+        pseudo.extend_from_slice(&snmc);
+        pseudo.extend_from_slice(&icmpv6_msg_len.to_be_bytes());
+        pseudo.extend_from_slice(&[0x00, 0x00, 0x00, 58u8]);
+        pseudo.extend_from_slice(&f[54..]);
+        let ck = inet_checksum(&pseudo);
+        f[56] = (ck >> 8) as u8;
+        f[57] = (ck & 0xff) as u8;
+        f
+    }
+
+    /// NS targeting the gateway produces a valid NA with gateway MAC.
+    #[test]
+    fn test_ndp_na_responds_to_gateway_ns() {
+        let (fd_a, fd_b) = create_socketpair().unwrap();
+        let guest_mac = [0xf2u8, 0xb9, 0xd0, 0x8c, 0x19, 0x6c];
+        let guest_ll  = [0xfe, 0x80u8, 0, 0, 0, 0, 0, 0, 0xf0, 0xb9, 0xd0, 0xff, 0xfe, 0x8c, 0x19, 0x6c];
+        let gw_ll = gateway_ip6_for_vm_mac(guest_mac);
+        let gw_mcast_mac = gateway_ip6_mcast_mac_for_vm_mac(guest_mac);
+        let gw_mac = GATEWAY_MAC.0;
+
+        let ns = make_ndp_ns(guest_mac, guest_ll, gw_ll);
+        assert!(ndp_neighbor_advertisement(fd_a, &ns, Some(&gw_ll), Some(&gw_mcast_mac)));
+
+        let mut buf = vec![0u8; 1500];
+        let n = unsafe { libc::recv(fd_b, buf.as_mut_ptr() as _, buf.len(), 0) };
+        assert_eq!(n, 86, "NA reply should be exactly 86 bytes");
+        let reply = &buf[..n as usize];
+
+        // Ethernet: dst = guest MAC, src = gateway MAC.
+        assert_eq!(&reply[0..6], &guest_mac, "Ethernet dst should be guest MAC");
+        assert_eq!(&reply[6..12], &gw_mac, "Ethernet src should be gateway MAC");
+
+        // IPv6: src = GATEWAY_IP6_LL, dst = guest LL.
+        assert_eq!(&reply[22..38], &gw_ll, "IPv6 src should be gateway LL");
+        assert_eq!(&reply[38..54], &guest_ll, "IPv6 dst should be guest LL");
+
+        // ICMPv6 type = 136 (NA), flags S+O.
+        assert_eq!(reply[54], 136, "ICMPv6 type should be 136 (NA)");
+        assert_eq!(reply[55], 0, "ICMPv6 code should be 0");
+        assert_eq!(reply[58], 0x60, "S+O flags should be set");
+
+        // Target = GATEWAY_IP6_LL.
+        assert_eq!(&reply[62..78], &gw_ll, "Target addr should be GATEWAY_IP6_LL");
+
+        // Option: type=2 (Target Link-Layer), len=1, MAC=gateway.
+        assert_eq!(reply[78], 2, "Option type should be 2");
+        assert_eq!(reply[79], 1, "Option length should be 1");
+        assert_eq!(&reply[80..86], &gw_mcast_mac, "Option MAC should be gateway multicast MAC");
+
+        // Checksum must be valid.
+        let icmpv6_len: u32 = 32;
+        let mut pseudo = Vec::new();
+        pseudo.extend_from_slice(&gw_ll);
+        pseudo.extend_from_slice(&guest_ll);
+        pseudo.extend_from_slice(&icmpv6_len.to_be_bytes());
+        pseudo.extend_from_slice(&[0x00, 0x00, 0x00, 58u8]);
+        let stored_ck = u16::from_be_bytes([reply[56], reply[57]]);
+        let mut msg = reply[54..].to_vec();
+        msg[2] = 0; msg[3] = 0;
+        pseudo.extend_from_slice(&msg);
+        assert_eq!(inet_checksum(&pseudo), stored_ck, "ICMPv6 checksum invalid");
+
+        unsafe { libc::close(fd_a); libc::close(fd_b); }
+    }
+
+    /// NS targeting a non-gateway address is ignored.
+    #[test]
+    fn test_ndp_na_ignores_other_targets() {
+        let (fd_a, fd_b) = create_socketpair().unwrap();
+        let guest_mac = [0xf2u8, 0xb9, 0xd0, 0x8c, 0x19, 0x6c];
+        let guest_ll  = [0xfe, 0x80u8, 0, 0, 0, 0, 0, 0, 0xf0, 0xb9, 0xd0, 0xff, 0xfe, 0x8c, 0x19, 0x6c];
+        let gw_ll = gateway_ip6_for_vm_mac(guest_mac);
+        let gw_mcast_mac = gateway_ip6_mcast_mac_for_vm_mac(guest_mac);
+        // Target is the guest's own address, not the gateway.
+        let ns = make_ndp_ns(guest_mac, guest_ll, guest_ll);
+        assert!(!ndp_neighbor_advertisement(fd_a, &ns, Some(&gw_ll), Some(&gw_mcast_mac)));
+        unsafe { libc::close(fd_a); libc::close(fd_b); }
+    }
+
+    /// Short frame is rejected.
+    #[test]
+    fn test_ndp_na_rejects_short_frame() {
+        let (fd_a, fd_b) = create_socketpair().unwrap();
+        let gw_ll = [0xfe, 0x80u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xfe, 1, 2, 3];
+        let gw_mcast = [0x33u8, 0x33, 0xff, 1, 2, 3];
+        assert!(!ndp_neighbor_advertisement(fd_a, &[0u8; 40], Some(&gw_ll), Some(&gw_mcast)));
+        unsafe { libc::close(fd_a); libc::close(fd_b); }
     }
 }

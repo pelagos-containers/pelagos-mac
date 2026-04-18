@@ -26,6 +26,6 @@ thiserror.workspace = true
 log.workspace = true
 libc.workspace = true
 smoltcp = { version = "0.12", default-features = false, features = [
-    "std", "log", "medium-ethernet", "proto-ipv4",
+    "std", "log", "medium-ethernet", "proto-ipv4", "proto-ipv6",
     "socket-tcp",
 ] }
