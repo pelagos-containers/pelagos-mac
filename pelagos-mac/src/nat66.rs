@@ -3,7 +3,21 @@
 //! The helper runs as root and owns all pfctl invocations.  This module is
 //! the client side: it detects the host's global IPv6 address, sends
 //! load/unload requests over the helper's Unix socket, and exposes the
-//! install/uninstall/status subcommand implementations.
+//! subcommand implementations.
+//!
+//! GUI-friendly API
+//! ----------------
+//! `pelagos nat66 enable`   — install helper if needed (macOS auth dialog),
+//!                            clear any disable flag, load rule.  Safe to call
+//!                            from a GUI button without any terminal.
+//! `pelagos nat66 disable`  — unload rule, write disable flag so the daemon
+//!                            does not auto-reload on next VM start.
+//! `pelagos nat66 status [--json]` — human or machine-readable status.
+//!
+//! Low-level plumbing
+//! ------------------
+//! `pelagos nat66 install`   — privileged install (requires sudo / root).
+//! `pelagos nat66 uninstall` — privileged removal.
 
 use std::ffi::CStr;
 use std::io::{BufRead, BufReader, Write};
@@ -83,19 +97,47 @@ pub fn detect_global_ipv6_iface() -> Option<(String, Ipv6Addr)> {
     }
 }
 
-/// Returns true for addresses in the global unicast range (2000::/3), i.e.
-/// not loopback (::1), not link-local (fe80::/10), not ULA (fc00::/7).
+/// Returns true for addresses in the global unicast range: not loopback (::1),
+/// not link-local (fe80::/10), not ULA (fc00::/7).
 fn is_global_unicast(b: &[u8; 16]) -> bool {
     if *b == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] {
-        return false; // loopback ::1
+        return false; // ::1 loopback
     }
     if b[0] == 0xfe && (b[1] & 0xc0) == 0x80 {
-        return false; // link-local fe80::/10
+        return false; // fe80::/10 link-local
     }
     if (b[0] & 0xfe) == 0xfc {
-        return false; // ULA fc00::/7
+        return false; // fc00::/7 ULA
     }
     true
+}
+
+// ---------------------------------------------------------------------------
+// Disable flag
+// ---------------------------------------------------------------------------
+
+/// Touch file that suppresses automatic NAT66 loading at VM start.
+/// Written by `disable`, removed by `enable`.
+fn disable_flag_path() -> Option<std::path::PathBuf> {
+    crate::state::pelagos_base()
+        .ok()
+        .map(|b| b.join("nat66-disabled"))
+}
+
+/// Returns true if the user has explicitly disabled NAT66 via `pelagos nat66 disable`.
+pub fn is_disabled_by_user() -> bool {
+    disable_flag_path()
+        .map(|p| p.exists())
+        .unwrap_or(false)
+}
+
+fn set_disabled_flag(disabled: bool) {
+    let Some(path) = disable_flag_path() else { return };
+    if disabled {
+        let _ = std::fs::write(&path, b"");
+    } else {
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +196,91 @@ pub fn helper_available() -> bool {
 /// helper is not running.
 pub fn status_active() -> Option<bool> {
     send_request(&Request::Status).ok()?.active
+}
+
+// ---------------------------------------------------------------------------
+// `pelagos nat66 enable` — GUI-friendly: installs helper via osascript if
+// needed, then loads the rule.  No terminal or sudo required from the user.
+// ---------------------------------------------------------------------------
+
+pub fn cmd_enable() -> Result<(), String> {
+    // If the helper is not yet installed, elevate via the macOS auth dialog.
+    if !helper_available() {
+        elevate_and_install()?;
+        // Give the LaunchDaemon a moment to start and create the socket.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if helper_available() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        if !helper_available() {
+            return Err("helper installed but socket not yet available — try again in a moment".into());
+        }
+    }
+
+    // Remove the user-disable flag so the daemon auto-loads on next VM start.
+    set_disabled_flag(false);
+
+    // Load the rule now.
+    let iface = detect_global_ipv6_iface()
+        .map(|(i, _)| i)
+        .ok_or("no global IPv6 address on this host — cannot enable NAT66")?;
+
+    match load(&iface) {
+        Ok(true) => {
+            println!("IPv6 NAT66 enabled (rule loaded on {iface}).");
+            Ok(())
+        }
+        Ok(false) => Err("helper did not confirm rule was loaded".into()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Run `pelagos nat66 install` as root using the macOS authorization dialog
+/// (`osascript ... with administrator privileges`).  The dialog is shown by
+/// the OS and is identical to the standard "enter your password" prompt that
+/// macOS presents for any privileged installer.
+fn elevate_and_install() -> Result<(), String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("current_exe: {e}"))?;
+    // Escape single quotes in the path (unlikely, but safe).
+    let exe_str = exe.to_string_lossy().replace('\'', "'\\''");
+    let script = format!(
+        "do shell script \"'{exe_str}' nat66 install\" with administrator privileges"
+    );
+    let out = Command::new("/usr/bin/osascript")
+        .args(["-e", &script])
+        .output()
+        .map_err(|e| format!("osascript: {e}"))?;
+
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Exit code 1 with "User canceled" means the user dismissed the dialog.
+        if stderr.contains("User canceled") || stderr.contains("(-128)") {
+            Err("authorization cancelled by user".into())
+        } else {
+            Err(format!("install failed: {stderr}"))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `pelagos nat66 disable` — unload rule + set flag (no privilege required)
+// ---------------------------------------------------------------------------
+
+pub fn cmd_disable() -> Result<(), String> {
+    // Write the flag so the daemon skips auto-load on next VM start.
+    set_disabled_flag(true);
+
+    // Unload the active rule if any.
+    unload()?;
+
+    println!("IPv6 NAT66 disabled.");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +345,9 @@ pub fn cmd_install() -> Result<(), String> {
 /// Remove the LaunchDaemon and helper binary.  Must be called as root.
 pub fn cmd_uninstall() -> Result<(), String> {
     if unsafe { libc::getuid() } != 0 {
-        return Err("pelagos nat66 uninstall must run as root.\nRun: sudo pelagos nat66 uninstall".into());
+        return Err(
+            "pelagos nat66 uninstall must run as root.\nRun: sudo pelagos nat66 uninstall".into(),
+        );
     }
 
     // Unload the LaunchDaemon (ignore errors — might not be loaded).
@@ -241,33 +370,72 @@ pub fn cmd_uninstall() -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Status output
+// ---------------------------------------------------------------------------
+
+/// Machine-readable status record for `pelagos nat66 status --json`.
+#[derive(Serialize)]
+pub struct Nat66Status {
+    /// Host has a globally-routable IPv6 address.
+    pub ipv6_available: bool,
+    /// Interface and address, if available.
+    pub ipv6_iface: Option<String>,
+    pub ipv6_addr: Option<String>,
+    /// pelagos-pfctl LaunchDaemon is installed (plist present).
+    pub helper_installed: bool,
+    /// pelagos-pfctl socket is reachable.
+    pub helper_running: bool,
+    /// User has explicitly disabled NAT66 (`pelagos nat66 disable`).
+    pub user_disabled: bool,
+    /// pf NAT66 rule is currently active.
+    pub active: bool,
+}
+
+/// Gather current status without printing.
+pub fn gather_status() -> Nat66Status {
+    let ipv6 = detect_global_ipv6_iface();
+    let active = status_active().unwrap_or(false);
+    Nat66Status {
+        ipv6_available: ipv6.is_some(),
+        ipv6_iface: ipv6.as_ref().map(|(i, _)| i.clone()),
+        ipv6_addr: ipv6.as_ref().map(|(_, a)| a.to_string()),
+        helper_installed: Path::new(PLIST_PATH).exists(),
+        helper_running: helper_available(),
+        user_disabled: is_disabled_by_user(),
+        active,
+    }
+}
+
 /// Print current NAT66 status.
-pub fn cmd_status() {
-    // Host IPv6 detection.
-    match detect_global_ipv6_iface() {
-        Some((iface, addr)) => println!("host IPv6:  {addr} on {iface}"),
-        None => println!("host IPv6:  none (IPv4-only network — NAT66 not available)"),
+pub fn cmd_status(json: bool) {
+    let s = gather_status();
+    if json {
+        println!("{}", serde_json::to_string(&s).unwrap_or_default());
+        return;
     }
 
-    // Helper daemon.
-    let installed = Path::new(PLIST_PATH).exists();
-    let running = helper_available();
+    match (&s.ipv6_iface, &s.ipv6_addr) {
+        (Some(iface), Some(addr)) => println!("host IPv6:  {addr} on {iface}"),
+        _ => println!("host IPv6:  none (IPv4-only network — NAT66 not available)"),
+    }
     println!(
         "helper:     {}",
-        if running {
+        if s.helper_running {
             "running"
-        } else if installed {
+        } else if s.helper_installed {
             "installed but not responding"
         } else {
-            "not installed (run: sudo pelagos nat66 install)"
+            "not installed  (run: pelagos nat66 enable)"
         }
     );
-
-    // Active rule.
-    match status_active() {
-        Some(true) => println!("nat66:      active"),
-        Some(false) => println!("nat66:      inactive"),
-        None => println!("nat66:      unknown (helper not running)"),
+    if s.user_disabled {
+        println!("nat66:      disabled by user (run: pelagos nat66 enable to re-enable)");
+    } else {
+        println!(
+            "nat66:      {}",
+            if s.active { "active" } else { "inactive" }
+        );
     }
 }
 
@@ -276,12 +444,10 @@ pub fn cmd_status() {
 // ---------------------------------------------------------------------------
 
 fn find_helper_binary() -> Result<std::path::PathBuf, String> {
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("current_exe: {e}"))?;
-    let bin_dir = exe.parent()
-        .ok_or("binary has no parent directory")?;
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let bin_dir = exe.parent().ok_or("binary has no parent directory")?;
 
-    // Development layout: target/<triple>/release/pelagos-pfctl
+    // Development layout: target/<triple>/release/pelagos-pfctl (sibling)
     // Homebrew layout: bin/pelagos and bin/pelagos-pfctl are siblings
     let candidates = [
         bin_dir.join("pelagos-pfctl"),

@@ -456,14 +456,26 @@ enum ContainerCommands {
 
 #[derive(Subcommand)]
 enum Nat66Commands {
-    /// Install the pelagos-pfctl privileged helper and register it as a system
-    /// LaunchDaemon.  Requires root: run with sudo.
+    /// Enable IPv6 NAT66: install the privileged helper if needed (shows a
+    /// macOS authorization dialog), then load the pf rule.  Safe to invoke
+    /// from a GUI — no terminal or sudo required.
+    Enable,
+    /// Disable IPv6 NAT66: unload the active pf rule and suppress auto-load
+    /// on future VM starts.  Does not uninstall the helper.
+    Disable,
+    /// Show IPv6 availability and current NAT66 rule status.
+    Status {
+        /// Output machine-readable JSON (for GUI integration).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Install the pelagos-pfctl privileged helper and register it as a
+    /// system LaunchDaemon.  Requires root: run with sudo.
+    /// Prefer `pelagos nat66 enable` from a GUI — it handles elevation.
     Install,
     /// Remove the pelagos-pfctl helper and its LaunchDaemon registration.
     /// Requires root: run with sudo.
     Uninstall,
-    /// Show IPv6 availability and current NAT66 rule status.
-    Status,
 }
 
 // ---------------------------------------------------------------------------
@@ -750,6 +762,30 @@ fn main() {
 
     match cli.command {
         Commands::Nat66 {
+            sub: Nat66Commands::Enable,
+        } => {
+            if let Err(e) = nat66::cmd_enable() {
+                eprintln!("error: {e}");
+                process::exit(1);
+            }
+        }
+
+        Commands::Nat66 {
+            sub: Nat66Commands::Disable,
+        } => {
+            if let Err(e) = nat66::cmd_disable() {
+                eprintln!("error: {e}");
+                process::exit(1);
+            }
+        }
+
+        Commands::Nat66 {
+            sub: Nat66Commands::Status { json },
+        } => {
+            nat66::cmd_status(json);
+        }
+
+        Commands::Nat66 {
             sub: Nat66Commands::Install,
         } => {
             if let Err(e) = nat66::cmd_install() {
@@ -765,12 +801,6 @@ fn main() {
                 eprintln!("error: {e}");
                 process::exit(1);
             }
-        }
-
-        Commands::Nat66 {
-            sub: Nat66Commands::Status,
-        } => {
-            nat66::cmd_status();
         }
 
         Commands::VmDaemonInternal => {
