@@ -1149,7 +1149,14 @@ busybox ip route add default via 192.168.105.1
 # router-port traffic, not host-port traffic).
 # fdfe:: is a valid ULA prefix (fc00::/7); /128 avoids polluting the routing table.
 busybox ip -6 addr add fdfe::1/128 dev eth0 2>/dev/null || true
-echo "[pelagos-init] network: static 192.168.105.2/24 + joined ff02::1:ff00:01 via fdfe::1/128"
+# ULA (Phase 2): assign fd00::2/64 so the VM has a routable IPv6 address.
+# The relay holds fd00::1/64.  This enables ping6 fd00::1 from the VM and
+# from containers (once the pelagos bridge is configured for IPv6).
+busybox ip -6 addr add fd00::2/64 dev eth0 2>/dev/null || true
+busybox ip -6 route add default via fd00::1 dev eth0 2>/dev/null || true
+# Enable IPv6 forwarding so containers can route through the VM's eth0.
+echo 1 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || true
+echo "[pelagos-init] network: static 192.168.105.2/24, fd00::2/64 ULA, + joined ff02::1:ff00:01 via fdfe::1/128"
 # Enable IP forwarding unconditionally — this is a container runtime VM.
 # pelagos port-forwarding uses nftables DNAT in PREROUTING to redirect
 # host-port connections to the container IP, which requires ip_forward=1

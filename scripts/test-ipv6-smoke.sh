@@ -113,15 +113,30 @@ else
     echo "    output: $(echo "$PING6_OUT" | tail -3)"
 fi
 
-# --- Phase 2: ULA ping6 (uncomment after initramfs rebuild) ------------------
-# GW_ULA="fd00::1"
-# printf "  ping6 gateway ULA ($GW_ULA)... "
-# PING6_ULA=$($PELAGOS vm ssh -- "ping6 -c 3 -W 2 $GW_ULA 2>&1" 2>/dev/null || true)
-# if echo "$PING6_ULA" | grep -qE "3 received|[1-9] received"; then
-#     pass "ping6 $GW_ULA: ok"
-# else
-#     fail "ping6 $GW_ULA failed"
-# fi
+# --- Phase 2: ULA ping6 from VM root namespace --------------------------------
+echo ""
+echo "--- Phase 2: ICMPv6 echo (ULA fd00::1, VM root namespace) ---"
+
+printf "  VM ULA addr (fd00::2/64 on eth0)... "
+ULA_OUT=$($PELAGOS vm ssh -- "ip -6 addr show dev eth0 scope global 2>/dev/null" 2>/dev/null || true)
+if echo "$ULA_OUT" | grep -q "fd00::2"; then
+    pass "VM has fd00::2/64 on eth0"
+else
+    fail "VM eth0 missing fd00::2/64 (got: $ULA_OUT)"
+fi
+
+GW_ULA="fd00::1"
+printf "  ping6 gateway ULA (%s) from VM root ns... " "$GW_ULA"
+PING6_ULA=$($PELAGOS vm ssh -- "ping6 -c 3 -W 2 $GW_ULA 2>&1" 2>/dev/null || true)
+if echo "$PING6_ULA" | grep -qE "0% packet loss"; then
+    pass "ping6 $GW_ULA: 0% loss"
+elif echo "$PING6_ULA" | grep -qE "[1-9] (packets )?received"; then
+    RECEIVED=$(echo "$PING6_ULA" | grep -oE "[0-9]+ (packets )?received" | head -1)
+    pass "ping6 $GW_ULA: $RECEIVED (partial — acceptable)"
+else
+    fail "ping6 $GW_ULA failed"
+    echo "    output: $(echo "$PING6_ULA" | tail -3)"
+fi
 
 # --- summary -----------------------------------------------------------------
 echo ""

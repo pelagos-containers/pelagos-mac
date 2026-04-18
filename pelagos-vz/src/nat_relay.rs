@@ -275,6 +275,21 @@ const GATEWAY_MAC: EthernetAddress = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x
 ///   Insert ff:fe:  00:00:00:ff:fe:00:00:01
 ///   Prepend fe80:  fe80::00ff:fe00:0001  (i.e. fe80::ff:fe00:1)
 const GATEWAY_IP6_LL: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0x00ff, 0xfe00, 0x0000, 0x0001);
+/// Solicited-node multicast MAC for GATEWAY_IP6_ULA (fd00::1).
+/// Last 3 bytes of fd00::1 are 00:00:01 → 33:33:ff:00:00:01.
+/// VZ's virtual switch delivers frames sent to this multicast MAC to the relay,
+/// so we advertise it as the TLLA in NA replies for fd00::1 (same trick as the LL gateway).
+#[allow(dead_code)] // used in pre_scan_frames — referenced by name
+const ULA_MCAST_MAC: [u8; 6] = [0x33, 0x33, 0xff, 0x00, 0x00, 0x01];
+
+/// ULA (Unique Local Address) gateway address: fd00::1/64.
+/// The VM is assigned fd00::2/64 in the initramfs init script.  smoltcp
+/// responds to NDP and ICMPv6 echo for this address automatically once
+/// it is added to the interface.
+pub(crate) const GATEWAY_IP6_ULA: Ipv6Address = Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
+/// Raw bytes of GATEWAY_IP6_ULA for use in Ethernet frame construction (smoltcp's
+/// Ipv6Address wraps std::net::Ipv6Addr whose fields are private).
+const GATEWAY_IP6_ULA_BYTES: [u8; 16] = [0xfd, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 /// Compute the dynamic gateway IPv6 link-local address for a given VM MAC.
 ///
 /// VZ's virtual switch uses MLD snooping: it only delivers IPv6 multicast to
@@ -380,9 +395,19 @@ fn pre_scan_frames(
         if icmpv6_echo_reply(device.relay_fd, &frame) {
             continue;
         }
-        // Handle NDP Neighbor Solicitations targeting the gateway — reply and discard.
+        // Handle NDP Neighbor Solicitations targeting the gateway LL — reply and discard.
         if ndp_neighbor_advertisement(device.relay_fd, &frame,
                 device.gateway_ip6_ll.as_ref(), device.gateway_ip6_mcast_mac.as_ref()) {
+            continue;
+        }
+        // Handle NDP Neighbor Solicitations targeting the gateway ULA (fd00::1) — reply and discard.
+        // smoltcp receives these NS frames but does not generate NA responses reliably due to
+        // VZ MLD snooping: multicast delivery requires the relay to have joined the solicited-node
+        // group ff02::1:ff00:0001, which smoltcp's MLD joins cannot accomplish here.
+        // We handle it manually, advertising ULA_MCAST_MAC as TLLA so VZ delivers subsequent
+        // packets to fd00::1 via the multicast Ethernet address the relay already receives.
+        if ndp_neighbor_advertisement(device.relay_fd, &frame,
+                Some(&GATEWAY_IP6_ULA_BYTES), Some(&ULA_MCAST_MAC)) {
             continue;
         }
         // Detect DAD NS (source IPv6 = ::, ICMPv6 type = 135).
@@ -415,10 +440,12 @@ fn pre_scan_frames(
                     }
                 }
             }
-            log::debug!("nat_relay: DAD NS detected — sending immediate NDP NA for gateway");
+            log::debug!("nat_relay: DAD NS detected — sending immediate NDP NA for gateway (LL + ULA)");
             if let (Some(gw6), Some(gw_mcast_mac)) = (device.gateway_ip6_ll, device.gateway_ip6_mcast_mac) {
                 send_ndp_unsolicited_na(device.relay_fd, device.guest_mac, &gw6, &gw_mcast_mac);
             }
+            // Also seed the VM neighbor cache for the ULA gateway (fd00::1).
+            send_ndp_unsolicited_na(device.relay_fd, device.guest_mac, &GATEWAY_IP6_ULA_BYTES, &ULA_MCAST_MAC);
         }
 
         // Handle UDP datagrams inline — proxy to real host, reply in thread.
@@ -582,6 +609,12 @@ fn run_relay(relay_fd: RawFd, relay_proxy_port: u16, inbound_rx: Receiver<(TcpSt
         // once a link-local address is configured — no manual NS/NA synthesis needed.
         addrs
             .push(IpCidr::new(IpAddress::Ipv6(GATEWAY_IP6_LL), 64))
+            .ok();
+        // ULA address fd00::1/64.  The VM is assigned fd00::2/64 in the
+        // initramfs init script.  smoltcp answers NDP and ICMPv6 echo for
+        // this address automatically.
+        addrs
+            .push(IpCidr::new(IpAddress::Ipv6(GATEWAY_IP6_ULA), 64))
             .ok();
     });
     // any_ip=true alone is not enough: smoltcp also requires a route to the
@@ -859,14 +892,15 @@ fn run_relay(relay_fd: RawFd, relay_proxy_port: u16, inbound_rx: Receiver<(TcpSt
             last_arp_keepalive = std::time::Instant::now();
         }
 
-        // NDP keepalive: unsolicited NA to seed the VM's IPv6 neighbor cache.
-        if let (Some(gw6), Some(gw_mcast_mac)) = (device.gateway_ip6_ll, device.gateway_ip6_mcast_mac) {
-            if std::time::Instant::now() >= ndp_keepalive_start
-                && last_ndp_keepalive.elapsed() >= NDP_KEEPALIVE_INTERVAL
-            {
+        // NDP keepalive: unsolicited NA for LL + ULA to seed the VM's IPv6 neighbor cache.
+        if std::time::Instant::now() >= ndp_keepalive_start
+            && last_ndp_keepalive.elapsed() >= NDP_KEEPALIVE_INTERVAL
+        {
+            if let (Some(gw6), Some(gw_mcast_mac)) = (device.gateway_ip6_ll, device.gateway_ip6_mcast_mac) {
                 send_ndp_unsolicited_na(device.relay_fd, device.guest_mac, &gw6, &gw_mcast_mac);
-                last_ndp_keepalive = std::time::Instant::now();
             }
+            send_ndp_unsolicited_na(device.relay_fd, device.guest_mac, &GATEWAY_IP6_ULA_BYTES, &ULA_MCAST_MAC);
+            last_ndp_keepalive = std::time::Instant::now();
         }
 
         let delay = iface
