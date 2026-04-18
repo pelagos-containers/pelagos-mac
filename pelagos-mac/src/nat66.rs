@@ -329,10 +329,29 @@ pub fn cmd_install() -> Result<(), String> {
 
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        // "service already loaded" is not an error.
-        if !stderr.contains("already loaded") && !stderr.contains("service exists") {
+        // Error 5 ("Bootstrap failed: 5: Input/output error") means the service
+        // is already registered — not a real error.
+        let already_loaded = stderr.contains("already loaded")
+            || stderr.contains("service exists")
+            || out.status.code() == Some(5)
+            || stderr.contains(": 5:");
+        if !already_loaded {
             return Err(format!("launchctl bootstrap: {stderr}"));
         }
+    }
+
+    // Wait for the daemon to start accepting connections (launchctl bootstrap
+    // returns before the process is ready).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if helper_available() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!("warning: helper installed but socket not yet available; check /var/log/pelagos-pfctl.log");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
     println!("pelagos-pfctl installed and running.");
