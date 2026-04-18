@@ -5,6 +5,7 @@ members = [
     "pelagos-mac",
     "pelagos-docker",
     "pelagos-tui",
+    "pelagos-pfctl",
 ]
 resolver = "2"
 

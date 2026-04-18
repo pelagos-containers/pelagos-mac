@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 
 use pelagos_vz::vm::{Vm, VmConfig};
 
+use crate::nat66;
+
 use crate::port_dispatcher::{DispatchCmd, PortDispatcher};
 use crate::state::StateDir;
 
@@ -313,6 +315,41 @@ pub fn run(args: DaemonArgs) -> ! {
         Arc::clone(&port_state),
     );
 
+    // Load IPv6 NAT66 rule if the host has a global IPv6 address and the
+    // pelagos-pfctl helper is installed.  Non-fatal: if the helper is absent
+    // or the user has disabled NAT66, the VM starts normally.
+    let nat66_iface: Option<String> = if nat66::is_disabled_by_user() {
+        log::debug!("nat66: disabled by user — skipping");
+        None
+    } else {
+        match nat66::detect_global_ipv6_iface() {
+            None => {
+                log::info!("nat66: host has no global IPv6 address — NAT66 not loaded");
+                None
+            }
+            Some((iface, addr)) => {
+                log::info!("nat66: host IPv6 detected: {addr} on {iface}");
+                match nat66::load(&iface) {
+                    Ok(true) => {
+                        log::info!("nat66: rule loaded for {iface}");
+                        Some(iface)
+                    }
+                    Ok(false) => {
+                        log::debug!(
+                            "nat66: helper not installed — IPv6 NAT disabled \
+                             (run: pelagos nat66 enable)"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        log::warn!("nat66: load failed: {e}");
+                        None
+                    }
+                }
+            }
+        }
+    };
+
     // Install SIGTERM handler: sets flag, SIGINT terminates immediately.
     let shutdown = Arc::new(AtomicBool::new(false));
     {
@@ -346,6 +383,16 @@ pub fn run(args: DaemonArgs) -> ! {
 
         if shutdown.load(Ordering::Relaxed) {
             log::info!("shutdown requested, stopping VM...");
+
+            // Remove the NAT66 rule before tearing down the VM.
+            if let Some(ref iface) = nat66_iface {
+                if let Err(e) = nat66::unload() {
+                    log::warn!("nat66: unload failed: {e}");
+                } else {
+                    log::info!("nat66: rule removed (was on {iface})");
+                }
+            }
+
             dispatcher.send(DispatchCmd::Shutdown);
             drop(dispatcher);
             // Drop the Arc. If no proxy threads are active, Vm::drop runs stop().

@@ -1,0 +1,16 @@
+[package]
+name = "pelagos-pfctl"
+version.workspace = true
+edition.workspace = true
+description = "Privileged pf NAT66 helper daemon for pelagos-mac"
+
+[[bin]]
+name = "pelagos-pfctl"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+env_logger.workspace = true
+libc.workspace = true
