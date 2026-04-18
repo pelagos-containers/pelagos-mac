@@ -15,6 +15,7 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 mod daemon;
+mod nat66;
 mod port_dispatcher;
 mod state;
 
@@ -286,6 +287,12 @@ enum Commands {
         #[command(subcommand)]
         sub: VmCommands,
     },
+    /// Manage IPv6 NAT66 (outbound IPv6 from VM to internet via pf).
+    Nat66 {
+        #[command(subcommand)]
+        sub: Nat66Commands,
+    },
+
     /// Internal: run as the persistent VM daemon. Not for direct use.
     #[command(hide = true)]
     VmDaemonInternal,
@@ -445,6 +452,18 @@ enum VmCommands {
 enum ContainerCommands {
     /// Remove all exited containers
     Prune,
+}
+
+#[derive(Subcommand)]
+enum Nat66Commands {
+    /// Install the pelagos-pfctl privileged helper and register it as a system
+    /// LaunchDaemon.  Requires root: run with sudo.
+    Install,
+    /// Remove the pelagos-pfctl helper and its LaunchDaemon registration.
+    /// Requires root: run with sudo.
+    Uninstall,
+    /// Show IPv6 availability and current NAT66 rule status.
+    Status,
 }
 
 // ---------------------------------------------------------------------------
@@ -730,6 +749,30 @@ fn main() {
     let profile = cli.profile.clone();
 
     match cli.command {
+        Commands::Nat66 {
+            sub: Nat66Commands::Install,
+        } => {
+            if let Err(e) = nat66::cmd_install() {
+                eprintln!("error: {e}");
+                process::exit(1);
+            }
+        }
+
+        Commands::Nat66 {
+            sub: Nat66Commands::Uninstall,
+        } => {
+            if let Err(e) = nat66::cmd_uninstall() {
+                eprintln!("error: {e}");
+                process::exit(1);
+            }
+        }
+
+        Commands::Nat66 {
+            sub: Nat66Commands::Status,
+        } => {
+            nat66::cmd_status();
+        }
+
         Commands::VmDaemonInternal => {
             let args = daemon_args_from_cli(&cli);
             daemon::run(args); // -> !
