@@ -215,7 +215,7 @@ impl smoltcp::phy::Device for AvfDevice {
             }
             if !ndp_neighbor_advertisement(self.relay_fd, &frame,
                     self.gateway_ip6_ll.as_ref(), self.gateway_ip6_mcast_mac.as_ref())
-                && !icmpv6_echo_reply(self.relay_fd, &frame)
+                && !icmpv6_echo_reply(self.relay_fd, &frame, self.gateway_ip6_ll.as_ref())
             {
                 self.pending_frames.push_back(frame);
             }
@@ -392,7 +392,7 @@ fn pre_scan_frames(
             continue;
         }
         // Handle ICMPv6 echo requests inline — reply and discard.
-        if icmpv6_echo_reply(device.relay_fd, &frame) {
+        if icmpv6_echo_reply(device.relay_fd, &frame, device.gateway_ip6_ll.as_ref()) {
             continue;
         }
         // Handle NDP Neighbor Solicitations targeting the gateway LL — reply and discard.
@@ -1460,12 +1460,18 @@ fn inet_checksum(data: &[u8]) -> u16 {
 // ICMPv6 echo reply synthesizer
 // ---------------------------------------------------------------------------
 
-/// If `frame` is an IPv6 ICMPv6 Echo Request (type 128), synthesize an Echo
-/// Reply (type 129) and write it back to `relay_fd`.  Returns true if handled.
+/// If `frame` is an IPv6 ICMPv6 Echo Request (type 128) **addressed to one of
+/// the relay's own IPv6 addresses**, synthesize an Echo Reply (type 129) and
+/// write it back to `relay_fd`.  Returns true if handled.
+///
+/// Only responds to pings targeting the relay itself (gateway LL or ULA).
+/// Echo requests to external addresses are NOT answered — doing so would fake
+/// internet reachability and hide the absence of real IPv6 connectivity from
+/// the VM's point of view.
 ///
 /// ICMPv6 checksum covers a pseudo-header:
 ///   src IPv6 (16 B) | dst IPv6 (16 B) | ICMPv6 length (4 B) | zeros (3 B) | next-header=58 (1 B)
-fn icmpv6_echo_reply(relay_fd: RawFd, frame: &[u8]) -> bool {
+fn icmpv6_echo_reply(relay_fd: RawFd, frame: &[u8], gw6_ll: Option<&[u8; 16]>) -> bool {
     // Minimum: 14 (Ethernet) + 40 (IPv6) + 8 (ICMPv6 header) = 62 bytes.
     if frame.len() < 62 {
         return false;
@@ -1481,6 +1487,15 @@ fn icmpv6_echo_reply(relay_fd: RawFd, frame: &[u8]) -> bool {
     // ICMPv6 type must be 128 (Echo Request).
     let icmp_off = 14 + 40;
     if frame[icmp_off] != 128 || frame[icmp_off + 1] != 0 {
+        return false;
+    }
+    // Only answer pings to the relay's own addresses.  Synthesizing replies for
+    // external destinations would silently fake IPv6 reachability.
+    let dst6: [u8; 16] = frame[14 + 24..14 + 40].try_into().unwrap();
+    let is_own_addr = dst6 == GATEWAY_IP6_ULA_BYTES
+        || gw6_ll.map_or(false, |ll| dst6 == *ll);
+    if !is_own_addr {
+        log::debug!("nat_relay: icmpv6 echo to external dst {:?} — not answered (no NAT66)", dst6);
         return false;
     }
     log::info!("nat_relay: icmpv6 echo request received — synthesizing reply");
@@ -1871,7 +1886,7 @@ mod tests {
         let dst_ip = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xfe, 0, 0, 1, 0, 0u8]; // gateway LL
         let frame = make_icmpv6_echo_request(src_mac, dst_mac, src_ip, dst_ip, 0x42, 0x01);
 
-        assert!(icmpv6_echo_reply(fd_a, &frame));
+        assert!(icmpv6_echo_reply(fd_a, &frame, Some(&dst_ip)));
 
         let mut buf = vec![0u8; 1500];
         let n = unsafe { libc::recv(fd_b, buf.as_mut_ptr() as _, buf.len(), 0) };
@@ -1912,14 +1927,14 @@ mod tests {
         let frame = make_icmpv4_echo_request(
             [0x11; 6], [0x22; 6], [10, 0, 0, 1], [10, 0, 0, 2], 1, 1,
         );
-        assert!(!icmpv6_echo_reply(fd_a, &frame));
+        assert!(!icmpv6_echo_reply(fd_a, &frame, None));
         unsafe { libc::close(fd_a); libc::close(fd_b); }
     }
 
     #[test]
     fn test_icmpv6_echo_reply_rejects_short_frame() {
         let (fd_a, fd_b) = create_socketpair().unwrap();
-        assert!(!icmpv6_echo_reply(fd_a, &[0x86, 0xdd, 0, 0, 0, 0, 0, 0]));
+        assert!(!icmpv6_echo_reply(fd_a, &[0x86, 0xdd, 0, 0, 0, 0, 0, 0], None));
         unsafe { libc::close(fd_a); libc::close(fd_b); }
     }
 
@@ -1932,7 +1947,27 @@ mod tests {
             [0xaa; 6], [0xbb; 6], src_ip, dst_ip, 1, 1,
         );
         frame[54] = 135; // Neighbor Solicitation — should not be answered here
-        assert!(!icmpv6_echo_reply(fd_a, &frame));
+        assert!(!icmpv6_echo_reply(fd_a, &frame, Some(&dst_ip)));
+        unsafe { libc::close(fd_a); libc::close(fd_b); }
+    }
+
+    #[test]
+    fn test_icmpv6_echo_reply_rejects_external_dst() {
+        // Echo requests to non-relay addresses must NOT be answered.
+        // Faking replies for external destinations would hide the absence
+        // of real IPv6 connectivity.
+        let (fd_a, fd_b) = create_socketpair().unwrap();
+        let src_ip = [0xfd, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2u8]; // fd00::2 (VM)
+        let external = [0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0x88, 0x88u8]; // 2001:4860:4860::8888
+        let frame = make_icmpv6_echo_request([0xaa; 6], [0xbb; 6], src_ip, external, 1, 1);
+        // Pass the relay's own LL — the external dst still doesn't match.
+        let own_ll = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xfe, 0, 0, 1, 0, 0u8];
+        assert!(!icmpv6_echo_reply(fd_a, &frame, Some(&own_ll)),
+            "must not answer ping to external IPv6 address");
+        // Also with no known LL — should still reject.
+        assert!(!icmpv6_echo_reply(fd_a, &frame, None),
+            "must not answer ping to external IPv6 address (no LL known)");
         unsafe { libc::close(fd_a); libc::close(fd_b); }
     }
 
