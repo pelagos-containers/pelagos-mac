@@ -5,19 +5,13 @@
 //!
 //! Protocol: newline-delimited JSON.
 //!
-//! Legacy NAT66-only requests (for `pelagos nat66` subcommand):
-//!   {"action":"load","iface":"en0"}
-//!   {"action":"unload"}
-//!   {"action":"status"}
-//!
 //! utun relay requests (for `tun_relay.rs`):
 //!   {"action":"create_utun"}
 //!     → creates a utun fd as root, sends {"ok":true,"iface":"utunN"} + fd via SCM_RIGHTS.
 //!       The relay process receives the fd via recvmsg and holds it for the relay lifetime.
 //!   {"action":"setup_utun","iface":"utun5",
 //!    "ipv4_addr":"192.168.105.1","ipv4_peer":"192.168.105.2",
-//!    "ipv4_cidr":"192.168.105.0/24","ipv6_addr":"fd00::1",
-//!    "ipv6_prefix":64,"ipv6_cidr":"fd00::/64","egress_iface":"en0"}
+//!    "ipv4_cidr":"192.168.105.0/24","egress_iface":"en0"}
 //!   {"action":"teardown_utun","iface":"utun5"}
 //!   {"action":"add_rdr","proto":"tcp","host_port":2222,
 //!    "vm_ip":"192.168.105.2","vm_port":22}
@@ -37,20 +31,13 @@ use serde::{Deserialize, Serialize};
 
 const SOCK_PATH: &str = "/var/run/pelagos-pfctl.sock";
 
-// Legacy NAT66-only anchor (kept for backward compat with `pelagos nat66` subcommand).
-const ANCHOR_NAT66: &str = "com.apple/pelagos-nat66";
-const ANCHOR_FILE_NAT66: &str = "/etc/pf.anchors/pelagos-nat66";
-
-// Combined NAT44+NAT66 anchor used by the utun relay.
+// NAT44 anchor used by the utun relay.
 const ANCHOR_NAT: &str = "com.apple/pelagos-nat";
 const ANCHOR_FILE_NAT: &str = "/etc/pf.anchors/pelagos-nat";
 
 // RDR anchor used by the utun relay for port forwarding.
 const ANCHOR_RDR: &str = "com.apple/pelagos-rdr";
 const ANCHOR_FILE_RDR: &str = "/etc/pf.anchors/pelagos-rdr";
-
-// ULA source prefix for the legacy NAT66-only rule.
-const VM_PREFIX_V6: &str = "fd00::/64";
 
 // ---------------------------------------------------------------------------
 // macOS utun constants and C structs (used by create_utun_privileged)
@@ -118,27 +105,17 @@ impl DaemonState {
 }
 
 // ---------------------------------------------------------------------------
-// Wire types (must match request senders in nat66.rs and tun_relay.rs)
+// Wire types (must match request senders in tun_relay.rs)
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum Request {
-    // Legacy NAT66-only operations.
-    Load {
-        iface: String,
-    },
-    Unload,
-    Status,
-    // utun relay operations.
     SetupUtun {
         iface: String,
         ipv4_addr: String,
         ipv4_peer: String,
         ipv4_cidr: String,
-        ipv6_addr: String,
-        ipv6_prefix: u8,
-        ipv6_cidr: String,
         egress_iface: String,
     },
     TeardownUtun {
@@ -256,26 +233,17 @@ fn handle_connection(stream: std::os::unix::net::UnixStream, state: Arc<Mutex<Da
 
     let mut st = state.lock().unwrap();
     let resp = match req {
-        Request::Load { iface } => handle_load(&iface),
-        Request::Unload => handle_unload(),
-        Request::Status => handle_status(),
         Request::SetupUtun {
             iface,
             ipv4_addr,
             ipv4_peer,
             ipv4_cidr,
-            ipv6_addr,
-            ipv6_prefix,
-            ipv6_cidr,
             egress_iface,
         } => handle_setup_utun(
             &iface,
             &ipv4_addr,
             &ipv4_peer,
             &ipv4_cidr,
-            &ipv6_addr,
-            ipv6_prefix,
-            &ipv6_cidr,
             &egress_iface,
             &mut st,
         ),
@@ -297,60 +265,14 @@ fn handle_connection(stream: std::os::unix::net::UnixStream, state: Arc<Mutex<Da
 }
 
 // ---------------------------------------------------------------------------
-// Legacy NAT66 handlers (load / unload / status)
-// ---------------------------------------------------------------------------
-
-fn handle_load(iface: &str) -> Response {
-    if !is_safe_iface(iface) {
-        return err_resp(format!("invalid interface name: {iface:?}"));
-    }
-    let rule = format!("nat on {iface} inet6 from {VM_PREFIX_V6} to any -> ({iface})\n");
-    if let Err(e) = std::fs::write(ANCHOR_FILE_NAT66, &rule) {
-        return err_resp(format!("write {ANCHOR_FILE_NAT66}: {e}"));
-    }
-    // Ensure pf is enabled (exit code 1 when already enabled is fine — ignore it).
-    let _ = Command::new("/sbin/pfctl").arg("-e").output();
-    match run_pfctl(&["-a", ANCHOR_NAT66, "-f", ANCHOR_FILE_NAT66]) {
-        Ok(_) => {
-            log::info!("nat66 loaded on {iface}: {}", rule.trim());
-            ok_active(true)
-        }
-        Err(e) => err_resp(format!("pfctl: {e}")),
-    }
-}
-
-fn handle_unload() -> Response {
-    match run_pfctl(&["-a", ANCHOR_NAT66, "-F", "all"]) {
-        Ok(_) => ok_active(false),
-        Err(e) if e.contains("Anchor does not exist") => ok_active(false),
-        Err(e) => err_resp(format!("pfctl: {e}")),
-    }
-}
-
-fn handle_status() -> Response {
-    let out = Command::new("/sbin/pfctl")
-        .args(["-a", ANCHOR_NAT66, "-s", "nat"])
-        .output();
-    let active = match out {
-        Ok(o) if o.status.success() => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
-        _ => false,
-    };
-    ok_active(active)
-}
-
-// ---------------------------------------------------------------------------
 // utun relay handlers
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
 fn handle_setup_utun(
     iface: &str,
     ipv4_addr: &str,
     ipv4_peer: &str,
     ipv4_cidr: &str,
-    ipv6_addr: &str,
-    ipv6_prefix: u8,
-    ipv6_cidr: &str,
     egress_iface: &str,
     state: &mut DaemonState,
 ) -> Response {
@@ -363,26 +285,14 @@ fn handle_setup_utun(
         return err_resp(format!("ifconfig inet: {e}"));
     }
 
-    // 2. Assign IPv6
-    let prefix_str = ipv6_prefix.to_string();
-    if let Err(e) = run_ifconfig(&[iface, "inet6", ipv6_addr, "prefixlen", &prefix_str]) {
-        return err_resp(format!("ifconfig inet6: {e}"));
-    }
-
-    // 3. Enable kernel IP forwarding — the kernel must route packets that arrive on
-    //    the utun interface out through the egress interface so pf NAT can fire.
-    //    The smoltcp relay never needed this (pure userspace), but the utun relay does.
+    // 2. Enable kernel IP forwarding for IPv4 NAT44.
     if let Err(e) = run_sysctl_set("net.inet.ip.forwarding", "1") {
         return err_resp(format!("sysctl net.inet.ip.forwarding: {e}"));
     }
-    if let Err(e) = run_sysctl_set("net.inet6.ip6.forwarding", "1") {
-        log::warn!("sysctl net.inet6.ip6.forwarding: {e}"); // non-fatal — IPv6 may not be available
-    }
 
-    // 4. Write and load combined NAT44+NAT66 anchor.
+    // 3. Write and load NAT44 anchor.
     let nat_rules = format!(
-        "nat on {egress_iface} inet from {ipv4_cidr} to any -> ({egress_iface})\n\
-         nat on {egress_iface} inet6 from {ipv6_cidr} to any -> ({egress_iface})\n"
+        "nat on {egress_iface} inet from {ipv4_cidr} to any -> ({egress_iface})\n"
     );
     if let Err(e) = std::fs::write(ANCHOR_FILE_NAT, &nat_rules) {
         return err_resp(format!("write {ANCHOR_FILE_NAT}: {e}"));
@@ -410,7 +320,6 @@ fn handle_teardown_utun(iface: &str, state: &mut DaemonState) -> Response {
         let _ = run_pfctl(&["-a", ANCHOR_RDR, "-F", "all"]);
         // Disable IP forwarding only when no utun relays remain.
         let _ = run_sysctl_set("net.inet.ip.forwarding", "0");
-        let _ = run_sysctl_set("net.inet6.ip6.forwarding", "0");
         state.utun_iface = None;
         state.egress_iface = None;
         state.rdr_rules.clear();
@@ -685,14 +594,6 @@ fn ok_resp() -> Response {
         ok: true,
         error: None,
         active: None,
-    }
-}
-
-fn ok_active(active: bool) -> Response {
-    Response {
-        ok: true,
-        error: None,
-        active: Some(active),
     }
 }
 

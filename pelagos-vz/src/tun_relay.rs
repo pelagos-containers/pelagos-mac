@@ -688,9 +688,6 @@ fn pfctl_setup_utun(iface: &str, egress: &str) -> Result<(), crate::Error> {
         ipv4_addr: &'static str,
         ipv4_peer: &'static str,
         ipv4_cidr: &'static str,
-        ipv6_addr: &'static str,
-        ipv6_prefix: u8,
-        ipv6_cidr: &'static str,
         egress_iface: &'a str,
     }
     let json = serde_json::to_string(&Req {
@@ -699,9 +696,6 @@ fn pfctl_setup_utun(iface: &str, egress: &str) -> Result<(), crate::Error> {
         ipv4_addr: "192.168.105.1",
         ipv4_peer: "192.168.105.2",
         ipv4_cidr: "192.168.105.0/24",
-        ipv6_addr: "fd00::1",
-        ipv6_prefix: 64,
-        ipv6_cidr: "fd00::/64",
         egress_iface: egress,
     })
     .map_err(|e| crate::Error::Runtime(e.to_string()))?;
