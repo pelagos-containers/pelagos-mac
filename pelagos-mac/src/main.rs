@@ -2035,67 +2035,96 @@ fn vm_ls() {
 fn vm_init(profile: &str, vm_data: Option<&std::path::Path>, force: bool) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind};
 
+    // ── 0. running-VM guard (bug 1) ───────────────────────────────────────
+    // Refuse to overwrite root.img while the VM is running without --force.
+    // Without this guard, if root.img has been unlinked while the VM daemon
+    // holds it open (Unix unlink-while-open), dst_disk.exists() returns false
+    // and vm init silently overwrites the user's OCI image cache.
+    if !force {
+        if let Ok(st) = state::StateDir::open_profile(profile) {
+            if let Some(pid) = st.running_pid() {
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    format!(
+                        "VM is running (pid {pid}). \
+                         Stop it first with 'pelagos vm stop', then re-run \
+                         'pelagos vm init', or pass --force to stop it automatically."
+                    ),
+                ));
+            }
+        }
+    }
+
     // ── 1. locate source directory ────────────────────────────────────────
-    let src_dir: PathBuf = if let Some(p) = vm_data {
-        p.to_path_buf()
+    let src_dir: Option<PathBuf> = if let Some(p) = vm_data {
+        let canonical = p.canonicalize().map_err(|e| {
+            Error::new(
+                ErrorKind::NotFound,
+                format!("vm-data directory {}: {}", p.display(), e),
+            )
+        })?;
+        Some(canonical)
     } else {
+        None
+    };
+
+    // ── 2. resolve artifact paths ─────────────────────────────────────────
+    // When --vm-data is given, require kernel + disk in that dir and write
+    // their absolute paths to vm.conf (dev workflow: custom kernel/initrd).
+    //
+    // When --vm-data is absent, only locate the disk here; kernel/initrd are
+    // NOT written to vm.conf so that runtime discovery finds them via the
+    // Homebrew pkgshare symlink, which always resolves to the current keg.
+    // This prevents vm.conf from going stale after `brew upgrade`.
+    let (kernel_for_conf, initrd_for_conf, src_disk) = if let Some(ref dir) = src_dir {
+        let kernel = ["vmlinuz", "ubuntu-vmlinuz"]
+            .iter()
+            .map(|n| dir.join(n))
+            .find(|p| p.exists())
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::NotFound,
+                    format!("vmlinuz not found in {}", dir.display()),
+                )
+            })?;
+        let initrd = ["initramfs.gz", "initramfs-custom.gz"]
+            .iter()
+            .map(|n| dir.join(n))
+            .find(|p| p.exists());
+        let disk = dir.join("root.img");
+        if !disk.exists() {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                format!("root.img not found in {}", dir.display()),
+            ));
+        }
+        (Some(kernel), initrd, disk)
+    } else {
+        // No explicit vm-data: find the disk only. The kernel/initrd will be
+        // discovered at runtime from the Homebrew pkgshare.
         let binary = std::env::current_exe()
             .map_err(|e| Error::new(ErrorKind::NotFound, format!("cannot locate binary: {}", e)))?;
         let bin_dir = binary
             .parent()
             .ok_or_else(|| Error::new(ErrorKind::NotFound, "binary has no parent directory"))?;
-
-        // Check Homebrew formula layout (bin/../share/pelagos-mac), then cask
-        // layout (staged_path/share/pelagos-mac where binary sits at
-        // staged_path root), then dev out/.
         let candidates = [
             bin_dir.join("../share/pelagos-mac"),
             bin_dir.join("share/pelagos-mac"),
             bin_dir.join("../../../out"),
         ];
-        candidates
-            .into_iter()
-            .find(|d| d.join("vmlinuz").exists() || d.join("ubuntu-vmlinuz").exists())
+        let disk = candidates
+            .iter()
+            .map(|d| d.join("root.img"))
+            .find(|p| p.exists())
             .ok_or_else(|| {
                 Error::new(
                     ErrorKind::NotFound,
-                    "VM artifacts not found. Specify --vm-data <dir> or run \
+                    "root.img not found. Specify --vm-data <dir> or run \
                      'brew install pelagos-containers/tap/pelagos-mac' first.",
                 )
-            })?
+            })?;
+        (None, None, disk)
     };
-
-    let src_dir = src_dir.canonicalize().map_err(|e| {
-        Error::new(
-            ErrorKind::NotFound,
-            format!("vm-data directory {}: {}", src_dir.display(), e),
-        )
-    })?;
-
-    // ── 2. resolve artifact paths in source dir ───────────────────────────
-    let kernel = ["vmlinuz", "ubuntu-vmlinuz"]
-        .iter()
-        .map(|n| src_dir.join(n))
-        .find(|p| p.exists())
-        .ok_or_else(|| {
-            Error::new(
-                ErrorKind::NotFound,
-                format!("vmlinuz not found in {}", src_dir.display()),
-            )
-        })?;
-
-    let initrd = ["initramfs.gz", "initramfs-custom.gz"]
-        .iter()
-        .map(|n| src_dir.join(n))
-        .find(|p| p.exists());
-
-    let src_disk = src_dir.join("root.img");
-    if !src_disk.exists() {
-        return Err(Error::new(
-            ErrorKind::NotFound,
-            format!("root.img not found in {}", src_dir.display()),
-        ));
-    }
 
     // ── 3. prepare profile state dir and disk path ────────────────────────
     let state_dir = state::profile_dir(profile)?;
@@ -2150,15 +2179,21 @@ fn vm_init(profile: &str, vm_data: Option<&std::path::Path>, force: bool) -> std
     }
 
     // ── 4. write vm.conf ──────────────────────────────────────────────────
+    // Only kernel/initrd overrides (from --vm-data) are written here.
+    // When absent, runtime discovery resolves them from the Homebrew pkgshare
+    // symlink so the paths never go stale after `brew upgrade`.
     let mut conf = format!(
         "# vm.conf — written by pelagos vm init\n\
-         kernel = {}\n\
+         # kernel and initrd are discovered automatically from the Homebrew\n\
+         # pkgshare unless overridden here (e.g. via --vm-data for dev builds).\n\
          disk   = {}\n",
-        kernel.display(),
         dst_disk.display(),
     );
-    if let Some(ref initrd) = initrd {
-        conf.push_str(&format!("initrd = {}\n", initrd.display()));
+    if let Some(ref k) = kernel_for_conf {
+        conf.push_str(&format!("kernel = {}\n", k.display()));
+    }
+    if let Some(ref i) = initrd_for_conf {
+        conf.push_str(&format!("initrd = {}\n", i.display()));
     }
 
     std::fs::write(&vm_conf, &conf)?;
@@ -2198,53 +2233,51 @@ struct DiscoveredArtifacts {
 
 /// Probe well-known locations for VM artifacts (kernel, initrd, disk image).
 ///
-/// Search order:
-///   1. `~/.local/share/pelagos/`          — XDG data dir (manually placed or previously used)
-///   2. `$(binary)/../share/pelagos-mac/`  — Homebrew pkgshare
-///   3. `$(binary)/../../../out/`            — dev build tree
+/// Kernel/initrd and disk are searched independently so that vm.conf can
+/// omit `kernel =` / `initrd =` (letting them be discovered at runtime from
+/// the Homebrew pkgshare symlink) while still specifying a custom disk path.
 ///
-/// Within each directory, both naming conventions are tried:
-///   kernel : `vmlinuz`, `ubuntu-vmlinuz`
-///   initrd : `initramfs.gz`, `initramfs-custom.gz`
-///   disk   : `root.img`
+/// Kernel search order (no disk required):
+///   1. `$(binary)/../share/pelagos-mac/`  — Homebrew formula pkgshare
+///   2. `$(binary)/share/pelagos-mac/`     — Homebrew cask staged layout
+///   3. `$(binary)/../../../out/`           — dev build tree
 ///
-/// Returns the first directory that contains at least a kernel and a disk image.
+/// Disk search order (fallback; vm.conf `disk =` takes priority in caller):
+///   1. `~/.local/share/pelagos/`          — XDG data dir (written by vm init)
+///   2. same dirs as kernel search         — fresh-install fallback
 fn discover_vm_artifacts() -> Option<DiscoveredArtifacts> {
     let binary = std::env::current_exe().ok()?;
     let bin_dir = binary.parent()?;
 
-    // Collect candidate directories, skipping any that fail to resolve.
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(base) = state::pelagos_base() {
-        dirs.push(base);
-    }
-    dirs.push(bin_dir.join("../share/pelagos-mac"));
-    dirs.push(bin_dir.join("../../../out"));
+    let kernel_dirs = [
+        bin_dir.join("../share/pelagos-mac"),
+        bin_dir.join("share/pelagos-mac"),
+        bin_dir.join("../../../out"),
+    ];
 
-    for dir in &dirs {
+    // Find kernel (and optional initrd) from install/dev dirs.
+    let (kernel, initrd) = kernel_dirs.iter().find_map(|dir| {
         let kernel = ["vmlinuz", "ubuntu-vmlinuz"]
             .iter()
             .map(|n| dir.join(n))
-            .find(|p| p.exists());
-        let disk = dir.join("root.img");
-
-        let (Some(kernel), true) = (kernel, disk.exists()) else {
-            continue;
-        };
-
+            .find(|p| p.exists())?;
         let initrd = ["initramfs.gz", "initramfs-custom.gz"]
             .iter()
             .map(|n| dir.join(n))
             .find(|p| p.exists());
+        log::debug!("auto-discovered kernel in {}", dir.display());
+        Some((kernel, initrd))
+    })?;
 
-        log::debug!("auto-discovered VM artifacts in {}", dir.display());
-        return Some(DiscoveredArtifacts {
-            kernel,
-            initrd,
-            disk,
-        });
+    // Find disk: user data dir first, then fall back to install/dev dirs.
+    let mut disk_dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(base) = state::pelagos_base() {
+        disk_dirs.push(base);
     }
-    None
+    disk_dirs.extend(kernel_dirs.iter().cloned());
+    let disk = disk_dirs.iter().map(|d| d.join("root.img")).find(|p| p.exists())?;
+
+    Some(DiscoveredArtifacts { kernel, initrd, disk })
 }
 
 // ---------------------------------------------------------------------------
