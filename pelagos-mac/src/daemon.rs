@@ -25,9 +25,28 @@ use serde::{Deserialize, Serialize};
 use pelagos_vz::vm::{Vm, VmConfig};
 
 use crate::nat66;
-
-use crate::port_dispatcher::{DispatchCmd, PortDispatcher};
 use crate::state::StateDir;
+
+// ---------------------------------------------------------------------------
+// PortRouter — port-forward abstraction over Arc<Vm>
+// ---------------------------------------------------------------------------
+
+/// Routes port-forward add/remove to the utun relay (pf RDR rules via pelagos-pfctl).
+struct PortRouter(Arc<Vm>);
+
+impl PortRouter {
+    fn add(&self, host_port: u16, container_port: u16) {
+        if let Err(e) = self.0.add_port_forward("tcp", host_port, container_port) {
+            log::warn!("add_rdr :{host_port}→:{container_port}: {e}");
+        }
+    }
+
+    fn remove(&self, host_port: u16) {
+        if let Err(e) = self.0.remove_port_forward("tcp", host_port) {
+            log::warn!("remove_rdr :{host_port}: {e}");
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -145,9 +164,6 @@ pub struct DaemonArgs {
     /// Secondary disk images: first → /dev/vdb, second → /dev/vdc, etc.
     /// Used during build-VM provisioning to avoid virtiofs I/O overhead.
     pub extra_disks: Vec<std::path::PathBuf>,
-    /// Loopback TCP port for the NAT relay proxy.  Distinct per profile so
-    /// multiple profiles can run simultaneously without relay conflicts.
-    pub relay_proxy_port: u16,
 }
 
 /// Ensure the daemon is running, starting it if necessary.
@@ -289,19 +305,15 @@ pub fn run(args: DaemonArgs) -> ! {
             log::error!("write extra_disks: {}", e);
         });
 
-    // Spawn the single-threaded port-forward dispatcher (O(1) listener threads
-    // regardless of how many ports or containers are active).
-    let dispatcher = Arc::new(PortDispatcher::spawn(args.relay_proxy_port));
     let port_state = Arc::new(Mutex::new(PortState::new()));
+
+    let router: Arc<PortRouter> = Arc::new(PortRouter(Arc::clone(&vm)));
 
     // Pre-register any ports requested at daemon startup via `vm start -p`.
     {
         let mut ps = port_state.lock().unwrap();
         for pf in &args.port_forwards {
-            dispatcher.send(DispatchCmd::Add {
-                host_port: pf.host_port,
-                container_port: pf.container_port,
-            });
+            router.add(pf.host_port, pf.container_port);
             ps.active.insert(pf.host_port, pf.container_port);
         }
     }
@@ -311,13 +323,13 @@ pub fn run(args: DaemonArgs) -> ! {
     // Spawn the subscription watcher: auto-deregisters ports when containers exit.
     start_subscription_watcher(
         Arc::clone(&vm),
-        Arc::clone(&dispatcher),
+        Arc::clone(&router),
         Arc::clone(&port_state),
     );
 
-    // Load IPv6 NAT66 rule if the host has a global IPv6 address and the
-    // pelagos-pfctl helper is installed.  Non-fatal: if the helper is absent
-    // or the user has disabled NAT66, the VM starts normally.
+    // tun_relay::start() → setup_utun loads NAT44 and NAT66 via pelagos-pfctl.
+    // If the host has a global IPv6 address, nat66::load records which interface
+    // was active so we can remove the rule on shutdown.
     let nat66_iface: Option<String> = if nat66::is_disabled_by_user() {
         log::debug!("nat66: disabled by user — skipping");
         None
@@ -393,8 +405,7 @@ pub fn run(args: DaemonArgs) -> ! {
                 }
             }
 
-            dispatcher.send(DispatchCmd::Shutdown);
-            drop(dispatcher);
+            drop(router);
             // Drop the Arc. If no proxy threads are active, Vm::drop runs stop().
             // If threads still hold clones the VM will stop when the last clone
             // drops. Either way the process exits immediately after cleanup.
@@ -429,10 +440,10 @@ pub fn run(args: DaemonArgs) -> ! {
         // blocked while waiting for the guest daemon to start (which can take
         // up to ~45 s during the ping-gate phase).
         let vm2 = Arc::clone(&vm);
-        let disp2 = Arc::clone(&dispatcher);
+        let router2 = Arc::clone(&router);
         let ps2 = Arc::clone(&port_state);
         std::thread::spawn(move || {
-            handle_connection(unix, vm2, disp2, ps2);
+            handle_connection(unix, vm2, router2, ps2);
         });
     }
 }
@@ -503,7 +514,7 @@ fn proxy(unix: UnixStream, vsock: OwnedFd, conn_id: std::thread::ThreadId) {
 fn handle_connection(
     mut unix: UnixStream,
     vm: Arc<Vm>,
-    dispatcher: Arc<PortDispatcher>,
+    router: Arc<PortRouter>,
     port_state: Arc<Mutex<PortState>>,
 ) {
     let conn_id = std::thread::current().id();
@@ -537,7 +548,7 @@ fn handle_connection(
 
     // If the first line is a DaemonCmd, handle it locally (no vsock needed).
     if let Ok(cmd) = serde_json::from_str::<DaemonCmd>(trimmed) {
-        handle_daemon_cmd(cmd, &mut unix, &dispatcher, &port_state, conn_id);
+        handle_daemon_cmd(cmd, &mut unix, &router, &port_state, conn_id);
         return;
     }
 
@@ -575,7 +586,7 @@ fn handle_connection(
 fn handle_daemon_cmd(
     cmd: DaemonCmd,
     unix: &mut UnixStream,
-    dispatcher: &PortDispatcher,
+    router: &PortRouter,
     port_state: &Mutex<PortState>,
     conn_id: std::thread::ThreadId,
 ) {
@@ -586,10 +597,7 @@ fn handle_daemon_cmd(
         } => {
             let mut ps = port_state.lock().unwrap();
             if let std::collections::hash_map::Entry::Vacant(e) = ps.active.entry(host_port) {
-                dispatcher.send(DispatchCmd::Add {
-                    host_port,
-                    container_port,
-                });
+                router.add(host_port, container_port);
                 e.insert(container_port);
                 log::info!(
                     "[{conn_id:?}] registered port {}:{}",
@@ -606,7 +614,7 @@ fn handle_daemon_cmd(
         DaemonCmd::UnregisterPort { host_port } => {
             let mut ps = port_state.lock().unwrap();
             if ps.active.remove(&host_port).is_some() {
-                dispatcher.send(DispatchCmd::Remove { host_port });
+                router.remove(host_port);
                 log::info!("[{conn_id:?}] unregistered port {}", host_port);
             }
             DaemonResponse::Ok
@@ -629,7 +637,7 @@ fn handle_daemon_cmd(
             if let Some(ports) = ps.compose_projects.remove(&project) {
                 for host_port in ports {
                     if ps.active.remove(&host_port).is_some() {
-                        dispatcher.send(DispatchCmd::Remove { host_port });
+                        router.remove(host_port);
                         log::info!(
                             "[{conn_id:?}] compose '{}': unregistered port {}",
                             project,
@@ -679,21 +687,21 @@ struct WatchContainer {
 
 /// Spawn the subscription watcher thread.  The thread connects to vsock,
 /// subscribes to container lifecycle events, and automatically removes port
-/// forwards from `PortDispatcher` / `PortState` when a container exits.
+/// forwards from `PortState` when a container exits.
 fn start_subscription_watcher(
     vm: Arc<Vm>,
-    dispatcher: Arc<PortDispatcher>,
+    router: Arc<PortRouter>,
     port_state: Arc<Mutex<PortState>>,
 ) {
     std::thread::Builder::new()
         .name("port-sub-watcher".into())
-        .spawn(move || subscription_watcher_loop(vm, dispatcher, port_state))
+        .spawn(move || subscription_watcher_loop(vm, router, port_state))
         .expect("spawn port-sub-watcher");
 }
 
 fn subscription_watcher_loop(
     vm: Arc<Vm>,
-    dispatcher: Arc<PortDispatcher>,
+    router: Arc<PortRouter>,
     port_state: Arc<Mutex<PortState>>,
 ) {
     use std::io::BufRead;
@@ -776,9 +784,7 @@ fn subscription_watcher_loop(
                         for spec in &ports {
                             if let Some(pf) = parse_port_spec(spec) {
                                 if ps.active.remove(&pf.host_port).is_some() {
-                                    dispatcher.send(DispatchCmd::Remove {
-                                        host_port: pf.host_port,
-                                    });
+                                    router.remove(pf.host_port);
                                     log::info!(
                                         "port-sub-watcher: {} exited — unregistered port {}",
                                         name,
@@ -856,8 +862,7 @@ fn build_vm_config(args: &DaemonArgs) -> VmConfig {
         .disk(&args.disk)
         .cmdline(build_cmdline(args))
         .memory_mib(args.memory_mib)
-        .cpus(args.cpus)
-        .relay_proxy_port(args.relay_proxy_port);
+        .cpus(args.cpus);
     if let Some(ref initrd) = args.initrd {
         b = b.initrd(initrd);
     }
@@ -1375,7 +1380,6 @@ mod tests {
             port_forwards: vec![],
             profile: "default".into(),
             extra_disks: vec![],
-            relay_proxy_port: pelagos_vz::nat_relay::RELAY_PROXY_PORT,
         }
     }
 

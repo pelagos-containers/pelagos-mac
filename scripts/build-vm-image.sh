@@ -1136,7 +1136,10 @@ busybox ip link set lo up
 busybox ip link set eth0 up
 busybox ip addr add 192.168.105.2/24 dev eth0
 busybox ip route add default via 192.168.105.1
-echo "[pelagos-init] network: static 192.168.105.2/24"
+# Static IPv6 for utun-relay NAT66 (fd00::1 is the host utun peer / gateway).
+busybox ip -6 addr add fd00::2/64 dev eth0
+busybox ip -6 route add default via fd00::1 dev eth0
+echo "[pelagos-init] network: static 192.168.105.2/24 + fd00::2/64"
 # Enable IP forwarding unconditionally — this is a container runtime VM.
 # pelagos port-forwarding uses nftables DNAT in PREROUTING to redirect
 # host-port connections to the container IP, which requires ip_forward=1
@@ -1148,6 +1151,7 @@ echo "[pelagos-init] network ready"
 busybox mkdir -p /etc
 echo 'nameserver 8.8.8.8' > /etc/resolv.conf
 echo 'nameserver 8.8.4.4' >> /etc/resolv.conf
+echo 'nameserver 2001:4860:4860::8888' >> /etc/resolv.conf
 
 # /tmp: bounded tmpfs — prevents VM-level OOM from unbounded temp storage.
 # Container workloads write to their own overlayfs (on /dev/vda), not here.

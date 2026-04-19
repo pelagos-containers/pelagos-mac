@@ -54,9 +54,6 @@ pub struct VmConfig {
     pub virtiofs_shares: Vec<(PathBuf, String, bool)>,
     /// Enable Rosetta for x86_64 Linux binaries (macOS 13+).
     pub rosetta: bool,
-    /// Loopback TCP port the NAT relay proxy binds on the host.
-    /// Distinct per profile so multiple profiles can run simultaneously.
-    pub relay_proxy_port: u16,
 }
 
 impl VmConfig {
@@ -77,7 +74,6 @@ pub struct VmConfigBuilder {
     vsock_port: Option<u32>,
     virtiofs_shares: Vec<(PathBuf, String, bool)>,
     rosetta: bool,
-    relay_proxy_port: Option<u16>,
 }
 
 impl VmConfigBuilder {
@@ -127,11 +123,6 @@ impl VmConfigBuilder {
         self.rosetta = enabled;
         self
     }
-    pub fn relay_proxy_port(mut self, port: u16) -> Self {
-        self.relay_proxy_port = Some(port);
-        self
-    }
-
     pub fn build(self) -> Result<VmConfig, &'static str> {
         Ok(VmConfig {
             kernel: self.kernel.ok_or("kernel required")?,
@@ -146,9 +137,6 @@ impl VmConfigBuilder {
             vsock_port: self.vsock_port.unwrap_or(1024),
             virtiofs_shares: self.virtiofs_shares,
             rosetta: self.rosetta,
-            relay_proxy_port: self
-                .relay_proxy_port
-                .unwrap_or(crate::nat_relay::RELAY_PROXY_PORT),
         })
     }
 }
@@ -183,14 +171,18 @@ unsafe impl Sync for SendQueue {}
 // Vm
 // ---------------------------------------------------------------------------
 
+/// Static IPv4 address of the VM inside the relay network.
+/// Both relay implementations configure the guest with this address.
+pub const VM_IP4: &str = "192.168.105.2";
+
 /// A running Linux VM. Holds all AVF resources.
 pub struct Vm {
     vm: Arc<SendVm>,
     sock_dev: Arc<SendSockDev>,
     queue: Arc<SendQueue>,
     config: VmConfig,
-    /// Keeps the NAT relay thread alive for the VM's lifetime.
-    _relay: crate::nat_relay::RelayHandle,
+    /// Keeps the utun relay alive for the VM's lifetime (Drop tears it down).
+    _relay: crate::tun_relay::TunRelayHandle,
 }
 
 #[derive(Debug)]
@@ -301,6 +293,19 @@ impl Vm {
         }
         let raw_fd = g.take().unwrap().map_err(crate::Error::Runtime)?;
         Ok(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(raw_fd) })
+    }
+
+    /// Add a TCP host→VM port forward via pf RDR rule (pelagos-pfctl).
+    ///
+    /// Connections to `127.0.0.1:host_port` (and the egress interface) are
+    /// kernel-redirected to `VM_IP4:vm_port`.
+    pub fn add_port_forward(&self, proto: &str, host_port: u16, vm_port: u16) -> Result<(), crate::Error> {
+        self._relay.add_rdr(proto, host_port, VM_IP4, vm_port)
+    }
+
+    /// Remove a previously added port forward.
+    pub fn remove_port_forward(&self, proto: &str, host_port: u16) -> Result<(), crate::Error> {
+        self._relay.remove_rdr(proto, host_port)
     }
 
     pub fn config(&self) -> &VmConfig {
@@ -425,11 +430,10 @@ unsafe fn start_vm(config: VmConfig) -> Result<(Vm, std::os::unix::io::OwnedFd),
         .collect();
     vm_config.setStorageDevices(&NSArray::from_slice(&storage_refs));
 
-    // 5. Userspace NAT relay via VZFileHandleNetworkDeviceAttachment.
-    //    Starts the smoltcp-based NAT relay (replaces socket_vmnet / vmnet.framework).
+    // 5. Network relay via VZFileHandleNetworkDeviceAttachment.
     //    Returns a SOCK_DGRAM fd that AVF consumes directly as raw Ethernet frames.
-    let (vmnet_fd, relay) = crate::nat_relay::start(config.relay_proxy_port)
-        .map_err(|e| crate::Error::Runtime(format!("nat_relay: {}", e)))?;
+    let (vmnet_fd, relay) = crate::tun_relay::start()
+        .map_err(|e| crate::Error::Runtime(format!("tun_relay: {e}")))?;
     let vmnet_fh = NSFileHandle::initWithFileDescriptor(NSFileHandle::alloc(), vmnet_fd);
     let net_attach = VZFileHandleNetworkDeviceAttachment::initWithFileHandle(
         VZFileHandleNetworkDeviceAttachment::alloc(),
@@ -439,7 +443,7 @@ unsafe fn start_vm(config: VmConfig) -> Result<(Vm, std::os::unix::io::OwnedFd),
     net_dev.setAttachment(Some(&*net_attach));
     let mac = VZMACAddress::randomLocallyAdministeredAddress();
     net_dev.setMACAddress(&mac);
-    log::info!("nat_relay: VM MAC address {}", mac.string());
+    log::info!("VM MAC address {}", mac.string());
     let net_ref: &VZNetworkDeviceConfiguration = &net_dev;
     vm_config.setNetworkDevices(&NSArray::from_slice(&[net_ref]));
 

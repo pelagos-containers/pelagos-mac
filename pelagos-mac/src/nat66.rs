@@ -83,9 +83,7 @@ pub fn detect_global_ipv6_iface() -> Option<(String, Ipv6Addr)> {
                 let sin6 = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
                 let bytes = sin6.sin6_addr.s6_addr;
                 if is_global_unicast(&bytes) {
-                    let name = CStr::from_ptr(ifa.ifa_name)
-                        .to_string_lossy()
-                        .into_owned();
+                    let name = CStr::from_ptr(ifa.ifa_name).to_string_lossy().into_owned();
                     result = Some((name, Ipv6Addr::from(bytes)));
                     break;
                 }
@@ -126,13 +124,13 @@ fn disable_flag_path() -> Option<std::path::PathBuf> {
 
 /// Returns true if the user has explicitly disabled NAT66 via `pelagos nat66 disable`.
 pub fn is_disabled_by_user() -> bool {
-    disable_flag_path()
-        .map(|p| p.exists())
-        .unwrap_or(false)
+    disable_flag_path().map(|p| p.exists()).unwrap_or(false)
 }
 
 fn set_disabled_flag(disabled: bool) {
-    let Some(path) = disable_flag_path() else { return };
+    let Some(path) = disable_flag_path() else {
+        return;
+    };
     if disabled {
         let _ = std::fs::write(&path, b"");
     } else {
@@ -145,12 +143,13 @@ fn set_disabled_flag(disabled: bool) {
 // ---------------------------------------------------------------------------
 
 fn send_request<'a>(req: &Request<'a>) -> Result<Response, String> {
-    let stream = UnixStream::connect(SOCK_PATH)
-        .map_err(|e| format!("connect {SOCK_PATH}: {e}"))?;
+    let stream = UnixStream::connect(SOCK_PATH).map_err(|e| format!("connect {SOCK_PATH}: {e}"))?;
     let mut writer = &stream;
     let mut line = serde_json::to_string(req).map_err(|e| e.to_string())?;
     line.push('\n');
-    writer.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    writer
+        .write_all(line.as_bytes())
+        .map_err(|e| e.to_string())?;
 
     let mut reader = BufReader::new(&stream);
     let mut resp = String::new();
@@ -216,7 +215,9 @@ pub fn cmd_enable() -> Result<(), String> {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
         if !helper_available() {
-            return Err("helper installed but socket not yet available — try again in a moment".into());
+            return Err(
+                "helper installed but socket not yet available — try again in a moment".into(),
+            );
         }
     }
 
@@ -243,13 +244,11 @@ pub fn cmd_enable() -> Result<(), String> {
 /// the OS and is identical to the standard "enter your password" prompt that
 /// macOS presents for any privileged installer.
 fn elevate_and_install() -> Result<(), String> {
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("current_exe: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     // Escape single quotes in the path (unlikely, but safe).
     let exe_str = exe.to_string_lossy().replace('\'', "'\\''");
-    let script = format!(
-        "do shell script \"'{exe_str}' nat66 install\" with administrator privileges"
-    );
+    let script =
+        format!("do shell script \"'{exe_str}' nat66 install\" with administrator privileges");
     let out = Command::new("/usr/bin/osascript")
         .args(["-e", &script])
         .output()
@@ -302,8 +301,7 @@ pub fn cmd_install() -> Result<(), String> {
 
     // Create destination directory.
     let dest_dir = Path::new(HELPER_INSTALL_PATH).parent().unwrap();
-    std::fs::create_dir_all(dest_dir)
-        .map_err(|e| format!("mkdir {}: {e}", dest_dir.display()))?;
+    std::fs::create_dir_all(dest_dir).map_err(|e| format!("mkdir {}: {e}", dest_dir.display()))?;
 
     // Copy binary.
     std::fs::copy(&helper_src, HELPER_INSTALL_PATH)
@@ -318,8 +316,7 @@ pub fn cmd_install() -> Result<(), String> {
 
     // Write the LaunchDaemon plist.
     let plist = plist_content();
-    std::fs::write(PLIST_PATH, &plist)
-        .map_err(|e| format!("write {PLIST_PATH}: {e}"))?;
+    std::fs::write(PLIST_PATH, &plist).map_err(|e| format!("write {PLIST_PATH}: {e}"))?;
 
     // Bootstrap the service.
     let out = Command::new("/bin/launchctl")
@@ -377,8 +374,7 @@ pub fn cmd_uninstall() -> Result<(), String> {
     // Remove plist and binary.
     for path in [PLIST_PATH, HELPER_INSTALL_PATH] {
         if Path::new(path).exists() {
-            std::fs::remove_file(path)
-                .map_err(|e| format!("remove {path}: {e}"))?;
+            std::fs::remove_file(path).map_err(|e| format!("remove {path}: {e}"))?;
         }
     }
 
@@ -474,14 +470,11 @@ fn find_helper_binary() -> Result<std::path::PathBuf, String> {
         bin_dir.join("../share/pelagos-mac/pelagos-pfctl"),
     ];
 
-    candidates
-        .into_iter()
-        .find(|p| p.exists())
-        .ok_or(
-            "pelagos-pfctl binary not found next to pelagos.\n\
+    candidates.into_iter().find(|p| p.exists()).ok_or(
+        "pelagos-pfctl binary not found next to pelagos.\n\
              Build it with: cargo build -p pelagos-pfctl --release"
-                .to_string(),
-        )
+            .to_string(),
+    )
 }
 
 fn plist_content() -> String {
