@@ -11,6 +11,9 @@
 //!   {"action":"status"}
 //!
 //! utun relay requests (for `tun_relay.rs`):
+//!   {"action":"create_utun"}
+//!     → creates a utun fd as root, sends {"ok":true,"iface":"utunN"} + fd via SCM_RIGHTS.
+//!       The relay process receives the fd via recvmsg and holds it for the relay lifetime.
 //!   {"action":"setup_utun","iface":"utun5",
 //!    "ipv4_addr":"192.168.105.1","ipv4_peer":"192.168.105.2",
 //!    "ipv4_cidr":"192.168.105.0/24","ipv6_addr":"fd00::1",
@@ -21,9 +24,11 @@
 //!   {"action":"remove_rdr","proto":"tcp","host_port":2222}
 //!
 //! Response: {"ok":true} | {"ok":false,"error":"..."} | {"ok":true,"active":true}
+//!           create_utun additionally sends the utun fd as SCM_RIGHTS ancillary data.
 
 use std::ffi::CString;
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixListener;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -48,6 +53,36 @@ const ANCHOR_FILE_RDR: &str = "/etc/pf.anchors/pelagos-rdr";
 const VM_PREFIX_V6: &str = "fd00::/64";
 
 // ---------------------------------------------------------------------------
+// macOS utun constants and C structs (used by create_utun_privileged)
+// ---------------------------------------------------------------------------
+
+const PF_SYSTEM: libc::c_int = 32; // AF_SYSTEM
+const AF_SYS_CONTROL: u16 = 2;
+const SYSPROTO_CONTROL: libc::c_int = 2;
+const UTUN_CONTROL_NAME: &[u8] = b"com.apple.net.utun_control\0";
+const UTUN_OPT_IFNAME: libc::c_int = 2;
+// CTLIOCGINFO = _IOWR('N', 3, struct ctl_info)  (ctl_info = 100 bytes)
+const CTLIOCGINFO: libc::c_ulong = 0xc064_4e03;
+const MAX_KCTL_NAME: usize = 96;
+const IFNAMSIZ: usize = 16;
+
+#[repr(C)]
+struct CtlInfo {
+    ctl_id: u32,
+    ctl_name: [libc::c_char; MAX_KCTL_NAME],
+}
+
+#[repr(C)]
+struct SockaddrCtl {
+    sc_len: u8,
+    sc_family: u8,
+    ss_sysaddr: u16,
+    sc_id: u32,
+    sc_unit: u32,
+    sc_reserved: [u32; 5],
+}
+
+// ---------------------------------------------------------------------------
 // Daemon state (shared across sequential connection handling)
 // ---------------------------------------------------------------------------
 
@@ -70,7 +105,11 @@ struct RdrRule {
 
 impl DaemonState {
     fn new() -> Self {
-        Self { utun_iface: None, egress_iface: None, rdr_rules: Vec::new() }
+        Self {
+            utun_iface: None,
+            egress_iface: None,
+            rdr_rules: Vec::new(),
+        }
     }
 }
 
@@ -82,7 +121,9 @@ impl DaemonState {
 #[serde(tag = "action", rename_all = "snake_case")]
 enum Request {
     // Legacy NAT66-only operations.
-    Load { iface: String },
+    Load {
+        iface: String,
+    },
     Unload,
     Status,
     // utun relay operations.
@@ -109,6 +150,8 @@ enum Request {
         proto: String,
         host_port: u16,
     },
+    /// Create a utun fd as root and pass it to the relay via SCM_RIGHTS.
+    CreateUtun,
 }
 
 #[derive(Serialize)]
@@ -172,21 +215,47 @@ fn set_socket_permissions() {
 // ---------------------------------------------------------------------------
 
 fn handle_connection(stream: std::os::unix::net::UnixStream, state: Arc<Mutex<DaemonState>>) {
-    let mut reader = BufReader::new(&stream);
-    let mut writer = &stream;
-    let mut line = String::new();
+    // Read the request line first, then release the BufReader borrow.
+    let line = {
+        let mut reader = BufReader::new(&stream);
+        let mut line = String::new();
+        if let Err(e) = reader.read_line(&mut line) {
+            log::warn!("read: {e}");
+            return;
+        }
+        line
+    };
 
-    if let Err(e) = reader.read_line(&mut line) {
-        log::warn!("read: {e}");
+    // Parse the request.
+    let req = match serde_json::from_str::<Request>(line.trim()) {
+        Ok(r) => r,
+        Err(e) => {
+            let resp = Response {
+                ok: false,
+                error: Some(format!("parse error: {e}")),
+                active: None,
+            };
+            if let Ok(mut out) = serde_json::to_string(&resp) {
+                out.push('\n');
+                let _ = (&stream).write_all(out.as_bytes());
+            }
+            return;
+        }
+    };
+
+    // CreateUtun is handled specially: the response includes an fd passed via SCM_RIGHTS,
+    // which requires sendmsg rather than the normal write_all path.
+    if let Request::CreateUtun = req {
+        handle_create_utun_with_fd(&stream);
         return;
     }
 
     let mut st = state.lock().unwrap();
-    let resp = match serde_json::from_str::<Request>(line.trim()) {
-        Ok(Request::Load { iface }) => handle_load(&iface),
-        Ok(Request::Unload) => handle_unload(),
-        Ok(Request::Status) => handle_status(),
-        Ok(Request::SetupUtun {
+    let resp = match req {
+        Request::Load { iface } => handle_load(&iface),
+        Request::Unload => handle_unload(),
+        Request::Status => handle_status(),
+        Request::SetupUtun {
             iface,
             ipv4_addr,
             ipv4_peer,
@@ -195,7 +264,7 @@ fn handle_connection(stream: std::os::unix::net::UnixStream, state: Arc<Mutex<Da
             ipv6_prefix,
             ipv6_cidr,
             egress_iface,
-        }) => handle_setup_utun(
+        } => handle_setup_utun(
             &iface,
             &ipv4_addr,
             &ipv4_peer,
@@ -206,19 +275,20 @@ fn handle_connection(stream: std::os::unix::net::UnixStream, state: Arc<Mutex<Da
             &egress_iface,
             &mut st,
         ),
-        Ok(Request::TeardownUtun { iface }) => handle_teardown_utun(&iface, &mut st),
-        Ok(Request::AddRdr { proto, host_port, vm_ip, vm_port }) => {
-            handle_add_rdr(&proto, host_port, &vm_ip, vm_port, &mut st)
-        }
-        Ok(Request::RemoveRdr { proto, host_port }) => {
-            handle_remove_rdr(&proto, host_port, &mut st)
-        }
-        Err(e) => Response { ok: false, error: Some(format!("parse error: {e}")), active: None },
+        Request::TeardownUtun { iface } => handle_teardown_utun(&iface, &mut st),
+        Request::AddRdr {
+            proto,
+            host_port,
+            vm_ip,
+            vm_port,
+        } => handle_add_rdr(&proto, host_port, &vm_ip, vm_port, &mut st),
+        Request::RemoveRdr { proto, host_port } => handle_remove_rdr(&proto, host_port, &mut st),
+        Request::CreateUtun => unreachable!("handled above"),
     };
 
     if let Ok(mut out) = serde_json::to_string(&resp) {
         out.push('\n');
-        let _ = writer.write_all(out.as_bytes());
+        let _ = (&stream).write_all(out.as_bytes());
     }
 }
 
@@ -295,7 +365,17 @@ fn handle_setup_utun(
         return err_resp(format!("ifconfig inet6: {e}"));
     }
 
-    // 3. Write and load combined NAT44+NAT66 anchor.
+    // 3. Enable kernel IP forwarding — the kernel must route packets that arrive on
+    //    the utun interface out through the egress interface so pf NAT can fire.
+    //    The smoltcp relay never needed this (pure userspace), but the utun relay does.
+    if let Err(e) = run_sysctl_set("net.inet.ip.forwarding", "1") {
+        return err_resp(format!("sysctl net.inet.ip.forwarding: {e}"));
+    }
+    if let Err(e) = run_sysctl_set("net.inet6.ip6.forwarding", "1") {
+        log::warn!("sysctl net.inet6.ip6.forwarding: {e}"); // non-fatal — IPv6 may not be available
+    }
+
+    // 4. Write and load combined NAT44+NAT66 anchor.
     let nat_rules = format!(
         "nat on {egress_iface} inet from {ipv4_cidr} to any -> ({egress_iface})\n\
          nat on {egress_iface} inet6 from {ipv6_cidr} to any -> ({egress_iface})\n"
@@ -318,6 +398,9 @@ fn handle_teardown_utun(iface: &str, state: &mut DaemonState) -> Response {
     // Flush NAT and RDR anchors — ignore errors (anchor may not be active).
     let _ = run_pfctl(&["-a", ANCHOR_NAT, "-F", "all"]);
     let _ = run_pfctl(&["-a", ANCHOR_RDR, "-F", "all"]);
+    // Disable IP forwarding that was enabled by setup_utun.
+    let _ = run_sysctl_set("net.inet.ip.forwarding", "0");
+    let _ = run_sysctl_set("net.inet6.ip6.forwarding", "0");
     // Try to bring down the interface (it's destroyed when the relay fd closes anyway).
     let _ = run_ifconfig(&[iface, "down"]);
     state.utun_iface = None;
@@ -338,7 +421,9 @@ fn handle_add_rdr(
         return err_resp(format!("invalid proto: {proto:?}"));
     }
     // Overwrite any existing rule for this proto+port.
-    state.rdr_rules.retain(|r| !(r.proto == proto && r.host_port == host_port));
+    state
+        .rdr_rules
+        .retain(|r| !(r.proto == proto && r.host_port == host_port));
     state.rdr_rules.push(RdrRule {
         proto: proto.to_string(),
         host_port,
@@ -349,7 +434,9 @@ fn handle_add_rdr(
 }
 
 fn handle_remove_rdr(proto: &str, host_port: u16, state: &mut DaemonState) -> Response {
-    state.rdr_rules.retain(|r| !(r.proto == proto && r.host_port == host_port));
+    state
+        .rdr_rules
+        .retain(|r| !(r.proto == proto && r.host_port == host_port));
     reload_rdr_anchor(state)
 }
 
@@ -391,6 +478,144 @@ fn reload_rdr_anchor(state: &DaemonState) -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// utun fd creation (privileged — runs as root inside pelagos-pfctl)
+// ---------------------------------------------------------------------------
+
+/// Create a macOS utun interface and return the fd + interface name.
+///
+/// This requires root because `connect(2)` on a PF_SYSTEM/SYSPROTO_CONTROL socket
+/// fails with EPERM for unprivileged processes on macOS.
+fn create_utun_privileged() -> Result<(OwnedFd, String), String> {
+    let io_err = |msg: &str| format!("{}: {}", msg, std::io::Error::last_os_error());
+
+    unsafe {
+        let raw_fd = libc::socket(PF_SYSTEM, libc::SOCK_DGRAM, SYSPROTO_CONTROL);
+        if raw_fd < 0 {
+            return Err(io_err("socket(PF_SYSTEM)"));
+        }
+        let owned = OwnedFd::from_raw_fd(raw_fd);
+
+        let mut ci = CtlInfo {
+            ctl_id: 0,
+            ctl_name: [0; MAX_KCTL_NAME],
+        };
+        std::ptr::copy_nonoverlapping(
+            UTUN_CONTROL_NAME.as_ptr() as *const libc::c_char,
+            ci.ctl_name.as_mut_ptr(),
+            UTUN_CONTROL_NAME.len(),
+        );
+        if libc::ioctl(
+            owned.as_raw_fd(),
+            CTLIOCGINFO,
+            &mut ci as *mut CtlInfo as *mut _,
+        ) < 0
+        {
+            return Err(io_err("ioctl(CTLIOCGINFO)"));
+        }
+
+        let sc = SockaddrCtl {
+            sc_len: std::mem::size_of::<SockaddrCtl>() as u8,
+            sc_family: PF_SYSTEM as u8,
+            ss_sysaddr: AF_SYS_CONTROL,
+            sc_id: ci.ctl_id,
+            sc_unit: 0, // 0 = let kernel assign the next free utunN
+            sc_reserved: [0; 5],
+        };
+        if libc::connect(
+            owned.as_raw_fd(),
+            &sc as *const SockaddrCtl as *const libc::sockaddr,
+            std::mem::size_of::<SockaddrCtl>() as libc::socklen_t,
+        ) < 0
+        {
+            return Err(io_err("connect(utun)"));
+        }
+
+        let mut ifname = [0u8; IFNAMSIZ];
+        let mut optlen = IFNAMSIZ as libc::socklen_t;
+        if libc::getsockopt(
+            owned.as_raw_fd(),
+            SYSPROTO_CONTROL,
+            UTUN_OPT_IFNAME,
+            ifname.as_mut_ptr() as *mut _,
+            &mut optlen,
+        ) < 0
+        {
+            return Err(io_err("getsockopt(UTUN_OPT_IFNAME)"));
+        }
+
+        let name_len = ifname
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(optlen as usize);
+        let iface = String::from_utf8_lossy(&ifname[..name_len]).into_owned();
+        Ok((owned, iface))
+    }
+}
+
+/// Handle a `create_utun` request.
+///
+/// Unlike all other handlers, this one sends the response directly via `sendmsg(2)`
+/// with SCM_RIGHTS ancillary data containing the utun fd — so it cannot go through
+/// the normal `write_all` path.
+///
+/// Protocol:
+///   • iov[0]   = JSON response bytes  {"ok":true,"iface":"utunN"}\n
+///   • cmsg     = SOL_SOCKET / SCM_RIGHTS / [utun_raw_fd]
+///
+/// The kernel increments the utun fd's reference count when the message is enqueued.
+/// The receiver calls recvmsg(2) to get a new fd in its process pointing to the same
+/// open file description.  pelagos-pfctl's copy closes when utun_fd drops at function
+/// end — safe because the kernel holds a reference until the receiver retrieves it.
+fn handle_create_utun_with_fd(stream: &std::os::unix::net::UnixStream) {
+    let (utun_fd, iface) = match create_utun_privileged() {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("create_utun: {e}");
+            // Error path can use the normal write path — no fd to pass.
+            let resp = format!("{{\"ok\":false,\"error\":\"{e}\"}}\n");
+            let _ = (&*stream).write_all(resp.as_bytes());
+            return;
+        }
+    };
+
+    let json = format!("{{\"ok\":true,\"iface\":\"{iface}\"}}\n");
+    let json_bytes = json.as_bytes();
+    let stream_raw = stream.as_raw_fd();
+    let utun_raw = utun_fd.as_raw_fd();
+
+    unsafe {
+        let mut iov = libc::iovec {
+            iov_base: json_bytes.as_ptr() as *mut libc::c_void,
+            iov_len: json_bytes.len(),
+        };
+
+        let cmsg_space = libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) as usize;
+        let mut cmsg_buf = vec![0u8; cmsg_space];
+
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov as *mut libc::iovec;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = cmsg_space as libc::socklen_t;
+
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32);
+        let fd_ptr = libc::CMSG_DATA(cmsg) as *mut libc::c_int;
+        *fd_ptr = utun_raw;
+
+        let r = libc::sendmsg(stream_raw, &msg, 0);
+        if r < 0 {
+            log::error!("create_utun: sendmsg: {}", std::io::Error::last_os_error());
+        } else {
+            log::info!("create_utun: iface={iface} fd={utun_raw} passed to relay");
+        }
+        // utun_fd drops here — kernel already has a reference for the in-flight message.
+    }
+}
+
+// ---------------------------------------------------------------------------
 // System command helpers
 // ---------------------------------------------------------------------------
 
@@ -399,7 +624,9 @@ fn reload_rdr_anchor(state: &DaemonState) -> Response {
 /// (ifconfig args are passed directly via Command::args, not a shell, so this
 /// only matters for the anchor rule strings written to the anchor files.)
 fn is_safe_iface(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 
 fn run_pfctl(args: &[&str]) -> Result<(), String> {
@@ -407,6 +634,18 @@ fn run_pfctl(args: &[&str]) -> Result<(), String> {
         .args(args)
         .output()
         .map_err(|e| format!("exec /sbin/pfctl: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+}
+
+fn run_sysctl_set(key: &str, val: &str) -> Result<(), String> {
+    let out = Command::new("/usr/sbin/sysctl")
+        .args(["-w", &format!("{key}={val}")])
+        .output()
+        .map_err(|e| format!("exec /usr/sbin/sysctl: {e}"))?;
     if out.status.success() {
         Ok(())
     } else {
@@ -431,13 +670,25 @@ fn run_ifconfig(args: &[&str]) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 fn ok_resp() -> Response {
-    Response { ok: true, error: None, active: None }
+    Response {
+        ok: true,
+        error: None,
+        active: None,
+    }
 }
 
 fn ok_active(active: bool) -> Response {
-    Response { ok: true, error: None, active: Some(active) }
+    Response {
+        ok: true,
+        error: None,
+        active: Some(active),
+    }
 }
 
 fn err_resp(msg: impl Into<String>) -> Response {
-    Response { ok: false, error: Some(msg.into()), active: None }
+    Response {
+        ok: false,
+        error: Some(msg.into()),
+        active: None,
+    }
 }

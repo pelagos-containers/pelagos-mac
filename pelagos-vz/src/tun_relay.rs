@@ -66,49 +66,14 @@ use serde::Serialize;
 const GATEWAY_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 const GATEWAY_IP4: [u8; 4] = [192, 168, 105, 1];
 const GATEWAY_IP6_ULA: [u8; 16] = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
-const GATEWAY_IP6_LL: [u8; 16] =
-    [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+const GATEWAY_IP6_LL: [u8; 16] = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 
 // 4-byte tun packet prefix (network byte order AF value).
-const TUN_HDR_IPV4: [u8; 4] = [0, 0, 0, 2];   // AF_INET  = 2
-const TUN_HDR_IPV6: [u8; 4] = [0, 0, 0, 30];  // AF_INET6 = 30 on macOS
+const TUN_HDR_IPV4: [u8; 4] = [0, 0, 0, 2]; // AF_INET  = 2
+const TUN_HDR_IPV6: [u8; 4] = [0, 0, 0, 30]; // AF_INET6 = 30 on macOS
 
 // Unix socket of the pelagos-pfctl LaunchDaemon.
 const PFCTL_SOCK: &str = "/var/run/pelagos-pfctl.sock";
-
-// ---------------------------------------------------------------------------
-// macOS utun constants and C structs
-// ---------------------------------------------------------------------------
-
-const PF_SYSTEM: libc::c_int = 32; // AF_SYSTEM
-const AF_SYS_CONTROL: u16 = 2;
-const SYSPROTO_CONTROL: libc::c_int = 2;
-const UTUN_CONTROL_NAME: &[u8] = b"com.apple.net.utun_control\0";
-const UTUN_OPT_IFNAME: libc::c_int = 2;
-// CTLIOCGINFO = _IOWR('N', 3, struct ctl_info)
-// ctl_info is { u32 ctl_id; char ctl_name[96]; } = 100 bytes
-// _IOWR(g,n,t) = 0xc0000000 | (sizeof(t) << 16) | (g << 8) | n
-//             = 0xc0000000 | (100 << 16) | ('N' << 8) | 3
-//             = 0xc0644e03
-const CTLIOCGINFO: libc::c_ulong = 0xc064_4e03;
-const MAX_KCTL_NAME: usize = 96;
-const IFNAMSIZ: usize = 16;
-
-#[repr(C)]
-struct CtlInfo {
-    ctl_id: u32,
-    ctl_name: [libc::c_char; MAX_KCTL_NAME],
-}
-
-#[repr(C)]
-struct SockaddrCtl {
-    sc_len: u8,
-    sc_family: u8,
-    ss_sysaddr: u16,
-    sc_id: u32,
-    sc_unit: u32,
-    sc_reserved: [u32; 5],
-}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -127,16 +92,17 @@ pub fn start() -> Result<(RawFd, TunRelayHandle), crate::Error> {
     set_sock_bufs(avf_fd, 128 * 1024, 512 * 1024);
     set_sock_bufs(relay_fd, 128 * 1024, 512 * 1024);
 
-    // Create the utun interface (unprivileged on macOS).
-    let (utun_owned, utun_iface) = create_utun()?;
+    // Ask pelagos-pfctl (root daemon) to create the utun fd and pass it back via SCM_RIGHTS.
+    // Direct creation in the pelagos daemon fails with EPERM because utun creation requires
+    // root (or com.apple.private.network.interface-management, a private Apple entitlement).
+    let (utun_owned, utun_iface) = pfctl_create_utun()?;
     let utun_fd = utun_owned.as_raw_fd();
 
     // Detect egress interface for NAT rules.
-    let egress = detect_egress_iface().ok_or_else(|| {
-        crate::Error::Runtime("could not detect default route interface".into())
-    })?;
+    let egress = detect_egress_iface()
+        .ok_or_else(|| crate::Error::Runtime("could not detect default route interface".into()))?;
 
-    // Ask pelagos-pfctl (root daemon) to configure the utun interface and load NAT rules.
+    // Ask pelagos-pfctl to assign IPs to the utun interface and load pf NAT rules.
     pfctl_setup_utun(&utun_iface, &egress)?;
 
     log::info!("tun_relay: started utun={utun_iface} egress={egress}");
@@ -151,7 +117,14 @@ pub fn start() -> Result<(RawFd, TunRelayHandle), crate::Error> {
         .spawn(move || run_relay(relay_fd, utun_fd, &iface_clone))
         .expect("spawn tun-relay");
 
-    Ok((avf_fd, TunRelayHandle { _thread: thread, _utun: utun_owned, utun_iface }))
+    Ok((
+        avf_fd,
+        TunRelayHandle {
+            _thread: thread,
+            _utun: utun_owned,
+            utun_iface,
+        },
+    ))
 }
 
 /// Handle to the running tun relay. When dropped, the utun fd is closed which
@@ -181,8 +154,14 @@ impl TunRelayHandle {
             vm_ip: &'a str,
             vm_port: u16,
         }
-        let json = serde_json::to_string(&Req { action: "add_rdr", proto, host_port, vm_ip, vm_port })
-            .map_err(|e| crate::Error::Runtime(e.to_string()))?;
+        let json = serde_json::to_string(&Req {
+            action: "add_rdr",
+            proto,
+            host_port,
+            vm_ip,
+            vm_port,
+        })
+        .map_err(|e| crate::Error::Runtime(e.to_string()))?;
         pfctl_send(&json)
     }
 
@@ -194,8 +173,12 @@ impl TunRelayHandle {
             proto: &'a str,
             host_port: u16,
         }
-        let json = serde_json::to_string(&Req { action: "remove_rdr", proto, host_port })
-            .map_err(|e| crate::Error::Runtime(e.to_string()))?;
+        let json = serde_json::to_string(&Req {
+            action: "remove_rdr",
+            proto,
+            host_port,
+        })
+        .map_err(|e| crate::Error::Runtime(e.to_string()))?;
         pfctl_send(&json)
     }
 }
@@ -210,68 +193,94 @@ impl Drop for TunRelayHandle {
 }
 
 // ---------------------------------------------------------------------------
-// utun fd creation
+// utun fd creation via pelagos-pfctl (SCM_RIGHTS fd passing)
 // ---------------------------------------------------------------------------
 
-fn create_utun() -> Result<(OwnedFd, String), crate::Error> {
-    let io_err =
-        |msg: &str| crate::Error::Runtime(format!("{msg}: {}", std::io::Error::last_os_error()));
+/// Ask pelagos-pfctl (root daemon) to create a utun interface and pass back the fd.
+///
+/// Direct creation fails with EPERM for non-root processes.  pelagos-pfctl runs as
+/// root via a LaunchDaemon, creates the utun fd, and delivers it to us via sendmsg(2)
+/// with SCM_RIGHTS ancillary data.  We receive it with recvmsg(2).
+fn pfctl_create_utun() -> Result<(OwnedFd, String), crate::Error> {
+    let stream = UnixStream::connect(PFCTL_SOCK)
+        .map_err(|e| crate::Error::Runtime(format!("pfctl connect: {e}")))?;
 
-    unsafe {
-        let raw_fd = libc::socket(PF_SYSTEM, libc::SOCK_DGRAM, SYSPROTO_CONTROL);
-        if raw_fd < 0 {
-            return Err(io_err("socket(PF_SYSTEM)"));
-        }
-        let owned = OwnedFd::from_raw_fd(raw_fd);
+    (&stream)
+        .write_all(b"{\"action\":\"create_utun\"}\n")
+        .map_err(|e| crate::Error::Runtime(format!("pfctl write: {e}")))?;
 
-        // Resolve the utun control ID.
-        let mut ci = CtlInfo { ctl_id: 0, ctl_name: [0; MAX_KCTL_NAME] };
-        std::ptr::copy_nonoverlapping(
-            UTUN_CONTROL_NAME.as_ptr() as *const libc::c_char,
-            ci.ctl_name.as_mut_ptr(),
-            UTUN_CONTROL_NAME.len(),
-        );
-        if libc::ioctl(owned.as_raw_fd(), CTLIOCGINFO, &mut ci as *mut CtlInfo as *mut _) < 0 {
-            return Err(io_err("ioctl(CTLIOCGINFO)"));
-        }
+    let stream_fd = stream.as_raw_fd();
 
-        // Connect — sc_unit=0 lets the kernel assign the next free utun number.
-        let sc = SockaddrCtl {
-            sc_len: std::mem::size_of::<SockaddrCtl>() as u8,
-            sc_family: PF_SYSTEM as u8,
-            ss_sysaddr: AF_SYS_CONTROL,
-            sc_id: ci.ctl_id,
-            sc_unit: 0,
-            sc_reserved: [0; 5],
-        };
-        if libc::connect(
-            owned.as_raw_fd(),
-            &sc as *const SockaddrCtl as *const libc::sockaddr,
-            std::mem::size_of::<SockaddrCtl>() as libc::socklen_t,
-        ) < 0
-        {
-            return Err(io_err("connect(utun)"));
-        }
+    // Receive JSON response + utun fd via recvmsg.
+    let mut json_buf = vec![0u8; 256];
+    let mut iov = libc::iovec {
+        iov_base: json_buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: json_buf.len(),
+    };
 
-        // Read back the assigned interface name.
-        let mut ifname = [0u8; IFNAMSIZ];
-        let mut optlen = IFNAMSIZ as libc::socklen_t;
-        if libc::getsockopt(
-            owned.as_raw_fd(),
-            SYSPROTO_CONTROL,
-            UTUN_OPT_IFNAME,
-            ifname.as_mut_ptr() as *mut _,
-            &mut optlen,
-        ) < 0
-        {
-            return Err(io_err("getsockopt(UTUN_OPT_IFNAME)"));
-        }
+    let cmsg_space =
+        unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) as usize };
+    let mut cmsg_buf = vec![0u8; cmsg_space];
 
-        let name_len = ifname.iter().position(|&b| b == 0).unwrap_or(optlen as usize);
-        let iface_name = String::from_utf8_lossy(&ifname[..name_len]).into_owned();
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov as *mut libc::iovec;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = cmsg_space as libc::socklen_t;
 
-        Ok((owned, iface_name))
+    let n = unsafe { libc::recvmsg(stream_fd, &mut msg, 0) };
+    if n <= 0 {
+        return Err(crate::Error::Runtime(format!(
+            "pfctl recvmsg: {}",
+            std::io::Error::last_os_error()
+        )));
     }
+
+    // Parse JSON response.
+    let json_str = std::str::from_utf8(&json_buf[..n as usize])
+        .map_err(|_| crate::Error::Runtime("pfctl: invalid UTF-8 in create_utun response".into()))?
+        .trim_matches(|c| c == '\n' || c == '\r' || c == ' ');
+
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        ok: bool,
+        error: Option<String>,
+        iface: Option<String>,
+    }
+    let resp: Resp = serde_json::from_str(json_str)
+        .map_err(|e| crate::Error::Runtime(format!("pfctl parse {json_str:?}: {e}")))?;
+
+    if !resp.ok {
+        return Err(crate::Error::Runtime(format!(
+            "pfctl create_utun: {}",
+            resp.error.unwrap_or_default()
+        )));
+    }
+    let iface = resp
+        .iface
+        .ok_or_else(|| crate::Error::Runtime("pfctl: create_utun response missing iface".into()))?;
+
+    // Extract the received fd from the SCM_RIGHTS ancillary data.
+    let received_fd = unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null() {
+            return Err(crate::Error::Runtime(
+                "pfctl: no SCM_RIGHTS fd in create_utun response".into(),
+            ));
+        }
+        if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
+            return Err(crate::Error::Runtime(format!(
+                "pfctl: unexpected cmsg level={} type={} in create_utun response",
+                (*cmsg).cmsg_level,
+                (*cmsg).cmsg_type,
+            )));
+        }
+        *(libc::CMSG_DATA(cmsg) as *const libc::c_int)
+    };
+
+    log::info!("tun_relay: received utun fd={received_fd} iface={iface} from pfctl");
+    let owned = unsafe { OwnedFd::from_raw_fd(received_fd) };
+    Ok((owned, iface))
 }
 
 // ---------------------------------------------------------------------------
@@ -287,12 +296,20 @@ fn run_relay(relay_fd: RawFd, utun_fd: RawFd, utun_iface: &str) {
     log::info!("tun_relay: relay loop started (relay_fd={relay_fd} utun_fd={utun_fd})");
     let mut state = RelayState { vm_mac: None };
     let mut avf_buf = vec![0u8; 65536 + 14]; // MTU + Ethernet header
-    let mut tun_buf = vec![0u8; 65536 + 4];  // MTU + 4-byte tun prefix
+    let mut tun_buf = vec![0u8; 65536 + 4]; // MTU + 4-byte tun prefix
 
     loop {
         let mut pollfds = [
-            libc::pollfd { fd: relay_fd, events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: utun_fd, events: libc::POLLIN, revents: 0 },
+            libc::pollfd {
+                fd: relay_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: utun_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
 
         let ret = unsafe { libc::poll(pollfds.as_mut_ptr(), 2, 5000) };
@@ -309,9 +326,8 @@ fn run_relay(relay_fd: RawFd, utun_fd: RawFd, utun_iface: &str) {
         // AVF → utun (and ARP/NDP synthesis).
         if pollfds[0].revents & libc::POLLIN != 0 {
             loop {
-                let n = unsafe {
-                    libc::recv(relay_fd, avf_buf.as_mut_ptr() as _, avf_buf.len(), 0)
-                };
+                let n =
+                    unsafe { libc::recv(relay_fd, avf_buf.as_mut_ptr() as _, avf_buf.len(), 0) };
                 if n <= 0 {
                     break;
                 }
@@ -328,9 +344,7 @@ fn run_relay(relay_fd: RawFd, utun_fd: RawFd, utun_iface: &str) {
         // utun → AVF.
         if pollfds[1].revents & libc::POLLIN != 0 {
             loop {
-                let n = unsafe {
-                    libc::read(utun_fd, tun_buf.as_mut_ptr() as _, tun_buf.len())
-                };
+                let n = unsafe { libc::read(utun_fd, tun_buf.as_mut_ptr() as _, tun_buf.len()) };
                 if n <= 0 {
                     break;
                 }
@@ -364,7 +378,12 @@ fn process_avf_frame(frame: &[u8], relay_fd: RawFd, utun_fd: RawFd, state: &mut 
         state.vm_mac = Some(mac);
         log::info!(
             "tun_relay: VM MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5]
         );
     }
 
@@ -523,18 +542,18 @@ fn send_to_avf(relay_fd: RawFd, frame: &[u8]) {
 /// Build an ARP reply advertising GATEWAY_MAC as the owner of GATEWAY_IP4.
 fn build_arp_reply(vm_mac: &[u8; 6], vm_ip4: &[u8; 4]) -> Vec<u8> {
     let mut f = vec![0u8; 42]; // 14 eth + 28 arp
-    // Ethernet
+                               // Ethernet
     f[0..6].copy_from_slice(vm_mac);
     f[6..12].copy_from_slice(&GATEWAY_MAC);
     f[12] = 0x08;
     f[13] = 0x06; // ethertype ARP
-    // ARP
+                  // ARP
     f[14] = 0x00;
     f[15] = 0x01; // Ethernet
     f[16] = 0x08;
     f[17] = 0x00; // IPv4
-    f[18] = 6;    // hw len
-    f[19] = 4;    // proto len
+    f[18] = 6; // hw len
+    f[19] = 4; // proto len
     f[20] = 0x00;
     f[21] = 0x02; // reply
     f[22..28].copy_from_slice(&GATEWAY_MAC);
@@ -559,8 +578,8 @@ fn build_ndp_na(vm_mac: &[u8; 6], target_ip6: &[u8; 16], dst_ip6: &[u8; 16]) -> 
     // [2..4] = checksum — computed below
     icmp[4] = 0x60; // S=1 (solicited), O=1 (override)
     icmp[8..24].copy_from_slice(target_ip6);
-    icmp[24] = 2;  // target link-layer address option type
-    icmp[25] = 1;  // option length (8 bytes / 8 = 1 unit)
+    icmp[24] = 2; // target link-layer address option type
+    icmp[25] = 1; // option length (8 bytes / 8 = 1 unit)
     icmp[26..32].copy_from_slice(&GATEWAY_MAC);
 
     let cksum = icmpv6_checksum(src_ip6, dst_ip6, &icmp);
@@ -581,7 +600,7 @@ fn build_ndp_na(vm_mac: &[u8; 6], target_ip6: &[u8; 16], dst_ip6: &[u8; 16]) -> 
     f.push(0x00);
     let plen = 32u16;
     f.extend_from_slice(&plen.to_be_bytes());
-    f.push(58);  // next header: ICMPv6
+    f.push(58); // next header: ICMPv6
     f.push(255); // hop limit (required 255 for NDP)
     f.extend_from_slice(src_ip6);
     f.extend_from_slice(dst_ip6);
@@ -654,7 +673,10 @@ fn pfctl_send(json: &str) -> Result<(), crate::Error> {
     if r.ok {
         Ok(())
     } else {
-        Err(crate::Error::Runtime(format!("pfctl: {}", r.error.unwrap_or_default())))
+        Err(crate::Error::Runtime(format!(
+            "pfctl: {}",
+            r.error.unwrap_or_default()
+        )))
     }
 }
 
@@ -692,8 +714,11 @@ fn pfctl_teardown_utun(iface: &str) -> Result<(), crate::Error> {
         action: &'static str,
         iface: &'a str,
     }
-    let json = serde_json::to_string(&Req { action: "teardown_utun", iface })
-        .map_err(|e| crate::Error::Runtime(e.to_string()))?;
+    let json = serde_json::to_string(&Req {
+        action: "teardown_utun",
+        iface,
+    })
+    .map_err(|e| crate::Error::Runtime(e.to_string()))?;
     pfctl_send(&json)
 }
 
@@ -706,9 +731,13 @@ fn detect_egress_iface() -> Option<String> {
         .args(["-n", "get", "default"])
         .output()
         .ok()?;
-    String::from_utf8_lossy(&out.stdout).lines().find_map(|line| {
-        line.trim().strip_prefix("interface:").map(|s| s.trim().to_string())
-    })
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("interface:")
+                .map(|s| s.trim().to_string())
+        })
 }
 
 fn create_socketpair() -> Result<(RawFd, RawFd), crate::Error> {
