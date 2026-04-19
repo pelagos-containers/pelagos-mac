@@ -22,6 +22,7 @@ compile_error!("pelagos-vz is macOS only");
 
 pub mod nat_relay;
 pub mod socket_vmnet;
+pub mod tun_relay;
 pub mod vm;
 
 use thiserror::Error;

@@ -80,8 +80,30 @@ struct Cli {
     #[arg(long = "extra-disk", global = true)]
     extra_disks: Vec<PathBuf>,
 
+    /// Network relay: smoltcp (IPv4 userspace, default) or utun (full IPv4+IPv6 via kernel).
+    /// The utun relay requires the pelagos-pfctl LaunchDaemon to be installed.
+    #[arg(long, default_value = "smoltcp", global = true)]
+    relay: RelayArg,
+
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Relay selector.  Exists so clap can parse and display "smoltcp|utun" cleanly.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, Default)]
+enum RelayArg {
+    #[default]
+    Smoltcp,
+    Utun,
+}
+
+impl From<RelayArg> for pelagos_vz::vm::RelayType {
+    fn from(r: RelayArg) -> Self {
+        match r {
+            RelayArg::Smoltcp => pelagos_vz::vm::RelayType::Smoltcp,
+            RelayArg::Utun => pelagos_vz::vm::RelayType::Utun,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -1844,6 +1866,7 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
         profile: cli.profile.clone(),
         extra_disks: cli.extra_disks.clone(),
         relay_proxy_port: relay_proxy_port_for_profile(&cli.profile),
+        relay_type: cli.relay.into(),
     }
 }
 

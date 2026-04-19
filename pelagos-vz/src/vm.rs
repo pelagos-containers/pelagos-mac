@@ -57,6 +57,19 @@ pub struct VmConfig {
     /// Loopback TCP port the NAT relay proxy binds on the host.
     /// Distinct per profile so multiple profiles can run simultaneously.
     pub relay_proxy_port: u16,
+    /// Which relay implementation to use. Default: `RelayType::Smoltcp`.
+    /// Set to `RelayType::Utun` to use the kernel-assisted utun relay.
+    pub relay_type: RelayType,
+}
+
+/// Selects the network relay implementation used by the VM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RelayType {
+    /// Userspace smoltcp relay (default — always available, IPv4 only).
+    #[default]
+    Smoltcp,
+    /// Kernel utun relay (requires pelagos-pfctl LaunchDaemon, full IPv4+IPv6).
+    Utun,
 }
 
 impl VmConfig {
@@ -78,6 +91,7 @@ pub struct VmConfigBuilder {
     virtiofs_shares: Vec<(PathBuf, String, bool)>,
     rosetta: bool,
     relay_proxy_port: Option<u16>,
+    relay_type: RelayType,
 }
 
 impl VmConfigBuilder {
@@ -132,6 +146,11 @@ impl VmConfigBuilder {
         self
     }
 
+    pub fn relay_type(mut self, t: RelayType) -> Self {
+        self.relay_type = t;
+        self
+    }
+
     pub fn build(self) -> Result<VmConfig, &'static str> {
         Ok(VmConfig {
             kernel: self.kernel.ok_or("kernel required")?,
@@ -149,6 +168,7 @@ impl VmConfigBuilder {
             relay_proxy_port: self
                 .relay_proxy_port
                 .unwrap_or(crate::nat_relay::RELAY_PROXY_PORT),
+            relay_type: self.relay_type,
         })
     }
 }
@@ -183,14 +203,22 @@ unsafe impl Sync for SendQueue {}
 // Vm
 // ---------------------------------------------------------------------------
 
+/// Holds whichever relay implementation is active for this VM.
+/// Fields are held purely for their `Drop` effect (keeping relay threads alive).
+#[allow(dead_code)]
+enum AnyRelay {
+    Smoltcp(crate::nat_relay::RelayHandle),
+    Utun(crate::tun_relay::TunRelayHandle),
+}
+
 /// A running Linux VM. Holds all AVF resources.
 pub struct Vm {
     vm: Arc<SendVm>,
     sock_dev: Arc<SendSockDev>,
     queue: Arc<SendQueue>,
     config: VmConfig,
-    /// Keeps the NAT relay thread alive for the VM's lifetime.
-    _relay: crate::nat_relay::RelayHandle,
+    /// Keeps the active relay alive for the VM's lifetime.
+    _relay: AnyRelay,
 }
 
 #[derive(Debug)]
@@ -425,11 +453,20 @@ unsafe fn start_vm(config: VmConfig) -> Result<(Vm, std::os::unix::io::OwnedFd),
         .collect();
     vm_config.setStorageDevices(&NSArray::from_slice(&storage_refs));
 
-    // 5. Userspace NAT relay via VZFileHandleNetworkDeviceAttachment.
-    //    Starts the smoltcp-based NAT relay (replaces socket_vmnet / vmnet.framework).
+    // 5. Network relay via VZFileHandleNetworkDeviceAttachment.
     //    Returns a SOCK_DGRAM fd that AVF consumes directly as raw Ethernet frames.
-    let (vmnet_fd, relay) = crate::nat_relay::start(config.relay_proxy_port)
-        .map_err(|e| crate::Error::Runtime(format!("nat_relay: {}", e)))?;
+    let (vmnet_fd, relay) = match config.relay_type {
+        RelayType::Smoltcp => {
+            let (fd, h) = crate::nat_relay::start(config.relay_proxy_port)
+                .map_err(|e| crate::Error::Runtime(format!("nat_relay: {e}")))?;
+            (fd, AnyRelay::Smoltcp(h))
+        }
+        RelayType::Utun => {
+            let (fd, h) = crate::tun_relay::start()
+                .map_err(|e| crate::Error::Runtime(format!("tun_relay: {e}")))?;
+            (fd, AnyRelay::Utun(h))
+        }
+    };
     let vmnet_fh = NSFileHandle::initWithFileDescriptor(NSFileHandle::alloc(), vmnet_fd);
     let net_attach = VZFileHandleNetworkDeviceAttachment::initWithFileHandle(
         VZFileHandleNetworkDeviceAttachment::alloc(),

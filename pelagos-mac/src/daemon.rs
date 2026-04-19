@@ -148,6 +148,8 @@ pub struct DaemonArgs {
     /// Loopback TCP port for the NAT relay proxy.  Distinct per profile so
     /// multiple profiles can run simultaneously without relay conflicts.
     pub relay_proxy_port: u16,
+    /// Which relay implementation to use (default: Smoltcp).
+    pub relay_type: pelagos_vz::vm::RelayType,
 }
 
 /// Ensure the daemon is running, starting it if necessary.
@@ -318,7 +320,12 @@ pub fn run(args: DaemonArgs) -> ! {
     // Load IPv6 NAT66 rule if the host has a global IPv6 address and the
     // pelagos-pfctl helper is installed.  Non-fatal: if the helper is absent
     // or the user has disabled NAT66, the VM starts normally.
-    let nat66_iface: Option<String> = if nat66::is_disabled_by_user() {
+    // Skip for the utun relay: tun_relay::start() calls setup_utun which
+    // already loads both NAT44 and NAT66 rules via pelagos-pfctl.
+    let nat66_iface: Option<String> = if args.relay_type == pelagos_vz::vm::RelayType::Utun {
+        log::debug!("nat66: skipping auto-load — utun relay manages NAT");
+        None
+    } else if nat66::is_disabled_by_user() {
         log::debug!("nat66: disabled by user — skipping");
         None
     } else {
@@ -846,6 +853,10 @@ pub(crate) fn daemon_subprocess_args(args: &DaemonArgs) -> Vec<std::ffi::OsStrin
         v.push("--extra-disk".into());
         v.push(path.as_os_str().into());
     }
+    if args.relay_type == pelagos_vz::vm::RelayType::Utun {
+        v.push("--relay".into());
+        v.push("utun".into());
+    }
     v.push("vm-daemon-internal".into());
     v
 }
@@ -857,7 +868,8 @@ fn build_vm_config(args: &DaemonArgs) -> VmConfig {
         .cmdline(build_cmdline(args))
         .memory_mib(args.memory_mib)
         .cpus(args.cpus)
-        .relay_proxy_port(args.relay_proxy_port);
+        .relay_proxy_port(args.relay_proxy_port)
+        .relay_type(args.relay_type);
     if let Some(ref initrd) = args.initrd {
         b = b.initrd(initrd);
     }
@@ -1376,6 +1388,7 @@ mod tests {
             profile: "default".into(),
             extra_disks: vec![],
             relay_proxy_port: pelagos_vz::nat_relay::RELAY_PROXY_PORT,
+            relay_type: pelagos_vz::vm::RelayType::default(),
         }
     }
 
