@@ -25,51 +25,25 @@ use serde::{Deserialize, Serialize};
 use pelagos_vz::vm::{Vm, VmConfig};
 
 use crate::nat66;
-
-use crate::port_dispatcher::{DispatchCmd, PortDispatcher};
 use crate::state::StateDir;
 
 // ---------------------------------------------------------------------------
-// PortRouter — relay-agnostic port-forward abstraction
+// PortRouter — port-forward abstraction over Arc<Vm>
 // ---------------------------------------------------------------------------
 
-/// Routes port-forward add/remove operations to the appropriate backend.
-///
-/// - `Dispatcher`: smoltcp relay — binds host TCP listeners and proxies via relay_proxy_port.
-/// - `UtunVm`: utun relay — installs/removes pf RDR rules via TunRelayHandle → pelagos-pfctl.
-enum PortRouter {
-    Dispatcher(Arc<PortDispatcher>),
-    UtunVm(Arc<Vm>),
-}
+/// Routes port-forward add/remove to the utun relay (pf RDR rules via pelagos-pfctl).
+struct PortRouter(Arc<Vm>);
 
 impl PortRouter {
     fn add(&self, host_port: u16, container_port: u16) {
-        match self {
-            PortRouter::Dispatcher(d) => d.send(DispatchCmd::Add { host_port, container_port }),
-            PortRouter::UtunVm(vm) => {
-                if let Err(e) = vm.add_port_forward("tcp", host_port, container_port) {
-                    log::warn!("utun add_rdr :{host_port}→:{container_port}: {e}");
-                }
-            }
+        if let Err(e) = self.0.add_port_forward("tcp", host_port, container_port) {
+            log::warn!("add_rdr :{host_port}→:{container_port}: {e}");
         }
     }
 
     fn remove(&self, host_port: u16) {
-        match self {
-            PortRouter::Dispatcher(d) => d.send(DispatchCmd::Remove { host_port }),
-            PortRouter::UtunVm(vm) => {
-                if let Err(e) = vm.remove_port_forward("tcp", host_port) {
-                    log::warn!("utun remove_rdr :{host_port}: {e}");
-                }
-            }
-        }
-    }
-
-    /// Signal the dispatcher to stop accepting new connections.
-    /// No-op for utun relay — cleanup happens via TunRelayHandle::Drop.
-    fn shutdown(&self) {
-        if let PortRouter::Dispatcher(d) = self {
-            d.send(DispatchCmd::Shutdown);
+        if let Err(e) = self.0.remove_port_forward("tcp", host_port) {
+            log::warn!("remove_rdr :{host_port}: {e}");
         }
     }
 }
@@ -190,11 +164,6 @@ pub struct DaemonArgs {
     /// Secondary disk images: first → /dev/vdb, second → /dev/vdc, etc.
     /// Used during build-VM provisioning to avoid virtiofs I/O overhead.
     pub extra_disks: Vec<std::path::PathBuf>,
-    /// Loopback TCP port for the NAT relay proxy.  Distinct per profile so
-    /// multiple profiles can run simultaneously without relay conflicts.
-    pub relay_proxy_port: u16,
-    /// Which relay implementation to use (default: Smoltcp).
-    pub relay_type: pelagos_vz::vm::RelayType,
 }
 
 /// Ensure the daemon is running, starting it if necessary.
@@ -338,19 +307,7 @@ pub fn run(args: DaemonArgs) -> ! {
 
     let port_state = Arc::new(Mutex::new(PortState::new()));
 
-    // Build the port router appropriate for the active relay.
-    let router: Arc<PortRouter> = Arc::new(
-        match args.relay_type {
-            pelagos_vz::vm::RelayType::Smoltcp => {
-                // smoltcp: single-threaded dispatcher binds host listeners and proxies via relay_proxy_port.
-                PortRouter::Dispatcher(Arc::new(PortDispatcher::spawn(args.relay_proxy_port)))
-            }
-            pelagos_vz::vm::RelayType::Utun => {
-                // utun: kernel pf RDR rules via pelagos-pfctl (no host TCP listener needed).
-                PortRouter::UtunVm(Arc::clone(&vm))
-            }
-        }
-    );
+    let router: Arc<PortRouter> = Arc::new(PortRouter(Arc::clone(&vm)));
 
     // Pre-register any ports requested at daemon startup via `vm start -p`.
     {
@@ -370,15 +327,10 @@ pub fn run(args: DaemonArgs) -> ! {
         Arc::clone(&port_state),
     );
 
-    // Load IPv6 NAT66 rule if the host has a global IPv6 address and the
-    // pelagos-pfctl helper is installed.  Non-fatal: if the helper is absent
-    // or the user has disabled NAT66, the VM starts normally.
-    // Skip for the utun relay: tun_relay::start() calls setup_utun which
-    // already loads both NAT44 and NAT66 rules via pelagos-pfctl.
-    let nat66_iface: Option<String> = if args.relay_type == pelagos_vz::vm::RelayType::Utun {
-        log::debug!("nat66: skipping auto-load — utun relay manages NAT");
-        None
-    } else if nat66::is_disabled_by_user() {
+    // tun_relay::start() → setup_utun loads NAT44 and NAT66 via pelagos-pfctl.
+    // If the host has a global IPv6 address, nat66::load records which interface
+    // was active so we can remove the rule on shutdown.
+    let nat66_iface: Option<String> = if nat66::is_disabled_by_user() {
         log::debug!("nat66: disabled by user — skipping");
         None
     } else {
@@ -453,7 +405,6 @@ pub fn run(args: DaemonArgs) -> ! {
                 }
             }
 
-            router.shutdown();
             drop(router);
             // Drop the Arc. If no proxy threads are active, Vm::drop runs stop().
             // If threads still hold clones the VM will stop when the last clone
@@ -736,7 +687,7 @@ struct WatchContainer {
 
 /// Spawn the subscription watcher thread.  The thread connects to vsock,
 /// subscribes to container lifecycle events, and automatically removes port
-/// forwards from `PortDispatcher` / `PortState` when a container exits.
+/// forwards from `PortState` when a container exits.
 fn start_subscription_watcher(
     vm: Arc<Vm>,
     router: Arc<PortRouter>,
@@ -901,10 +852,6 @@ pub(crate) fn daemon_subprocess_args(args: &DaemonArgs) -> Vec<std::ffi::OsStrin
         v.push("--extra-disk".into());
         v.push(path.as_os_str().into());
     }
-    if args.relay_type == pelagos_vz::vm::RelayType::Utun {
-        v.push("--relay".into());
-        v.push("utun".into());
-    }
     v.push("vm-daemon-internal".into());
     v
 }
@@ -915,9 +862,7 @@ fn build_vm_config(args: &DaemonArgs) -> VmConfig {
         .disk(&args.disk)
         .cmdline(build_cmdline(args))
         .memory_mib(args.memory_mib)
-        .cpus(args.cpus)
-        .relay_proxy_port(args.relay_proxy_port)
-        .relay_type(args.relay_type);
+        .cpus(args.cpus);
     if let Some(ref initrd) = args.initrd {
         b = b.initrd(initrd);
     }
@@ -1435,8 +1380,6 @@ mod tests {
             port_forwards: vec![],
             profile: "default".into(),
             extra_disks: vec![],
-            relay_proxy_port: pelagos_vz::nat_relay::RELAY_PROXY_PORT,
-            relay_type: pelagos_vz::vm::RelayType::default(),
         }
     }
 

@@ -54,22 +54,6 @@ pub struct VmConfig {
     pub virtiofs_shares: Vec<(PathBuf, String, bool)>,
     /// Enable Rosetta for x86_64 Linux binaries (macOS 13+).
     pub rosetta: bool,
-    /// Loopback TCP port the NAT relay proxy binds on the host.
-    /// Distinct per profile so multiple profiles can run simultaneously.
-    pub relay_proxy_port: u16,
-    /// Which relay implementation to use. Default: `RelayType::Smoltcp`.
-    /// Set to `RelayType::Utun` to use the kernel-assisted utun relay.
-    pub relay_type: RelayType,
-}
-
-/// Selects the network relay implementation used by the VM.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum RelayType {
-    /// Userspace smoltcp relay (default — always available, IPv4 only).
-    #[default]
-    Smoltcp,
-    /// Kernel utun relay (requires pelagos-pfctl LaunchDaemon, full IPv4+IPv6).
-    Utun,
 }
 
 impl VmConfig {
@@ -90,8 +74,6 @@ pub struct VmConfigBuilder {
     vsock_port: Option<u32>,
     virtiofs_shares: Vec<(PathBuf, String, bool)>,
     rosetta: bool,
-    relay_proxy_port: Option<u16>,
-    relay_type: RelayType,
 }
 
 impl VmConfigBuilder {
@@ -141,16 +123,6 @@ impl VmConfigBuilder {
         self.rosetta = enabled;
         self
     }
-    pub fn relay_proxy_port(mut self, port: u16) -> Self {
-        self.relay_proxy_port = Some(port);
-        self
-    }
-
-    pub fn relay_type(mut self, t: RelayType) -> Self {
-        self.relay_type = t;
-        self
-    }
-
     pub fn build(self) -> Result<VmConfig, &'static str> {
         Ok(VmConfig {
             kernel: self.kernel.ok_or("kernel required")?,
@@ -165,10 +137,6 @@ impl VmConfigBuilder {
             vsock_port: self.vsock_port.unwrap_or(1024),
             virtiofs_shares: self.virtiofs_shares,
             rosetta: self.rosetta,
-            relay_proxy_port: self
-                .relay_proxy_port
-                .unwrap_or(crate::nat_relay::RELAY_PROXY_PORT),
-            relay_type: self.relay_type,
         })
     }
 }
@@ -207,22 +175,14 @@ unsafe impl Sync for SendQueue {}
 /// Both relay implementations configure the guest with this address.
 pub const VM_IP4: &str = "192.168.105.2";
 
-/// Holds whichever relay implementation is active for this VM.
-/// Fields are held purely for their `Drop` effect (keeping relay threads alive).
-#[allow(dead_code)] // both inner values are Drop-only; Utun is also used by add/remove_port_forward
-enum AnyRelay {
-    Smoltcp(crate::nat_relay::RelayHandle),
-    Utun(crate::tun_relay::TunRelayHandle),
-}
-
 /// A running Linux VM. Holds all AVF resources.
 pub struct Vm {
     vm: Arc<SendVm>,
     sock_dev: Arc<SendSockDev>,
     queue: Arc<SendQueue>,
     config: VmConfig,
-    /// Keeps the active relay alive for the VM's lifetime.
-    _relay: AnyRelay,
+    /// Keeps the utun relay alive for the VM's lifetime (Drop tears it down).
+    _relay: crate::tun_relay::TunRelayHandle,
 }
 
 #[derive(Debug)]
@@ -335,25 +295,17 @@ impl Vm {
         Ok(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(raw_fd) })
     }
 
-    /// Add a TCP host→VM port forward.
+    /// Add a TCP host→VM port forward via pf RDR rule (pelagos-pfctl).
     ///
-    /// For the utun relay: installs a pf RDR rule via pelagos-pfctl so connections
-    /// to `127.0.0.1:host_port` (and the egress interface) are kernel-redirected
-    /// to `VM_IP4:vm_port`.
-    /// For the smoltcp relay: the PortDispatcher handles forwarding; this is a no-op.
+    /// Connections to `127.0.0.1:host_port` (and the egress interface) are
+    /// kernel-redirected to `VM_IP4:vm_port`.
     pub fn add_port_forward(&self, proto: &str, host_port: u16, vm_port: u16) -> Result<(), crate::Error> {
-        match &self._relay {
-            AnyRelay::Utun(h) => h.add_rdr(proto, host_port, VM_IP4, vm_port),
-            AnyRelay::Smoltcp(_) => Ok(()), // smoltcp relay uses PortDispatcher
-        }
+        self._relay.add_rdr(proto, host_port, VM_IP4, vm_port)
     }
 
     /// Remove a previously added port forward.
     pub fn remove_port_forward(&self, proto: &str, host_port: u16) -> Result<(), crate::Error> {
-        match &self._relay {
-            AnyRelay::Utun(h) => h.remove_rdr(proto, host_port),
-            AnyRelay::Smoltcp(_) => Ok(()),
-        }
+        self._relay.remove_rdr(proto, host_port)
     }
 
     pub fn config(&self) -> &VmConfig {
@@ -480,18 +432,8 @@ unsafe fn start_vm(config: VmConfig) -> Result<(Vm, std::os::unix::io::OwnedFd),
 
     // 5. Network relay via VZFileHandleNetworkDeviceAttachment.
     //    Returns a SOCK_DGRAM fd that AVF consumes directly as raw Ethernet frames.
-    let (vmnet_fd, relay) = match config.relay_type {
-        RelayType::Smoltcp => {
-            let (fd, h) = crate::nat_relay::start(config.relay_proxy_port)
-                .map_err(|e| crate::Error::Runtime(format!("nat_relay: {e}")))?;
-            (fd, AnyRelay::Smoltcp(h))
-        }
-        RelayType::Utun => {
-            let (fd, h) = crate::tun_relay::start()
-                .map_err(|e| crate::Error::Runtime(format!("tun_relay: {e}")))?;
-            (fd, AnyRelay::Utun(h))
-        }
-    };
+    let (vmnet_fd, relay) = crate::tun_relay::start()
+        .map_err(|e| crate::Error::Runtime(format!("tun_relay: {e}")))?;
     let vmnet_fh = NSFileHandle::initWithFileDescriptor(NSFileHandle::alloc(), vmnet_fd);
     let net_attach = VZFileHandleNetworkDeviceAttachment::initWithFileHandle(
         VZFileHandleNetworkDeviceAttachment::alloc(),
@@ -501,7 +443,7 @@ unsafe fn start_vm(config: VmConfig) -> Result<(Vm, std::os::unix::io::OwnedFd),
     net_dev.setAttachment(Some(&*net_attach));
     let mac = VZMACAddress::randomLocallyAdministeredAddress();
     net_dev.setMACAddress(&mac);
-    log::info!("nat_relay: VM MAC address {}", mac.string());
+    log::info!("VM MAC address {}", mac.string());
     let net_ref: &VZNetworkDeviceConfiguration = &net_dev;
     vm_config.setNetworkDevices(&NSArray::from_slice(&[net_ref]));
 

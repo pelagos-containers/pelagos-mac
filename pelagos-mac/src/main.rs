@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 
 mod daemon;
 mod nat66;
-mod port_dispatcher;
 mod state;
 
 // ---------------------------------------------------------------------------
@@ -80,30 +79,8 @@ struct Cli {
     #[arg(long = "extra-disk", global = true)]
     extra_disks: Vec<PathBuf>,
 
-    /// Network relay: smoltcp (IPv4 userspace, default) or utun (full IPv4+IPv6 via kernel).
-    /// The utun relay requires the pelagos-pfctl LaunchDaemon to be installed.
-    #[arg(long, default_value = "smoltcp", global = true)]
-    relay: RelayArg,
-
     #[command(subcommand)]
     command: Commands,
-}
-
-/// Relay selector.  Exists so clap can parse and display "smoltcp|utun" cleanly.
-#[derive(clap::ValueEnum, Debug, Clone, Copy, Default, PartialEq)]
-enum RelayArg {
-    #[default]
-    Smoltcp,
-    Utun,
-}
-
-impl From<RelayArg> for pelagos_vz::vm::RelayType {
-    fn from(r: RelayArg) -> Self {
-        match r {
-            RelayArg::Smoltcp => pelagos_vz::vm::RelayType::Smoltcp,
-            RelayArg::Utun => pelagos_vz::vm::RelayType::Utun,
-        }
-    }
 }
 
 #[derive(Subcommand)]
@@ -319,23 +296,6 @@ enum Commands {
     #[command(hide = true)]
     VmDaemonInternal,
 
-    /// Internal: TCP port-proxy. Binds host TCP listeners and forwards each
-    /// accepted connection to the VM at 192.168.105.2. Not for direct use.
-    #[command(hide = true)]
-    PortProxy {
-        /// Port forward HOST_PORT:VM_PORT (repeatable).
-        #[arg(short = 'p', long = "port")]
-        ports: Vec<String>,
-    },
-
-    /// Internal: SSH ProxyCommand helper — connects stdin/stdout to a VM port
-    /// via the smoltcp NAT relay proxy. Used by `pelagos vm ssh`. Not for
-    /// direct use.
-    #[command(hide = true)]
-    SshRelayProxy {
-        /// VM port to connect to (e.g. 22 for SSH).
-        port: u16,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -950,25 +910,8 @@ fn main() {
                 .arg("-o")
                 .arg("LogLevel=ERROR");
 
-            if cli.relay == RelayArg::Utun {
-                // utun relay: the VM is directly routable at VM_IP4 via the utun interface.
-                cmd.arg(format!("root@{}", pelagos_vz::vm::VM_IP4));
-            } else {
-                // smoltcp relay: no direct route to 192.168.105.2; proxy through the relay.
-                let exe = std::env::current_exe().unwrap_or_else(|_| {
-                    eprintln!("error: cannot determine current executable path");
-                    process::exit(1);
-                });
-                let proxy_cmd = format!(
-                    "{} --profile {} ssh-relay-proxy {}",
-                    exe.display(),
-                    cli.profile,
-                    VM_SSH_PORT
-                );
-                cmd.arg("-o")
-                    .arg(format!("ProxyCommand={}", proxy_cmd))
-                    .arg("root@vm"); // hostname is arbitrary; ProxyCommand handles routing
-            }
+            // utun relay: the VM is directly routable at VM_IP4 via the utun interface.
+            cmd.arg(format!("root@{}", pelagos_vz::vm::VM_IP4));
 
             for arg in &extra {
                 cmd.arg(arg);
@@ -1051,9 +994,8 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            // Register port forwards with the daemon.  The daemon's
-            // PortDispatcher (one listener thread for all ports) manages TCP
-            // listeners; conflict detection returns an error immediately.
+            // Register port forwards with the daemon.  The daemon installs pf RDR
+            // rules via pelagos-pfctl; conflict detection returns an error immediately.
             for spec in &cli.ports {
                 if let Some(pf) = daemon::parse_port_spec(spec) {
                     if let Err(e) = send_daemon_cmd(
@@ -1647,107 +1589,9 @@ fn main() {
             }
         }
 
-        Commands::PortProxy { ref ports } => {
-            let relay_port = relay_proxy_port_for_profile(&cli.profile);
-            cmd_port_proxy(ports, relay_port);
-        }
-
-        Commands::SshRelayProxy { port } => {
-            let relay_port = relay_proxy_port_for_profile(&cli.profile);
-            ssh_relay_proxy(port, relay_port);
-        }
     }
 }
 
-/// Start a TCP port-proxy for each `HOST:VM` spec.  Binds `0.0.0.0:HOST` on
-/// macOS and forwards each accepted connection to `192.168.105.2:VM`.
-/// Runs until the process is killed (SIGTERM from the shim on container stop/rm).
-fn cmd_port_proxy(ports: &[String], relay_proxy_port: u16) {
-    use port_dispatcher::{DispatchCmd, PortDispatcher};
-
-    if ports.is_empty() {
-        log::warn!("port-proxy: no ports specified, exiting immediately");
-        return;
-    }
-    let dispatcher = PortDispatcher::spawn(relay_proxy_port);
-    for spec in ports {
-        match daemon::parse_port_spec(spec) {
-            Some(pf) => {
-                dispatcher.send(DispatchCmd::Add {
-                    host_port: pf.host_port,
-                    container_port: pf.container_port,
-                });
-            }
-            None => {
-                log::error!("port-proxy: invalid port spec {:?}", spec);
-                process::exit(1);
-            }
-        }
-    }
-    // Block until killed.
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(86400));
-    }
-}
-
-/// SSH ProxyCommand helper: connect stdin/stdout to a VM port via the smoltcp
-/// NAT relay proxy at `127.0.0.1:relay_port`.
-///
-/// `relay_port` is the per-profile relay proxy port derived from the active
-/// profile name via [`relay_proxy_port_for_profile`].
-///
-/// Protocol: connect → write 2-byte big-endian port number → raw stream.
-/// SSH invokes this as a subprocess and speaks SSH protocol over its stdio.
-fn ssh_relay_proxy(port: u16, relay_port: u16) -> ! {
-    use std::fs::File;
-    use std::io::Write;
-    use std::net::TcpStream;
-    use std::os::unix::io::FromRawFd;
-
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], relay_port));
-    let mut relay = TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5))
-        .unwrap_or_else(|e| {
-            eprintln!("ssh-relay-proxy: connect relay: {}", e);
-            process::exit(1);
-        });
-
-    // Send the 2-byte big-endian target port inside the VM.
-    relay.write_all(&port.to_be_bytes()).unwrap_or_else(|e| {
-        eprintln!("ssh-relay-proxy: write port: {}", e);
-        process::exit(1);
-    });
-
-    // Proxy stdin → relay and relay → stdout in two threads.
-    // When either direction closes, call process::exit immediately.
-    // SSH waits for the ProxyCommand process to exit before it considers
-    // the session done; blocking on the other direction creates a deadlock
-    // (SSH holds its write pipe open waiting for us to exit; we're blocked
-    // reading that pipe waiting for SSH to close it).
-    //
-    // IMPORTANT: stdout() uses a LineWriter that only flushes on '\n'.
-    // The SSH banner ends with \r\n (flushed), but the subsequent binary
-    // KEXINIT packet has no newline and would be buffered indefinitely.
-    // Write to raw fd 1 directly (via File::from_raw_fd) to bypass the
-    // LineWriter and ensure all bytes reach SSH immediately.
-    let relay_read = relay.try_clone().expect("clone relay");
-    std::thread::spawn(move || {
-        let mut src = std::io::stdin().lock();
-        let mut dst = relay;
-        let _ = std::io::copy(&mut src, &mut dst);
-        process::exit(0);
-    });
-    std::thread::spawn(move || {
-        let mut src = relay_read;
-        // SAFETY: fd 1 is stdout, open for the lifetime of this process.
-        let mut dst = unsafe { File::from_raw_fd(1) };
-        let _ = std::io::copy(&mut src, &mut dst);
-        process::exit(0);
-    });
-    // Park; the proxy threads call process::exit when either side closes.
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(86400));
-    }
-}
 
 fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
     // Load per-profile vm.conf as a fallback layer below CLI flags.
@@ -1867,8 +1711,6 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
         port_forwards,
         profile: cli.profile.clone(),
         extra_disks: cli.extra_disks.clone(),
-        relay_proxy_port: relay_proxy_port_for_profile(&cli.profile),
-        relay_type: cli.relay.into(),
     }
 }
 
@@ -1963,31 +1805,6 @@ fn build_virtiofs_shares(volumes: &[String]) -> Vec<daemon::VirtiofsShare> {
 /// Parse a slice of `/host:/container[:ro]` strings into `VirtiofsShare`s.
 /// Tags are assigned as `share0`, `share1`, etc. based on index.
 /// For home-aware share building, call `build_virtiofs_shares` instead.
-/// Returns the NAT relay proxy port for a given profile.
-///
-/// Each profile binds its own loopback port so that the default (Alpine
-/// container) VM and named profiles (e.g. "build" Ubuntu VM) can run
-/// simultaneously without one profile's `ssh-relay-proxy` or port-dispatcher
-/// accidentally connecting to the wrong daemon's relay.
-///
-/// "default" → [`pelagos_vz::nat_relay::RELAY_PROXY_PORT`] (17900) for
-/// backward compatibility.  Named profiles get a deterministic port derived
-/// from the profile name via FNV-1a hash, clamped to 17901..=18899 (well
-/// below the ephemeral port range and away from common service ports).
-fn relay_proxy_port_for_profile(profile: &str) -> u16 {
-    if profile == "default" {
-        return pelagos_vz::nat_relay::RELAY_PROXY_PORT;
-    }
-    // FNV-1a 32-bit: deterministic, zero-dependency, good distribution.
-    let mut hash: u32 = 2166136261;
-    for b in profile.bytes() {
-        hash ^= b as u32;
-        hash = hash.wrapping_mul(16777619);
-    }
-    // 999 slots: 17901..=18899.  No collision with 17900 (default).
-    17901 + (hash % 999) as u16
-}
-
 fn parse_volumes(volumes: &[String]) -> Vec<daemon::VirtiofsShare> {
     volumes
         .iter()
@@ -3253,8 +3070,7 @@ fn ping_ssh(cli: &Cli) -> i32 {
             log::error!("SSH ping timed out after 10 minutes");
             return 1;
         }
-        // Wait between retries. A longer gap (15s vs 5s) reduces stale smoltcp
-        // connection accumulation during the boot window when ARP is not yet ready.
+        // Wait between retries (15s gap matches the utun ping timeout).
         std::thread::sleep(std::time::Duration::from_secs(15));
     }
 }
@@ -3666,45 +3482,12 @@ fn read_winsize() -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        recv_frame, relay_proxy_port_for_profile, send_frame, Cli, Commands, GuestCommand,
-        GuestMount, GuestResponse, FRAME_EXIT, FRAME_RESIZE, FRAME_STDIN, FRAME_STDOUT,
+        recv_frame, send_frame, Cli, Commands, GuestCommand, GuestMount, GuestResponse,
+        FRAME_EXIT, FRAME_RESIZE, FRAME_STDIN, FRAME_STDOUT,
     };
     use clap::Parser as _;
     use std::io::Cursor;
     use std::path::PathBuf;
-
-    #[test]
-    fn relay_port_default_is_canonical() {
-        assert_eq!(
-            relay_proxy_port_for_profile("default"),
-            pelagos_vz::nat_relay::RELAY_PROXY_PORT
-        );
-    }
-
-    #[test]
-    fn relay_port_named_differs_from_default() {
-        let build_port = relay_proxy_port_for_profile("build");
-        assert_ne!(build_port, pelagos_vz::nat_relay::RELAY_PROXY_PORT);
-        assert!(build_port >= 17901 && build_port <= 18899);
-    }
-
-    #[test]
-    fn relay_port_named_is_deterministic() {
-        assert_eq!(
-            relay_proxy_port_for_profile("build"),
-            relay_proxy_port_for_profile("build")
-        );
-    }
-
-    #[test]
-    fn relay_port_distinct_profiles_differ() {
-        let a = relay_proxy_port_for_profile("build");
-        let b = relay_proxy_port_for_profile("staging");
-        assert_ne!(
-            a, b,
-            "different profile names should produce different ports"
-        );
-    }
 
     #[test]
     fn pong_deserializes() {
