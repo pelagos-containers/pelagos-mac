@@ -203,9 +203,13 @@ unsafe impl Sync for SendQueue {}
 // Vm
 // ---------------------------------------------------------------------------
 
+/// Static IPv4 address of the VM inside the relay network.
+/// Both relay implementations configure the guest with this address.
+pub const VM_IP4: &str = "192.168.105.2";
+
 /// Holds whichever relay implementation is active for this VM.
 /// Fields are held purely for their `Drop` effect (keeping relay threads alive).
-#[allow(dead_code)]
+#[allow(dead_code)] // both inner values are Drop-only; Utun is also used by add/remove_port_forward
 enum AnyRelay {
     Smoltcp(crate::nat_relay::RelayHandle),
     Utun(crate::tun_relay::TunRelayHandle),
@@ -329,6 +333,27 @@ impl Vm {
         }
         let raw_fd = g.take().unwrap().map_err(crate::Error::Runtime)?;
         Ok(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(raw_fd) })
+    }
+
+    /// Add a TCP host→VM port forward.
+    ///
+    /// For the utun relay: installs a pf RDR rule via pelagos-pfctl so connections
+    /// to `127.0.0.1:host_port` (and the egress interface) are kernel-redirected
+    /// to `VM_IP4:vm_port`.
+    /// For the smoltcp relay: the PortDispatcher handles forwarding; this is a no-op.
+    pub fn add_port_forward(&self, proto: &str, host_port: u16, vm_port: u16) -> Result<(), crate::Error> {
+        match &self._relay {
+            AnyRelay::Utun(h) => h.add_rdr(proto, host_port, VM_IP4, vm_port),
+            AnyRelay::Smoltcp(_) => Ok(()), // smoltcp relay uses PortDispatcher
+        }
+    }
+
+    /// Remove a previously added port forward.
+    pub fn remove_port_forward(&self, proto: &str, host_port: u16) -> Result<(), crate::Error> {
+        match &self._relay {
+            AnyRelay::Utun(h) => h.remove_rdr(proto, host_port),
+            AnyRelay::Smoltcp(_) => Ok(()),
+        }
     }
 
     pub fn config(&self) -> &VmConfig {

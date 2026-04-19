@@ -90,7 +90,7 @@ struct Cli {
 }
 
 /// Relay selector.  Exists so clap can parse and display "smoltcp|utun" cleanly.
-#[derive(clap::ValueEnum, Debug, Clone, Copy, Default)]
+#[derive(clap::ValueEnum, Debug, Clone, Copy, Default, PartialEq)]
 enum RelayArg {
     #[default]
     Smoltcp,
@@ -940,22 +940,6 @@ fn main() {
                 );
                 process::exit(1);
             }
-            // Route SSH through the smoltcp relay proxy — the host has no
-            // direct route to 192.168.105.2, but the relay proxy at
-            // 127.0.0.1:RELAY_PROXY_PORT can forward TCP to any VM port.
-            // We use ourselves as the ProxyCommand so no external tools are needed.
-            let exe = std::env::current_exe().unwrap_or_else(|_| {
-                eprintln!("error: cannot determine current executable path");
-                process::exit(1);
-            });
-            // Include --profile so the subprocess derives the same per-profile
-            // relay port without any extra IPC.
-            let proxy_cmd = format!(
-                "{} --profile {} ssh-relay-proxy {}",
-                exe.display(),
-                cli.profile,
-                VM_SSH_PORT
-            );
             let mut cmd = std::process::Command::new("ssh");
             cmd.arg("-i")
                 .arg(&ssh_key)
@@ -964,10 +948,28 @@ fn main() {
                 .arg("-o")
                 .arg("UserKnownHostsFile=/dev/null")
                 .arg("-o")
-                .arg("LogLevel=ERROR")
-                .arg("-o")
-                .arg(format!("ProxyCommand={}", proxy_cmd))
-                .arg("root@vm"); // hostname is arbitrary; ProxyCommand handles routing
+                .arg("LogLevel=ERROR");
+
+            if cli.relay == RelayArg::Utun {
+                // utun relay: the VM is directly routable at VM_IP4 via the utun interface.
+                cmd.arg(format!("root@{}", pelagos_vz::vm::VM_IP4));
+            } else {
+                // smoltcp relay: no direct route to 192.168.105.2; proxy through the relay.
+                let exe = std::env::current_exe().unwrap_or_else(|_| {
+                    eprintln!("error: cannot determine current executable path");
+                    process::exit(1);
+                });
+                let proxy_cmd = format!(
+                    "{} --profile {} ssh-relay-proxy {}",
+                    exe.display(),
+                    cli.profile,
+                    VM_SSH_PORT
+                );
+                cmd.arg("-o")
+                    .arg(format!("ProxyCommand={}", proxy_cmd))
+                    .arg("root@vm"); // hostname is arbitrary; ProxyCommand handles routing
+            }
+
             for arg in &extra {
                 cmd.arg(arg);
             }

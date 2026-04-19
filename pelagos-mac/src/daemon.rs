@@ -30,6 +30,51 @@ use crate::port_dispatcher::{DispatchCmd, PortDispatcher};
 use crate::state::StateDir;
 
 // ---------------------------------------------------------------------------
+// PortRouter — relay-agnostic port-forward abstraction
+// ---------------------------------------------------------------------------
+
+/// Routes port-forward add/remove operations to the appropriate backend.
+///
+/// - `Dispatcher`: smoltcp relay — binds host TCP listeners and proxies via relay_proxy_port.
+/// - `UtunVm`: utun relay — installs/removes pf RDR rules via TunRelayHandle → pelagos-pfctl.
+enum PortRouter {
+    Dispatcher(Arc<PortDispatcher>),
+    UtunVm(Arc<Vm>),
+}
+
+impl PortRouter {
+    fn add(&self, host_port: u16, container_port: u16) {
+        match self {
+            PortRouter::Dispatcher(d) => d.send(DispatchCmd::Add { host_port, container_port }),
+            PortRouter::UtunVm(vm) => {
+                if let Err(e) = vm.add_port_forward("tcp", host_port, container_port) {
+                    log::warn!("utun add_rdr :{host_port}→:{container_port}: {e}");
+                }
+            }
+        }
+    }
+
+    fn remove(&self, host_port: u16) {
+        match self {
+            PortRouter::Dispatcher(d) => d.send(DispatchCmd::Remove { host_port }),
+            PortRouter::UtunVm(vm) => {
+                if let Err(e) = vm.remove_port_forward("tcp", host_port) {
+                    log::warn!("utun remove_rdr :{host_port}: {e}");
+                }
+            }
+        }
+    }
+
+    /// Signal the dispatcher to stop accepting new connections.
+    /// No-op for utun relay — cleanup happens via TunRelayHandle::Drop.
+    fn shutdown(&self) {
+        if let PortRouter::Dispatcher(d) = self {
+            d.send(DispatchCmd::Shutdown);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
@@ -291,19 +336,27 @@ pub fn run(args: DaemonArgs) -> ! {
             log::error!("write extra_disks: {}", e);
         });
 
-    // Spawn the single-threaded port-forward dispatcher (O(1) listener threads
-    // regardless of how many ports or containers are active).
-    let dispatcher = Arc::new(PortDispatcher::spawn(args.relay_proxy_port));
     let port_state = Arc::new(Mutex::new(PortState::new()));
+
+    // Build the port router appropriate for the active relay.
+    let router: Arc<PortRouter> = Arc::new(
+        match args.relay_type {
+            pelagos_vz::vm::RelayType::Smoltcp => {
+                // smoltcp: single-threaded dispatcher binds host listeners and proxies via relay_proxy_port.
+                PortRouter::Dispatcher(Arc::new(PortDispatcher::spawn(args.relay_proxy_port)))
+            }
+            pelagos_vz::vm::RelayType::Utun => {
+                // utun: kernel pf RDR rules via pelagos-pfctl (no host TCP listener needed).
+                PortRouter::UtunVm(Arc::clone(&vm))
+            }
+        }
+    );
 
     // Pre-register any ports requested at daemon startup via `vm start -p`.
     {
         let mut ps = port_state.lock().unwrap();
         for pf in &args.port_forwards {
-            dispatcher.send(DispatchCmd::Add {
-                host_port: pf.host_port,
-                container_port: pf.container_port,
-            });
+            router.add(pf.host_port, pf.container_port);
             ps.active.insert(pf.host_port, pf.container_port);
         }
     }
@@ -313,7 +366,7 @@ pub fn run(args: DaemonArgs) -> ! {
     // Spawn the subscription watcher: auto-deregisters ports when containers exit.
     start_subscription_watcher(
         Arc::clone(&vm),
-        Arc::clone(&dispatcher),
+        Arc::clone(&router),
         Arc::clone(&port_state),
     );
 
@@ -400,8 +453,8 @@ pub fn run(args: DaemonArgs) -> ! {
                 }
             }
 
-            dispatcher.send(DispatchCmd::Shutdown);
-            drop(dispatcher);
+            router.shutdown();
+            drop(router);
             // Drop the Arc. If no proxy threads are active, Vm::drop runs stop().
             // If threads still hold clones the VM will stop when the last clone
             // drops. Either way the process exits immediately after cleanup.
@@ -436,10 +489,10 @@ pub fn run(args: DaemonArgs) -> ! {
         // blocked while waiting for the guest daemon to start (which can take
         // up to ~45 s during the ping-gate phase).
         let vm2 = Arc::clone(&vm);
-        let disp2 = Arc::clone(&dispatcher);
+        let router2 = Arc::clone(&router);
         let ps2 = Arc::clone(&port_state);
         std::thread::spawn(move || {
-            handle_connection(unix, vm2, disp2, ps2);
+            handle_connection(unix, vm2, router2, ps2);
         });
     }
 }
@@ -510,7 +563,7 @@ fn proxy(unix: UnixStream, vsock: OwnedFd, conn_id: std::thread::ThreadId) {
 fn handle_connection(
     mut unix: UnixStream,
     vm: Arc<Vm>,
-    dispatcher: Arc<PortDispatcher>,
+    router: Arc<PortRouter>,
     port_state: Arc<Mutex<PortState>>,
 ) {
     let conn_id = std::thread::current().id();
@@ -544,7 +597,7 @@ fn handle_connection(
 
     // If the first line is a DaemonCmd, handle it locally (no vsock needed).
     if let Ok(cmd) = serde_json::from_str::<DaemonCmd>(trimmed) {
-        handle_daemon_cmd(cmd, &mut unix, &dispatcher, &port_state, conn_id);
+        handle_daemon_cmd(cmd, &mut unix, &router, &port_state, conn_id);
         return;
     }
 
@@ -582,7 +635,7 @@ fn handle_connection(
 fn handle_daemon_cmd(
     cmd: DaemonCmd,
     unix: &mut UnixStream,
-    dispatcher: &PortDispatcher,
+    router: &PortRouter,
     port_state: &Mutex<PortState>,
     conn_id: std::thread::ThreadId,
 ) {
@@ -593,10 +646,7 @@ fn handle_daemon_cmd(
         } => {
             let mut ps = port_state.lock().unwrap();
             if let std::collections::hash_map::Entry::Vacant(e) = ps.active.entry(host_port) {
-                dispatcher.send(DispatchCmd::Add {
-                    host_port,
-                    container_port,
-                });
+                router.add(host_port, container_port);
                 e.insert(container_port);
                 log::info!(
                     "[{conn_id:?}] registered port {}:{}",
@@ -613,7 +663,7 @@ fn handle_daemon_cmd(
         DaemonCmd::UnregisterPort { host_port } => {
             let mut ps = port_state.lock().unwrap();
             if ps.active.remove(&host_port).is_some() {
-                dispatcher.send(DispatchCmd::Remove { host_port });
+                router.remove(host_port);
                 log::info!("[{conn_id:?}] unregistered port {}", host_port);
             }
             DaemonResponse::Ok
@@ -636,7 +686,7 @@ fn handle_daemon_cmd(
             if let Some(ports) = ps.compose_projects.remove(&project) {
                 for host_port in ports {
                     if ps.active.remove(&host_port).is_some() {
-                        dispatcher.send(DispatchCmd::Remove { host_port });
+                        router.remove(host_port);
                         log::info!(
                             "[{conn_id:?}] compose '{}': unregistered port {}",
                             project,
@@ -689,18 +739,18 @@ struct WatchContainer {
 /// forwards from `PortDispatcher` / `PortState` when a container exits.
 fn start_subscription_watcher(
     vm: Arc<Vm>,
-    dispatcher: Arc<PortDispatcher>,
+    router: Arc<PortRouter>,
     port_state: Arc<Mutex<PortState>>,
 ) {
     std::thread::Builder::new()
         .name("port-sub-watcher".into())
-        .spawn(move || subscription_watcher_loop(vm, dispatcher, port_state))
+        .spawn(move || subscription_watcher_loop(vm, router, port_state))
         .expect("spawn port-sub-watcher");
 }
 
 fn subscription_watcher_loop(
     vm: Arc<Vm>,
-    dispatcher: Arc<PortDispatcher>,
+    router: Arc<PortRouter>,
     port_state: Arc<Mutex<PortState>>,
 ) {
     use std::io::BufRead;
@@ -783,9 +833,7 @@ fn subscription_watcher_loop(
                         for spec in &ports {
                             if let Some(pf) = parse_port_spec(spec) {
                                 if ps.active.remove(&pf.host_port).is_some() {
-                                    dispatcher.send(DispatchCmd::Remove {
-                                        host_port: pf.host_port,
-                                    });
+                                    router.remove(pf.host_port);
                                     log::info!(
                                         "port-sub-watcher: {} exited — unregistered port {}",
                                         name,

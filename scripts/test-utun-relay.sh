@@ -73,5 +73,12 @@ echo "==> IPv6: ping6 google.com from container..."
     && echo "  IPv6: PASS" \
     || echo "  IPv6: FAIL"
 
+# ── 8. SSH (phase 3) ─────────────────────────────────────────────────────────
+echo ""
+echo "==> SSH: direct ssh to VM..."
+"$PELAGOS" --relay utun vm ssh -- echo "phase3 OK" \
+    && echo "  SSH: PASS" \
+    || echo "  SSH: FAIL"
+
 echo ""
 echo "==> done."
