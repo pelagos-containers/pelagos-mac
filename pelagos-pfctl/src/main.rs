@@ -93,6 +93,9 @@ struct DaemonState {
     egress_iface: Option<String>,
     /// Active port-forward rules, rebuilt into the RDR anchor on every change.
     rdr_rules: Vec<RdrRule>,
+    /// Number of utun relays currently set up. IP forwarding is only disabled
+    /// when this reaches zero, preventing a racing teardown from killing a live relay.
+    active_utun_count: u32,
 }
 
 #[derive(Clone)]
@@ -109,6 +112,7 @@ impl DaemonState {
             utun_iface: None,
             egress_iface: None,
             rdr_rules: Vec::new(),
+            active_utun_count: 0,
         }
     }
 }
@@ -391,22 +395,29 @@ fn handle_setup_utun(
     log::info!("utun relay setup: iface={iface} egress={egress_iface}");
     state.utun_iface = Some(iface.to_string());
     state.egress_iface = Some(egress_iface.to_string());
+    state.active_utun_count += 1;
     ok_resp()
 }
 
 fn handle_teardown_utun(iface: &str, state: &mut DaemonState) -> Response {
-    // Flush NAT and RDR anchors — ignore errors (anchor may not be active).
-    let _ = run_pfctl(&["-a", ANCHOR_NAT, "-F", "all"]);
-    let _ = run_pfctl(&["-a", ANCHOR_RDR, "-F", "all"]);
-    // Disable IP forwarding that was enabled by setup_utun.
-    let _ = run_sysctl_set("net.inet.ip.forwarding", "0");
-    let _ = run_sysctl_set("net.inet6.ip6.forwarding", "0");
+    // Decrement active relay count; only flush global state when the last relay stops.
+    state.active_utun_count = state.active_utun_count.saturating_sub(1);
+    let last_relay = state.active_utun_count == 0;
+
+    if last_relay {
+        // Flush NAT and RDR anchors — ignore errors (anchor may not be active).
+        let _ = run_pfctl(&["-a", ANCHOR_NAT, "-F", "all"]);
+        let _ = run_pfctl(&["-a", ANCHOR_RDR, "-F", "all"]);
+        // Disable IP forwarding only when no utun relays remain.
+        let _ = run_sysctl_set("net.inet.ip.forwarding", "0");
+        let _ = run_sysctl_set("net.inet6.ip6.forwarding", "0");
+        state.utun_iface = None;
+        state.egress_iface = None;
+        state.rdr_rules.clear();
+    }
     // Try to bring down the interface (it's destroyed when the relay fd closes anyway).
     let _ = run_ifconfig(&[iface, "down"]);
-    state.utun_iface = None;
-    state.egress_iface = None;
-    state.rdr_rules.clear();
-    log::info!("utun relay teardown: iface={iface}");
+    log::info!("utun relay teardown: iface={iface} (remaining={})", state.active_utun_count);
     ok_resp()
 }
 
