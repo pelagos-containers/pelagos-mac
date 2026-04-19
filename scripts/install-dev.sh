@@ -60,12 +60,20 @@ echo ""
 echo -n "  LaunchDaemon PID: "
 launchctl list com.pelagos.pfctl 2>/dev/null | grep '"PID"' || echo "not running"
 
-# ── 5. Start VM ───────────────────────────────────────────────────────────────
+# ── 5. Point vm.conf at local out/ artifacts ─────────────────────────────────
+# Rewrites vm.conf to use out/vmlinuz (Ubuntu 6.11, no RCU stalls under AVF)
+# and out/initramfs-custom.gz (local guest binary + Ubuntu modules + SSH key).
+# --force stops any running VM and overwrites an existing vm.conf.
+echo ""
+echo "--- vm init (local out/) ---"
+pelagos vm init --force --vm-data "$REPO/out"
+
+# ── 6. Start VM ───────────────────────────────────────────────────────────────
 echo ""
 echo "--- VM ---"
 pelagos vm start && echo "  VM running" || echo "  VM already running or failed — check: pelagos vm status"
 
-# ── 6. pelagos-ui ─────────────────────────────────────────────────────────────
+# ── 7. pelagos-ui ─────────────────────────────────────────────────────────────
 UI_DIR="$HOME/Projects/pelagos-ui"
 if [ -d "$UI_DIR" ]; then
     echo ""
