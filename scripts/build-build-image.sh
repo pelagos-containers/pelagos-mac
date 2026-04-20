@@ -288,8 +288,8 @@ cat > "\$MNT/etc/systemd/network/10-eth.network" << 'NETCFG'
 Name=en* eth*
 
 [Network]
-Address=192.168.105.2/24
-Gateway=192.168.105.1
+Address=192.168.106.2/24
+Gateway=192.168.106.1
 DNS=8.8.8.8
 DNS=1.1.1.1
 # Keep any IP pre-configured by the initramfs so the relay can reach the
