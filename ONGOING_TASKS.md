@@ -1,6 +1,6 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-04-14 — build VM provisioning fixed + verified; contributor docs added; two PRs open*
+*Last updated: 2026-04-20 (fd0535b) — per-profile VM subnet merged (PR #246); build-build-image.sh updated; pfctl zombie-route fix merged*
 
 ---
 
@@ -40,6 +40,7 @@ in ~16s; full console replay works.
 | Ubuntu 6.8 HWE kernel for container VM | ✅ | PR #131 |
 | hvc0 console drain — no RCU stall on boot | ✅ | PR #131 |
 | Build VM: full pelagos test suite (297/303, 0 fail) | ✅ | PR #136 + pelagos PRs |
+| Per-profile VM subnet (simultaneous VMs, no routing conflict) | ✅ | PR #246 |
 
 ---
 
