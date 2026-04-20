@@ -173,6 +173,12 @@ pub struct DaemonArgs {
 pub fn ensure_running(args: &DaemonArgs) -> io::Result<()> {
     let state = StateDir::open_profile(&args.profile)?;
 
+    // Ensure the privileged pf/utun helper is installed and running.
+    // SMJobBless installs it on first use — macOS prompts for admin credentials
+    // once; every subsequent call hits the fast path (socket stat only).
+    crate::bless::ensure_pfctl_blessed()
+        .map_err(|e| io::Error::other(format!("pfctl helper: {e}")))?;
+
     if state.is_daemon_alive() {
         // Verify that the running daemon was started with the same mounts.
         // (virtiofs shares are part of the VM config and cannot change at runtime.)

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>io.pelagos.mac</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+
+    <!-- SMPrivilegedExecutables: maps helper label → designated requirement for the helper.
+         @HELPER_DR@ is substituted at build time by pelagos-mac/build.rs.
+         Dev default: certificate leaf[subject.CN] = "pelagos-mac Dev"
+         Prod: anchor apple generic and identifier "com.pelagos.pfctl" and ... -->
+    <key>SMPrivilegedExecutables</key>
+    <dict>
+        <key>com.pelagos.pfctl</key>
+        <string>@HELPER_DR@</string>
+    </dict>
+</dict>
+</plist>

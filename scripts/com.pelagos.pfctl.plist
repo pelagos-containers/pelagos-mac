@@ -7,7 +7,7 @@
     <string>com.pelagos.pfctl</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/lib/pelagos/pelagos-pfctl</string>
+        <string>/Library/PrivilegedHelperTools/com.pelagos.pfctl</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
