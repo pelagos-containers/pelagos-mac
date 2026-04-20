@@ -54,6 +54,9 @@ pub struct VmConfig {
     pub virtiofs_shares: Vec<(PathBuf, String, bool)>,
     /// Enable Rosetta for x86_64 Linux binaries (macOS 13+).
     pub rosetta: bool,
+    /// Guest IPv4 address assigned to the VM's virtio-net interface.
+    /// Defaults to `192.168.105.2`; override via `vm_ip` in `vm.conf`.
+    pub guest_ip: [u8; 4],
 }
 
 impl VmConfig {
@@ -74,6 +77,7 @@ pub struct VmConfigBuilder {
     vsock_port: Option<u32>,
     virtiofs_shares: Vec<(PathBuf, String, bool)>,
     rosetta: bool,
+    guest_ip: Option<[u8; 4]>,
 }
 
 impl VmConfigBuilder {
@@ -123,6 +127,10 @@ impl VmConfigBuilder {
         self.rosetta = enabled;
         self
     }
+    pub fn guest_ip(mut self, ip: [u8; 4]) -> Self {
+        self.guest_ip = Some(ip);
+        self
+    }
     pub fn build(self) -> Result<VmConfig, &'static str> {
         Ok(VmConfig {
             kernel: self.kernel.ok_or("kernel required")?,
@@ -137,6 +145,7 @@ impl VmConfigBuilder {
             vsock_port: self.vsock_port.unwrap_or(1024),
             virtiofs_shares: self.virtiofs_shares,
             rosetta: self.rosetta,
+            guest_ip: self.guest_ip.unwrap_or(DEFAULT_GUEST_IP4),
         })
     }
 }
@@ -171,9 +180,9 @@ unsafe impl Sync for SendQueue {}
 // Vm
 // ---------------------------------------------------------------------------
 
-/// Static IPv4 address of the VM inside the relay network.
-/// Both relay implementations configure the guest with this address.
-pub const VM_IP4: &str = "192.168.105.2";
+/// Default guest IPv4 (used when no per-profile subnet is configured).
+/// Profiles with an explicit `vm_ip` in `vm.conf` use a different address.
+pub const DEFAULT_GUEST_IP4: [u8; 4] = [192, 168, 105, 2];
 
 /// A running Linux VM. Holds all AVF resources.
 pub struct Vm {
@@ -183,6 +192,8 @@ pub struct Vm {
     config: VmConfig,
     /// Keeps the utun relay alive for the VM's lifetime (Drop tears it down).
     _relay: crate::tun_relay::TunRelayHandle,
+    /// Guest IPv4, stored separately so port-forward rules use the right address.
+    guest_ip: [u8; 4],
 }
 
 #[derive(Debug)]
@@ -298,9 +309,11 @@ impl Vm {
     /// Add a TCP host→VM port forward via pf RDR rule (pelagos-pfctl).
     ///
     /// Connections to `127.0.0.1:host_port` (and the egress interface) are
-    /// kernel-redirected to `VM_IP4:vm_port`.
+    /// kernel-redirected to the guest IP of this VM at `vm_port`.
     pub fn add_port_forward(&self, proto: &str, host_port: u16, vm_port: u16) -> Result<(), crate::Error> {
-        self._relay.add_rdr(proto, host_port, VM_IP4, vm_port)
+        let ip = self.guest_ip;
+        let ip_str = format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+        self._relay.add_rdr(proto, host_port, &ip_str, vm_port)
     }
 
     /// Remove a previously added port forward.
@@ -432,7 +445,8 @@ unsafe fn start_vm(config: VmConfig) -> Result<(Vm, std::os::unix::io::OwnedFd),
 
     // 5. Network relay via VZFileHandleNetworkDeviceAttachment.
     //    Returns a SOCK_DGRAM fd that AVF consumes directly as raw Ethernet frames.
-    let (vmnet_fd, relay) = crate::tun_relay::start()
+    let subnet = crate::tun_relay::VmSubnet::from_guest_ip(config.guest_ip);
+    let (vmnet_fd, relay) = crate::tun_relay::start(subnet)
         .map_err(|e| crate::Error::Runtime(format!("tun_relay: {e}")))?;
     let vmnet_fh = NSFileHandle::initWithFileDescriptor(NSFileHandle::alloc(), vmnet_fd);
     let net_attach = VZFileHandleNetworkDeviceAttachment::initWithFileHandle(
@@ -599,6 +613,7 @@ unsafe fn start_vm(config: VmConfig) -> Result<(Vm, std::os::unix::io::OwnedFd),
 
     let queue_arc = Arc::new(SendQueue(queue));
 
+    let guest_ip = config.guest_ip;
     Ok((
         Vm {
             vm: vm_arc,
@@ -606,6 +621,7 @@ unsafe fn start_vm(config: VmConfig) -> Result<(Vm, std::os::unix::io::OwnedFd),
             queue: queue_arc,
             config,
             _relay: relay,
+            guest_ip,
         },
         relay_console_fd,
     ))

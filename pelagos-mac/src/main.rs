@@ -838,8 +838,12 @@ fn main() {
                 .arg("-o")
                 .arg("LogLevel=ERROR");
 
-            // utun relay: the VM is directly routable at VM_IP4 via the utun interface.
-            cmd.arg(format!("root@{}", pelagos_vz::vm::VM_IP4));
+            // utun relay: the VM is directly routable at its per-profile guest IP.
+            let guest_ip = state::VmProfileConfig::load(&profile)
+                .ok()
+                .and_then(|c| c.vm_ip)
+                .unwrap_or(state::DEFAULT_GUEST_IP);
+            cmd.arg(format!("root@{}", guest_ip));
 
             for arg in &extra {
                 cmd.arg(arg);

@@ -3,6 +3,7 @@
 //! ~/.local/share/pelagos/profiles/<name>/ (named profiles).
 
 use std::io;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 pub struct StateDir {
@@ -57,6 +58,11 @@ pub struct VmProfileConfig {
     /// Override the kernel cmdline. When set, replaces the `--cmdline` default
     /// (`console=hvc0`). The `clock.utc=` token is still appended by the daemon.
     pub cmdline: Option<String>,
+    /// Per-profile guest IPv4 for the VM's virtio-net interface.
+    /// When set, the host-side utun gets `.1` of the same /24, eliminating
+    /// subnet conflicts when multiple profiles run simultaneously.
+    /// Absent → `192.168.105.2` (backward-compatible default).
+    pub vm_ip: Option<Ipv4Addr>,
 }
 
 impl VmProfileConfig {
@@ -97,6 +103,7 @@ impl VmProfileConfig {
                     }
                 }
                 "cmdline" => cfg.cmdline = Some(val.to_string()),
+                "vm_ip" => cfg.vm_ip = val.parse::<Ipv4Addr>().ok(),
                 _ => {}
             }
         }
@@ -243,6 +250,92 @@ pub fn profile_dir(name: &str) -> io::Result<PathBuf> {
     } else {
         Ok(base.join("profiles").join(name))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-profile subnet allocation
+// ---------------------------------------------------------------------------
+
+/// Default guest IP for the "default" profile (backward-compatible).
+pub const DEFAULT_GUEST_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 105, 2);
+
+/// Assign (and persist) a per-profile guest IP if one is not already set.
+///
+/// The "default" profile always receives `192.168.105.2`.  Other profiles
+/// receive the lowest available `192.168.N.2` (N ∈ 106–254) not in use by
+/// any existing profile's `vm.conf`.  The chosen IP is written to the
+/// profile's `vm.conf` so subsequent daemon starts are stable.
+///
+/// Returns the guest IP that should be used for this boot.
+pub fn ensure_vm_ip(profile: &str) -> io::Result<Ipv4Addr> {
+    // Fast path: already configured.
+    let conf = VmProfileConfig::load(profile)?;
+    if let Some(ip) = conf.vm_ip {
+        return Ok(ip);
+    }
+
+    // The default profile is always 192.168.105.2 — no allocation needed.
+    if profile == "default" {
+        append_vm_ip_to_conf(profile, DEFAULT_GUEST_IP)?;
+        return Ok(DEFAULT_GUEST_IP);
+    }
+
+    // Collect IPs already in use by all profiles (including default).
+    let base = pelagos_base()?;
+    let mut taken: std::collections::HashSet<u8> = std::collections::HashSet::new();
+
+    // Default profile.
+    if let Ok(c) = VmProfileConfig::load("default") {
+        if let Some(ip) = c.vm_ip {
+            taken.insert(ip.octets()[2]);
+        } else {
+            taken.insert(105);
+        }
+    } else {
+        taken.insert(105);
+    }
+
+    // Named profiles.
+    let profiles_dir = base.join("profiles");
+    if let Ok(entries) = std::fs::read_dir(&profiles_dir) {
+        for entry in entries.flatten() {
+            let entry_name = entry.file_name();
+            let pname = entry_name.to_string_lossy();
+            if pname == profile {
+                continue; // skip ourselves
+            }
+            if let Ok(c) = VmProfileConfig::load(&pname) {
+                if let Some(ip) = c.vm_ip {
+                    taken.insert(ip.octets()[2]);
+                }
+            }
+        }
+    }
+
+    // Pick the lowest unused N in 106–254.
+    let n = (106u8..=254)
+        .find(|n| !taken.contains(n))
+        .ok_or_else(|| io::Error::other("no available VM subnet (all 192.168.106–254 in use)"))?;
+
+    let ip = Ipv4Addr::new(192, 168, n, 2);
+    append_vm_ip_to_conf(profile, ip)?;
+    log::info!("subnet: assigned {} to profile '{}'", ip, profile);
+    Ok(ip)
+}
+
+/// Append `vm_ip = <ip>` to the profile's `vm.conf`, creating the file and
+/// directory if necessary.
+fn append_vm_ip_to_conf(profile: &str, ip: Ipv4Addr) -> io::Result<()> {
+    let dir = profile_dir(profile)?;
+    std::fs::create_dir_all(&dir)?;
+    let conf_path = dir.join("vm.conf");
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&conf_path)?;
+    use std::io::Write;
+    writeln!(f, "vm_ip = {}", ip)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

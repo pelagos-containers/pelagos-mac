@@ -179,6 +179,12 @@ pub fn ensure_running(args: &DaemonArgs) -> io::Result<()> {
     crate::bless::ensure_pfctl_blessed()
         .map_err(|e| io::Error::other(format!("pfctl helper: {e}")))?;
 
+    // Ensure this profile has a stable per-VM subnet IP assigned and persisted
+    // in vm.conf before the daemon subprocess is spawned.  The daemon subprocess
+    // re-reads vm.conf and uses the IP to configure the tun relay.
+    crate::state::ensure_vm_ip(&args.profile)
+        .map_err(|e| io::Error::other(format!("subnet allocation: {e}")))?;
+
     if state.is_daemon_alive() {
         // Verify that the running daemon was started with the same mounts.
         // (virtiofs shares are part of the VM config and cannot change at runtime.)
@@ -818,12 +824,19 @@ pub(crate) fn daemon_subprocess_args(args: &DaemonArgs) -> Vec<std::ffi::OsStrin
 }
 
 fn build_vm_config(args: &DaemonArgs) -> VmConfig {
+    let profile_conf = crate::state::VmProfileConfig::load(&args.profile)
+        .unwrap_or_default();
+    let guest_ip = profile_conf
+        .vm_ip
+        .unwrap_or(crate::state::DEFAULT_GUEST_IP)
+        .octets();
     let mut b = VmConfig::builder()
         .kernel(&args.kernel)
         .disk(&args.disk)
         .cmdline(build_cmdline(args))
         .memory_mib(args.memory_mib)
-        .cpus(args.cpus);
+        .cpus(args.cpus)
+        .guest_ip(guest_ip);
     if let Some(ref initrd) = args.initrd {
         b = b.initrd(initrd);
     }

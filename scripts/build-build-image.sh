@@ -663,6 +663,7 @@ initrd    = $UBUNTU_INITRD
 memory    = $MEMORY_MIB
 cpus      = $CPUS
 ping_mode = ssh
+vm_ip     = 192.168.106.2
 # net.ifnames=0: prevent udev from renaming eth0 → enp0sN.
 # Without this, udev brings eth0 down to rename it, dropping the IP configured
 # by the initramfs before switch_root, leaving smoltcp unable to ARP the VM.
