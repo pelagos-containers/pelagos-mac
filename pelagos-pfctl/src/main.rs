@@ -373,7 +373,10 @@ fn handle_teardown_utun(iface: &str, state: &mut DaemonState) -> Response {
     // Remove the P2P IPv4 address by bringing the interface down — on macOS
     // bringing a P2P utun down removes its inet address and associated routes.
     let _ = run_ifconfig(&[iface, "down"]);
-    log::info!("utun relay teardown: iface={iface} (remaining={})", state.active_utun_count);
+    log::info!(
+        "utun relay teardown: iface={iface} (remaining={})",
+        state.active_utun_count
+    );
     ok_resp()
 }
 

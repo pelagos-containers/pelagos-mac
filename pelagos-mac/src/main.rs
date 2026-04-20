@@ -289,7 +289,6 @@ enum Commands {
     /// Internal: run as the persistent VM daemon. Not for direct use.
     #[command(hide = true)]
     VmDaemonInternal,
-
 }
 
 #[derive(Subcommand, Debug)]
@@ -1520,10 +1519,8 @@ fn main() {
                 process::exit(1);
             }
         }
-
     }
 }
-
 
 fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
     // Load per-profile vm.conf as a fallback layer below CLI flags.
@@ -2204,9 +2201,16 @@ fn discover_vm_artifacts() -> Option<DiscoveredArtifacts> {
         disk_dirs.push(base);
     }
     disk_dirs.extend(kernel_dirs.iter().cloned());
-    let disk = disk_dirs.iter().map(|d| d.join("root.img")).find(|p| p.exists())?;
+    let disk = disk_dirs
+        .iter()
+        .map(|d| d.join("root.img"))
+        .find(|p| p.exists())?;
 
-    Some(DiscoveredArtifacts { kernel, initrd, disk })
+    Some(DiscoveredArtifacts {
+        kernel,
+        initrd,
+        disk,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3444,8 +3448,8 @@ fn read_winsize() -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        recv_frame, send_frame, Cli, Commands, GuestCommand, GuestMount, GuestResponse,
-        FRAME_EXIT, FRAME_RESIZE, FRAME_STDIN, FRAME_STDOUT,
+        recv_frame, send_frame, Cli, Commands, GuestCommand, GuestMount, GuestResponse, FRAME_EXIT,
+        FRAME_RESIZE, FRAME_STDIN, FRAME_STDOUT,
     };
     use clap::Parser as _;
     use std::io::Cursor;

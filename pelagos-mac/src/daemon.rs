@@ -824,8 +824,7 @@ pub(crate) fn daemon_subprocess_args(args: &DaemonArgs) -> Vec<std::ffi::OsStrin
 }
 
 fn build_vm_config(args: &DaemonArgs) -> VmConfig {
-    let profile_conf = crate::state::VmProfileConfig::load(&args.profile)
-        .unwrap_or_default();
+    let profile_conf = crate::state::VmProfileConfig::load(&args.profile).unwrap_or_default();
     let guest_ip = profile_conf
         .vm_ip
         .unwrap_or(crate::state::DEFAULT_GUEST_IP)

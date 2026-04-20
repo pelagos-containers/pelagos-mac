@@ -73,7 +73,11 @@ impl VmSubnet {
     pub fn from_guest_ip(guest: [u8; 4]) -> Self {
         let host = [guest[0], guest[1], guest[2], 1];
         let cidr = format!("{}.{}.{}.0/24", guest[0], guest[1], guest[2]);
-        VmSubnet { host_ip4: host, guest_ip4: guest, cidr }
+        VmSubnet {
+            host_ip4: host,
+            guest_ip4: guest,
+            cidr,
+        }
     }
 }
 
@@ -306,7 +310,10 @@ struct RelayState {
 
 fn run_relay(relay_fd: RawFd, utun_fd: RawFd, utun_iface: &str, gateway_ip4: [u8; 4]) {
     log::info!("tun_relay: relay loop started (relay_fd={relay_fd} utun_fd={utun_fd})");
-    let mut state = RelayState { vm_mac: None, gateway_ip4 };
+    let mut state = RelayState {
+        vm_mac: None,
+        gateway_ip4,
+    };
     let mut avf_buf = vec![0u8; 65536 + 14]; // MTU + Ethernet header
     let mut tun_buf = vec![0u8; 65536 + 4]; // MTU + 4-byte tun prefix
 

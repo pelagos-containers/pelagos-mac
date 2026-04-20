@@ -310,7 +310,12 @@ impl Vm {
     ///
     /// Connections to `127.0.0.1:host_port` (and the egress interface) are
     /// kernel-redirected to the guest IP of this VM at `vm_port`.
-    pub fn add_port_forward(&self, proto: &str, host_port: u16, vm_port: u16) -> Result<(), crate::Error> {
+    pub fn add_port_forward(
+        &self,
+        proto: &str,
+        host_port: u16,
+        vm_port: u16,
+    ) -> Result<(), crate::Error> {
         let ip = self.guest_ip;
         let ip_str = format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
         self._relay.add_rdr(proto, host_port, &ip_str, vm_port)
