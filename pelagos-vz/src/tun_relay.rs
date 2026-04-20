@@ -1,4 +1,4 @@
-//! Kernel-assisted NAT relay using a macOS `utun` interface.
+//! Kernel-assisted relay using a macOS `utun` interface.
 //!
 //! # Architecture
 //!
@@ -7,15 +7,15 @@
 //!        │
 //!  [tun_relay thread — poll loop on relay_fd + utun_fd]
 //!        │  strip/add 14-byte Ethernet header
-//!        │  ARP replies and NDP Neighbour Advertisements (synthesised locally)
-//!        │  IPv4: forward as-is — kernel handles NAT44 via pf
-//!        │  IPv6: forward as-is — kernel handles NAT66 via pf
+//!        │  ARP replies (IPv4) and NDP NA + RA synthesis (IPv6)
+//!        │  IPv4: forward → utun; pf NAT44 handles egress
+//!        │  IPv6: forward → utun; no NAT (VM has real GUA via SLAAC)
 //!        │
 //!   utunN (kernel L3 interface, e.g. utun5)
-//!        │  fd00::1/64 assigned by pelagos-pfctl (ip6.forwarding=1)
+//!        │  IPv4: 192.168.N.1 ↔ 192.168.N.2 (per-profile P2P)
+//!        │  IPv6: GUA alias added dynamically when VM completes SLAAC
 //!        │
 //!  macOS pf  ──  NAT44: 192.168.N.0/24 → egress IP   (N = profile subnet)
-//!           ├─  NAT66: fd00::/64 → egress IPv6 (GUA)
 //!           └─  RDR port-forward rules (managed by pelagos-pfctl)
 //!        │
 //!   egress interface (en0 / WiFi / …)
@@ -24,17 +24,29 @@
 //! # VM network constants
 //!
 //! ```text
-//! Gateway MAC:      02:00:00:00:00:01   (relay answers ARP/NDP with this)
-//! Gateway IPv4:     192.168.N.1         (host-side utun; N chosen per profile)
-//! VM IPv4:          192.168.N.2/24      (configured in guest)
-//! Gateway IPv6 ULA: fd00::1/64          (host-side utun address; pf NAT66 source)
-//! Gateway IPv6 LL:  fe80::1             (relay answers NDP for this)
-//! VM IPv6 ULA:      fd00::2/64          (configured in guest; NAT66 via pf)
+//! Gateway MAC:   02:00:00:00:00:01   (relay answers ARP/NDP with this)
+//! Gateway IPv4:  192.168.N.1         (host-side utun; N chosen per profile)
+//! VM IPv4:       192.168.N.2/24      (static in guest initramfs/networkd)
+//! Gateway IPv6:  fe80::1             (relay answers NDP NS and issues RA)
+//! VM IPv6:       SLAAC from host /64 prefix (e.g. 2601:x:y:z::something)
 //! ```
 //!
-//! IPv4 addressing is per-profile so multiple VMs can run simultaneously
-//! without routing conflicts.  IPv6 is fixed (fd00::/64) because each VM gets
-//! its own utun interface and the NAT rules are scoped to that interface.
+//! # IPv6 path
+//!
+//! The relay detects the host's GUA prefix on the egress interface at startup.
+//! When the VM sends a Router Solicitation (ICMPv6 type 133), the relay
+//! synthesises a Router Advertisement containing the real /64 prefix.  The VM
+//! does SLAAC and assigns itself a GUA.  The relay detects the DAD Neighbour
+//! Solicitation (source = ::) and asks pelagos-pfctl to add that GUA as an
+//! alias on the utun interface.  Inbound traffic addressed to the GUA is then
+//! delivered to utun by the kernel, and the relay forwards it to the VM.
+//! No NAT or address translation occurs for IPv6.
+//!
+//! If the egress interface has no GUA (IPv6 unavailable), the relay skips RA
+//! synthesis and the VM has no IPv6 — acceptable degradation.
+//!
+//! Prefix mobility (re-issuing RA when the host prefix changes) is tracked in
+//! issue #248.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -47,9 +59,12 @@ use serde::Serialize;
 // ---------------------------------------------------------------------------
 
 const GATEWAY_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
-// GATEWAY_IP4 is now per-VM (stored in RelayState); IPv6 is fixed across all profiles.
-const GATEWAY_IP6_ULA: [u8; 16] = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+// GATEWAY_IP4 is per-VM (stored in RelayState).
+// GATEWAY_IP6_LL is the link-local gateway address advertised in the RA and answered by NDP.
 const GATEWAY_IP6_LL: [u8; 16] = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+// Ethernet multicast destination for IPv6 all-nodes (ff02::1).
+const ALL_NODES_MAC: [u8; 6] = [0x33, 0x33, 0x00, 0x00, 0x00, 0x01];
+const ALL_NODES_IP6: [u8; 16] = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 
 // ---------------------------------------------------------------------------
 // Per-VM subnet
@@ -92,7 +107,7 @@ const PFCTL_SOCK: &str = "/var/run/pelagos-pfctl.sock";
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Start the utun NAT relay.
+/// Start the utun relay.
 ///
 /// Returns `(avf_fd, relay)`:
 /// - `avf_fd` is one end of a `socketpair(AF_UNIX, SOCK_DGRAM)` ready to be
@@ -111,12 +126,20 @@ pub fn start(subnet: VmSubnet) -> Result<(RawFd, TunRelayHandle), crate::Error> 
     let (utun_owned, utun_iface) = pfctl_create_utun()?;
     let utun_fd = utun_owned.as_raw_fd();
 
-    // Detect egress interface for NAT rules.
+    // Detect egress interface for NAT44 rules and GUA prefix discovery.
     let egress = detect_egress_iface()
         .ok_or_else(|| crate::Error::Runtime("could not detect default route interface".into()))?;
 
     // Ask pelagos-pfctl to assign IPs to the utun interface and load pf NAT44 rules.
     pfctl_setup_utun(&utun_iface, &egress, &subnet)?;
+
+    // Detect host GUA prefix for SLAAC RA synthesis.
+    let gua_prefix = detect_host_gua_prefix(&egress);
+    if gua_prefix.is_some() {
+        log::info!("tun_relay: GUA prefix detected on {egress} — SLAAC RA synthesis enabled");
+    } else {
+        log::warn!("tun_relay: no GUA prefix on {egress} — VM will have no IPv6");
+    }
 
     log::info!("tun_relay: started utun={utun_iface} egress={egress}");
 
@@ -128,7 +151,7 @@ pub fn start(subnet: VmSubnet) -> Result<(RawFd, TunRelayHandle), crate::Error> 
     let gateway_ip4 = subnet.host_ip4;
     let thread = std::thread::Builder::new()
         .name("tun-relay".into())
-        .spawn(move || run_relay(relay_fd, utun_fd, &iface_clone, gateway_ip4))
+        .spawn(move || run_relay(relay_fd, utun_fd, iface_clone, gateway_ip4, gua_prefix))
         .expect("spawn tun-relay");
 
     Ok((
@@ -306,13 +329,29 @@ struct RelayState {
     vm_mac: Option<[u8; 6]>,
     /// Host-side gateway IPv4 for this VM (per-profile; used in ARP replies).
     gateway_ip4: [u8; 4],
+    /// Host GUA /64 prefix (first 8 bytes of a GUA, last 8 zeroed).
+    /// None if the host has no IPv6 GUA; RA synthesis is skipped in that case.
+    gua_prefix: Option<[u8; 16]>,
+    /// utun interface name — needed to request GUA alias assignment from pfctl.
+    utun_iface: String,
+    /// GUA address the VM has claimed via SLAAC (after DAD NS observed).
+    vm_gua: Option<[u8; 16]>,
 }
 
-fn run_relay(relay_fd: RawFd, utun_fd: RawFd, utun_iface: &str, gateway_ip4: [u8; 4]) {
+fn run_relay(
+    relay_fd: RawFd,
+    utun_fd: RawFd,
+    utun_iface: String,
+    gateway_ip4: [u8; 4],
+    gua_prefix: Option<[u8; 16]>,
+) {
     log::info!("tun_relay: relay loop started (relay_fd={relay_fd} utun_fd={utun_fd})");
     let mut state = RelayState {
         vm_mac: None,
         gateway_ip4,
+        gua_prefix,
+        utun_iface,
+        vm_gua: None,
     };
     let mut avf_buf = vec![0u8; 65536 + 14]; // MTU + Ethernet header
     let mut tun_buf = vec![0u8; 65536 + 4]; // MTU + 4-byte tun prefix
@@ -378,7 +417,7 @@ fn run_relay(relay_fd: RawFd, utun_fd: RawFd, utun_iface: &str, gateway_ip4: [u8
         }
     }
 
-    log::info!("tun_relay: relay loop exited (iface={utun_iface})");
+    log::info!("tun_relay: relay loop exited (iface={})", state.utun_iface);
 }
 
 // ---------------------------------------------------------------------------
@@ -415,18 +454,33 @@ fn process_avf_frame(frame: &[u8], relay_fd: RawFd, utun_fd: RawFd, state: &mut 
             forward_to_utun(utun_fd, &frame[14..], &TUN_HDR_IPV4);
         }
         0x86DD => {
-            // IPv6 — check for NDP Neighbour Solicitation before forwarding.
-            if is_ndp_ns(frame) && handle_ndp_ns(frame, relay_fd, state) {
-                return; // handled locally
+            // IPv6 — handle ICMPv6 control traffic before forwarding.
+            if is_icmpv6_rs(frame) {
+                handle_rs(frame, relay_fd, state);
+                return; // RS is not forwarded to the host stack
             }
+            if is_ndp_ns(frame) && handle_ndp_ns(frame, relay_fd, state) {
+                return; // consumed — gateway NA sent back
+            }
+            // Track SLAAC completion: once the VM sends any IPv6 packet with a
+            // GUA source (after DAD completes), alias that address to the utun so
+            // inbound traffic is routed to the VM.  We deliberately do NOT assign
+            // during DAD NS (source = ::) because assigning to the utun while DAD
+            // is in progress causes the host to answer the probe, making the VM
+            // mark the address as dadfailed.
+            maybe_assign_gua_alias(frame, state);
             // Strip Ethernet header, prepend tun prefix, write to utun.
-            // pf NAT66 (fd00::/64 → egress GUA) is handled by the kernel.
             forward_to_utun(utun_fd, &frame[14..], &TUN_HDR_IPV6);
         }
         _ => {
             log::trace!("tun_relay: unknown ethertype 0x{:04x} — drop", ethertype);
         }
     }
+}
+
+/// Returns true if `frame` carries an ICMPv6 Router Solicitation (type 133).
+fn is_icmpv6_rs(frame: &[u8]) -> bool {
+    frame.len() > 54 && frame[20] == 58 && frame[54] == 133
 }
 
 /// Returns true if `frame` carries an ICMPv6 Neighbour Solicitation (type 135).
@@ -469,8 +523,9 @@ fn handle_ndp_ns(frame: &[u8], relay_fd: RawFd, state: &RelayState) -> bool {
         Err(_) => return false,
     };
 
-    // Only respond for our gateway IPv6 addresses.
-    if target != GATEWAY_IP6_ULA && target != GATEWAY_IP6_LL {
+    // Only respond for our link-local gateway address (fe80::1).
+    // The VM's default route (from the RA) is via fe80::1, so it will NS for it.
+    if target != GATEWAY_IP6_LL {
         return false;
     }
 
@@ -488,6 +543,112 @@ fn handle_ndp_ns(frame: &[u8], relay_fd: RawFd, state: &RelayState) -> bool {
     let na = build_ndp_na(&vm_mac, &target, &ns_src_ip);
     send_to_avf(relay_fd, &na);
     true
+}
+
+/// Respond to a Router Solicitation by injecting a synthesised RA into the VM.
+fn handle_rs(_frame: &[u8], relay_fd: RawFd, state: &RelayState) {
+    let gua_prefix = match state.gua_prefix {
+        Some(p) => p,
+        None => return, // No GUA — can't synthesize RA
+    };
+    let ra = build_ra(&gua_prefix);
+    send_to_avf(relay_fd, &ra);
+    log::info!(
+        "tun_relay: sent RA (prefix={:02x}{:02x}{:02x}{:02x}:...)",
+        gua_prefix[0],
+        gua_prefix[1],
+        gua_prefix[2],
+        gua_prefix[3]
+    );
+}
+
+/// Check whether the IPv6 frame is sourced from a GUA in our prefix and, if so,
+/// alias that address to the utun (first time only).
+///
+/// We trigger on the first real IPv6 packet from the VM with a GUA source rather
+/// than on the DAD NS (source = ::).  Assigning during DAD causes the host to
+/// answer the probe and the VM marks the address dadfailed; waiting for a real
+/// packet means DAD has already succeeded before we take ownership.
+fn maybe_assign_gua_alias(frame: &[u8], state: &mut RelayState) {
+    if state.vm_gua.is_some() {
+        return; // already assigned
+    }
+    let gua_prefix = match state.gua_prefix {
+        Some(p) => p,
+        None => return,
+    };
+    if frame.len() < 38 {
+        return;
+    }
+    // IPv6 source address is at frame[22..38].
+    let src: [u8; 16] = match frame[22..38].try_into() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    // Skip :: (DAD) and link-local (fe80::) — only act on GUA.
+    if src == [0u8; 16] || src[..8] != gua_prefix[..8] {
+        return;
+    }
+    let addr = std::net::Ipv6Addr::from(src).to_string();
+    if let Err(e) = pfctl_assign_utun_alias(&state.utun_iface, &addr) {
+        log::warn!("tun_relay: assign_utun_alias {addr}: {e}");
+    } else {
+        log::info!("tun_relay: VM GUA {addr} — aliased on {}", state.utun_iface);
+        state.vm_gua = Some(src);
+    }
+}
+
+/// Build an ICMPv6 Router Advertisement frame sent to the all-nodes multicast.
+///
+/// The RA carries a Prefix Information option for the host's GUA /64 with
+/// A=1 (SLAAC) and L=1 (on-link).  The advertised router is `fe80::1`
+/// (our link-local gateway address, answered by NDP).
+fn build_ra(gua_prefix: &[u8; 16]) -> Vec<u8> {
+    // ICMPv6 RA body (56 bytes):
+    //   [0]     type=134, [1] code=0, [2..4] checksum
+    //   [4]     cur_hop_limit=64, [5] M=0/O=0 flags
+    //   [6..8]  router_lifetime=1800s
+    //   [8..16] reachable_time=0, retrans_timer=0
+    //   [16..48] Prefix Information option (32 bytes)
+    //   [48..56] SLLA option (8 bytes)
+    let mut icmp = [0u8; 56];
+    icmp[0] = 134; // RA
+    icmp[4] = 64; // cur_hop_limit
+    let router_lifetime: u16 = 1800;
+    icmp[6..8].copy_from_slice(&router_lifetime.to_be_bytes());
+    // Prefix Information option
+    icmp[16] = 3; // type
+    icmp[17] = 4; // len (4 × 8 = 32 bytes)
+    icmp[18] = 64; // prefix length
+    icmp[19] = 0xC0; // L=1, A=1
+    icmp[20..24].copy_from_slice(&86400u32.to_be_bytes()); // valid lifetime
+    icmp[24..28].copy_from_slice(&14400u32.to_be_bytes()); // preferred lifetime
+    icmp[32..48].copy_from_slice(gua_prefix); // prefix (last 8 bytes already 0)
+                                              // SLLA option (Source Link-Layer Address)
+    icmp[48] = 1; // type
+    icmp[49] = 1; // len (1 × 8 = 8 bytes)
+    icmp[50..56].copy_from_slice(&GATEWAY_MAC);
+    // Checksum over IPv6 pseudo-header (src=fe80::1, dst=ff02::1)
+    let cksum = icmpv6_checksum(&GATEWAY_IP6_LL, &ALL_NODES_IP6, &icmp);
+    icmp[2] = (cksum >> 8) as u8;
+    icmp[3] = (cksum & 0xff) as u8;
+    // Build full Ethernet frame: 14 + 40 + 56 = 110 bytes
+    let mut f = Vec::with_capacity(110);
+    f.extend_from_slice(&ALL_NODES_MAC); // Ethernet dst (all-nodes multicast)
+    f.extend_from_slice(&GATEWAY_MAC); // Ethernet src
+    f.push(0x86);
+    f.push(0xDD); // ethertype IPv6
+    f.push(0x60);
+    f.push(0x00);
+    f.push(0x00);
+    f.push(0x00); // IPv6 version=6, TC=0, flow=0
+    f.extend_from_slice(&56u16.to_be_bytes()); // payload length
+    f.push(58); // next header: ICMPv6
+    f.push(255); // hop limit (required 255 for NDP/RA)
+    f.extend_from_slice(&GATEWAY_IP6_LL); // src: fe80::1
+    f.extend_from_slice(&ALL_NODES_IP6); // dst: ff02::1
+    f.extend_from_slice(&icmp);
+    f
 }
 
 fn forward_to_utun(utun_fd: RawFd, ip_packet: &[u8], tun_hdr: &[u8; 4]) {
@@ -739,6 +900,24 @@ fn pfctl_teardown_utun(iface: &str) -> Result<(), crate::Error> {
     pfctl_send(&json)
 }
 
+/// Ask pelagos-pfctl to add a GUA alias to the utun interface so inbound IPv6
+/// traffic addressed to the VM's SLAAC address is delivered locally.
+fn pfctl_assign_utun_alias(iface: &str, addr: &str) -> Result<(), crate::Error> {
+    #[derive(Serialize)]
+    struct Req<'a> {
+        action: &'static str,
+        iface: &'a str,
+        addr: &'a str,
+    }
+    let json = serde_json::to_string(&Req {
+        action: "assign_utun_alias",
+        iface,
+        addr,
+    })
+    .map_err(|e| crate::Error::Runtime(e.to_string()))?;
+    pfctl_send(&json)
+}
+
 // ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
@@ -755,6 +934,35 @@ fn detect_egress_iface() -> Option<String> {
                 .strip_prefix("interface:")
                 .map(|s| s.trim().to_string())
         })
+}
+
+/// Scan the given interface for a Global Unicast Address (GUA) and return the
+/// /64 prefix (first 8 bytes set, last 8 zeroed).
+///
+/// GUA first byte: 0x20–0x3f (RFC 4291 §2.4).  We skip link-local (fe80::),
+/// loopback (::1), and ULA (fc00::/7, i.e. first byte 0xfc–0xfd).
+fn detect_host_gua_prefix(egress: &str) -> Option<[u8; 16]> {
+    let out = std::process::Command::new("/sbin/ifconfig")
+        .arg(egress)
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("inet6 ") {
+            // Strip scope suffix (e.g. "%en0") and any trailing qualifiers.
+            let addr_str = rest.split('%').next()?.split_whitespace().next()?;
+            if let Ok(addr) = addr_str.parse::<std::net::Ipv6Addr>() {
+                let bytes = addr.octets();
+                if bytes[0] >= 0x20 && bytes[0] <= 0x3f {
+                    let mut prefix = bytes;
+                    prefix[8..].fill(0);
+                    return Some(prefix);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn create_socketpair() -> Result<(RawFd, RawFd), crate::Error> {
