@@ -83,7 +83,7 @@ SKALIBS_PKG="skalibs-libs-2.14.3.0-r0"
 SKALIBS_APK="$WORK/${SKALIBS_PKG}.apk"
 SKALIBS_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${SKALIBS_PKG}.apk"
 
-ZLIB_PKG="zlib-1.3.1-r2"
+ZLIB_PKG="zlib-1.3.2-r0"
 ZLIB_APK="$WORK/${ZLIB_PKG}.apk"
 ZLIB_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${ZLIB_PKG}.apk"
 
@@ -113,7 +113,7 @@ NFT_BIN="$WORK/nft-bin"
 
 # Shared library dependencies for ip and nft.
 # All paths are usr/lib/ inside the APK (Alpine 3.21+ moved libs there).
-LIBCAP2_PKG="libcap2-2.71-r0"
+LIBCAP2_PKG="libcap2-2.78-r0"
 LIBCAP2_APK="$WORK/${LIBCAP2_PKG}.apk"
 LIBCAP2_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${LIBCAP2_PKG}.apk"
 
