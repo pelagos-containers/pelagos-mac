@@ -12,8 +12,14 @@ Requires macOS 13.5+ (Ventura) on Apple Silicon.
 ```bash
 brew tap pelagos-containers/tap
 brew install pelagos-containers/tap/pelagos-mac
+sudo bash "$(brew --prefix)/share/pelagos-mac/install-pfctl-daemon.sh"
 pelagos vm init
 ```
+
+`install-pfctl-daemon.sh` installs the privileged helper daemon (`pelagos-pfctl`)
+that creates the utun interface and loads pf NAT rules. It needs to run once after
+install and once after each upgrade. It registers a LaunchDaemon that starts
+automatically on reboot — you only run this script manually.
 
 `pelagos vm init` copies the VM disk image to `~/.local/share/pelagos/` and writes
 `vm.conf` pointing at the installed kernel, initramfs, and disk. Run it once after
@@ -33,6 +39,7 @@ subsequent command reuses the running VM.
 
 ```bash
 brew upgrade pelagos-containers/tap/pelagos-mac
+sudo bash "$(brew --prefix)/share/pelagos-mac/install-pfctl-daemon.sh"
 pelagos vm init --force   # stops old VM, re-inits with new kernel + initramfs
 pelagos ping
 ```
@@ -54,6 +61,14 @@ The state directory (`~/.local/share/pelagos/`) is not managed by Homebrew and
 must be removed manually. It contains the writable disk image (OCI layer cache)
 and `vm.conf` — omit the `rm` if you want to preserve cached images for a
 reinstall.
+
+To also remove the privileged helper daemon:
+
+```bash
+sudo launchctl bootout system /Library/LaunchDaemons/com.pelagos.pfctl.plist
+sudo rm /Library/LaunchDaemons/com.pelagos.pfctl.plist
+sudo rm -rf /usr/local/lib/pelagos
+```
 
 ---
 
@@ -170,14 +185,16 @@ bash scripts/build-release.sh      # packs tarballs + writes local formula
 
 brew uninstall pelagos-mac 2>/dev/null || true
 HOMEBREW_DEVELOPER=1 HOMEBREW_NO_INSTALL_FROM_API=1 \
-  brew install pelagos-containers/tap/pelagos-mac
+  brew install skeptomai/tap/pelagos-mac
+sudo bash "$(brew --prefix)/share/pelagos-mac/install-pfctl-daemon.sh"
 pelagos vm init
 ```
 
 `build-release.sh` writes the formula to `dist/tap/Formula/pelagos-mac.rb`
 with `file://` URLs pointing at the local tarballs, and syncs it to the local
-tap. Do **not** use `brew reinstall` — if the install fails (e.g. checksum
-mismatch), the binary is gone with no recovery.
+tap (`skeptomai/tap` — your local Homebrew tap; the production tap is
+`pelagos-containers/tap`). Do **not** use `brew reinstall` — if the install
+fails (e.g. checksum mismatch), the binary is gone with no recovery.
 
 ---
 
@@ -191,9 +208,17 @@ mismatch), the binary is gone with no recovery.
 | `/opt/homebrew/share/pelagos-mac/vmlinuz` | Linux kernel (read-only, shared) |
 | `/opt/homebrew/share/pelagos-mac/initramfs.gz` | Initramfs (read-only, shared) |
 | `/opt/homebrew/share/pelagos-mac/root.img` | Blank disk placeholder |
+| `/opt/homebrew/share/pelagos-mac/pelagos-pfctl` | Privileged helper daemon binary |
+| `/opt/homebrew/share/pelagos-mac/install-pfctl-daemon.sh` | Post-install daemon setup script |
+| `/usr/local/lib/pelagos/pelagos-pfctl` | Installed daemon binary (root-owned) |
+| `/Library/LaunchDaemons/com.pelagos.pfctl.plist` | LaunchDaemon plist (installed by script) |
+| `/var/run/pelagos-pfctl.sock` | Daemon Unix socket (present when running) |
+| `/var/log/pelagos-pfctl.log` | Daemon log |
 | `~/.local/share/pelagos/root.img` | Writable disk (OCI image cache) |
 | `~/.local/share/pelagos/vm.conf` | VM configuration (written by `vm init`) |
 | `~/.local/share/pelagos/daemon.log` | VM daemon log |
 
 The `share/` artifacts are read-only and shared across users. `vm init` copies
 `root.img` to the writable state directory so each user has their own OCI cache.
+`/usr/local/lib/pelagos/` and `/Library/LaunchDaemons/` are managed by
+`install-pfctl-daemon.sh` (not by Homebrew directly).
