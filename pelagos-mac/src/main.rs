@@ -14,6 +14,7 @@ use std::process;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
+mod bless;
 mod daemon;
 mod state;
 
@@ -1970,14 +1971,11 @@ fn vm_init(profile: &str, vm_data: Option<&std::path::Path>, force: bool) -> std
     if !force {
         if let Ok(st) = state::StateDir::open_profile(profile) {
             if let Some(pid) = st.running_pid() {
-                return Err(Error::new(
-                    ErrorKind::Other,
-                    format!(
-                        "VM is running (pid {pid}). \
-                         Stop it first with 'pelagos vm stop', then re-run \
-                         'pelagos vm init', or pass --force to stop it automatically."
-                    ),
-                ));
+                return Err(Error::other(format!(
+                    "VM is running (pid {pid}). \
+                     Stop it first with 'pelagos vm stop', then re-run \
+                     'pelagos vm init', or pass --force to stop it automatically."
+                )));
             }
         }
     }

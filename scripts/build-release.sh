@@ -84,9 +84,11 @@ trap 'rm -rf "$BIN_STAGING" "$VM_STAGING"' EXIT
 cp "$REPO/target/aarch64-apple-darwin/release/pelagos"        "$BIN_STAGING/pelagos"
 cp "$REPO/target/aarch64-apple-darwin/release/pelagos-docker" "$BIN_STAGING/pelagos-docker"
 cp "$REPO/target/aarch64-apple-darwin/release/pelagos-tui"    "$BIN_STAGING/pelagos-tui"
-cp "$REPO/target/aarch64-apple-darwin/release/pelagos-pfctl"  "$BIN_STAGING/pelagos-pfctl"
-# Entitlements, LaunchDaemon plist, and privileged daemon install script
-# are shipped in share/pelagos-mac for the post-install steps.
+# The helper is named by its bundle identifier.  SMJobBless looks for it
+# in the same directory as the calling binary using this exact name.
+cp "$REPO/target/aarch64-apple-darwin/release/pelagos-pfctl"  "$BIN_STAGING/com.pelagos.pfctl"
+# Entitlements, LaunchDaemon plist, and fallback install script shipped in
+# share/pelagos-mac.  The install script is a last-resort fallback only.
 mkdir -p "$BIN_STAGING/share"
 cp "$REPO/pelagos-mac/entitlements.plist"                      "$BIN_STAGING/share/entitlements.plist"
 cp "$REPO/scripts/com.pelagos.pfctl.plist"                     "$BIN_STAGING/share/com.pelagos.pfctl.plist"
@@ -146,32 +148,35 @@ class PelagosMac < Formula
     bin.install "pelagos"
     bin.install "pelagos-docker"
     bin.install "pelagos-tui"
-    # pelagos-pfctl is a privileged root daemon; ship it in pkgshare so the
-    # post-install script can copy it to /usr/local/lib/pelagos/.
-    (pkgshare).install "pelagos-pfctl"
-    (pkgshare).install "share/entitlements.plist"
-    (pkgshare).install "share/com.pelagos.pfctl.plist"
-    (pkgshare).install "share/install-pfctl-daemon.sh"
+    # SMJobBless convention for non-bundle CLIs: the helper binary must be in
+    # the same directory as the calling binary, named by its bundle identifier.
+    # Install as bin/com.pelagos.pfctl (symlink to pkgshare copy).
+    pkgshare.install "com.pelagos.pfctl"
+    bin.install_symlink pkgshare/"com.pelagos.pfctl"
+    pkgshare.install "share/entitlements.plist"
+    pkgshare.install "share/com.pelagos.pfctl.plist"
+    pkgshare.install "share/install-pfctl-daemon.sh"
     resource("vm").stage { pkgshare.install Dir["*"] }
   end
 
   def post_install
     # macOS 26 taskgated validates the AVF entitlement signature at the binary's
-    # actual run path.  Re-sign after install so the signature covers the Cellar path.
+    # actual run path.  Re-sign both binaries after install.
     entitlements = pkgshare/"entitlements.plist"
     system "codesign", "--sign", "-", "--entitlements", entitlements.to_s,
            "--force", (bin/"pelagos").to_s
+    # Re-sign the helper at its pkgshare path and the bin symlink target.
+    system "codesign", "--sign", "-", "--force", (pkgshare/"com.pelagos.pfctl").to_s
   end
 
   def caveats
     <<~EOS
-      pelagos requires a privileged helper daemon (pelagos-pfctl) to create
-      the utun interface and load pf NAT rules.  Run once after install:
+      On first 'pelagos vm start', pelagos will automatically install the
+      privileged helper daemon (pelagos-pfctl) via SMJobBless.  macOS will
+      prompt for admin credentials once.
 
+      If SMJobBless fails (e.g. signing requirements don't match), run manually:
         sudo bash #{pkgshare}/install-pfctl-daemon.sh
-
-      This installs /usr/local/lib/pelagos/pelagos-pfctl and registers
-      the com.pelagos.pfctl LaunchDaemon (starts automatically on reboot).
     EOS
   end
 
