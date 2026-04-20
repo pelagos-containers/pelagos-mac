@@ -12,6 +12,8 @@
 //!   {"action":"setup_utun","iface":"utun5",
 //!    "ipv4_addr":"192.168.105.1","ipv4_peer":"192.168.105.2",
 //!    "ipv4_cidr":"192.168.105.0/24","egress_iface":"en0"}
+//!   Assigns fd00::1/64 to the utun for NAT66, enables ip4/ip6 forwarding,
+//!   and loads both NAT44 and NAT66 pf anchors.
 //!   {"action":"teardown_utun","iface":"utun5"}
 //!   {"action":"add_rdr","proto":"tcp","host_port":2222,
 //!    "vm_ip":"192.168.105.2","vm_port":22}
@@ -285,14 +287,32 @@ fn handle_setup_utun(
         return err_resp(format!("ifconfig inet: {e}"));
     }
 
-    // 2. Enable kernel IP forwarding for IPv4 NAT44.
+    // 2. Assign IPv6 ULA address for the VM gateway.
+    // macOS returns exit 0 but does nothing if fd00::1 is already assigned to another
+    // interface (e.g. a stale utun from a crashed/unclean previous session).
+    // Sweep the utun range and remove any stale fd00::1 assignment first.
+    for i in 0u32..=20 {
+        let candidate = format!("utun{i}");
+        if candidate != iface {
+            let _ = run_ifconfig(&[&candidate, "inet6", "fd00::1", "-alias"]);
+        }
+    }
+    if let Err(e) = run_ifconfig(&[iface, "inet6", "fd00::1", "prefixlen", "64"]) {
+        return err_resp(format!("ifconfig inet6: {e}"));
+    }
+
+    // 3. Enable kernel IP forwarding for NAT44 and NAT66.
     if let Err(e) = run_sysctl_set("net.inet.ip.forwarding", "1") {
         return err_resp(format!("sysctl net.inet.ip.forwarding: {e}"));
     }
+    if let Err(e) = run_sysctl_set("net.inet6.ip6.forwarding", "1") {
+        return err_resp(format!("sysctl net.inet6.ip6.forwarding: {e}"));
+    }
 
-    // 3. Write and load NAT44 anchor.
+    // 4. Write and load NAT44 + NAT66 anchor.
     let nat_rules = format!(
-        "nat on {egress_iface} inet from {ipv4_cidr} to any -> ({egress_iface})\n"
+        "nat on {egress_iface} inet from {ipv4_cidr} to any -> ({egress_iface})\n\
+         nat on {egress_iface} inet6 from fd00::/64 to any -> ({egress_iface})\n"
     );
     if let Err(e) = std::fs::write(ANCHOR_FILE_NAT, &nat_rules) {
         return err_resp(format!("write {ANCHOR_FILE_NAT}: {e}"));
@@ -320,10 +340,14 @@ fn handle_teardown_utun(iface: &str, state: &mut DaemonState) -> Response {
         let _ = run_pfctl(&["-a", ANCHOR_RDR, "-F", "all"]);
         // Disable IP forwarding only when no utun relays remain.
         let _ = run_sysctl_set("net.inet.ip.forwarding", "0");
+        let _ = run_sysctl_set("net.inet6.ip6.forwarding", "0");
         state.utun_iface = None;
         state.egress_iface = None;
         state.rdr_rules.clear();
     }
+    // Explicitly remove the IPv6 gateway address so it doesn't linger if the
+    // relay fd is closed without a clean teardown (e.g. daemon crash/restart).
+    let _ = run_ifconfig(&[iface, "inet6", "fd00::1", "-alias"]);
     // Try to bring down the interface (it's destroyed when the relay fd closes anyway).
     let _ = run_ifconfig(&[iface, "down"]);
     log::info!("utun relay teardown: iface={iface} (remaining={})", state.active_utun_count);
