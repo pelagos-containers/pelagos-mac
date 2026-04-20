@@ -70,6 +70,9 @@ cargo build -p pelagos-docker --release 2>&1 | grep -E "Compiling|Finished|^erro
 echo "[release] building pelagos-tui..."
 cargo build -p pelagos-tui --release 2>&1 | grep -E "Compiling|Finished|^error"
 
+echo "[release] building pelagos-pfctl..."
+cargo build -p pelagos-pfctl --release 2>&1 | grep -E "Compiling|Finished|^error"
+
 # ---------------------------------------------------------------------------
 # Pack
 # ---------------------------------------------------------------------------
@@ -81,6 +84,13 @@ trap 'rm -rf "$BIN_STAGING" "$VM_STAGING"' EXIT
 cp "$REPO/target/aarch64-apple-darwin/release/pelagos"        "$BIN_STAGING/pelagos"
 cp "$REPO/target/aarch64-apple-darwin/release/pelagos-docker" "$BIN_STAGING/pelagos-docker"
 cp "$REPO/target/aarch64-apple-darwin/release/pelagos-tui"    "$BIN_STAGING/pelagos-tui"
+cp "$REPO/target/aarch64-apple-darwin/release/pelagos-pfctl"  "$BIN_STAGING/pelagos-pfctl"
+# Entitlements, LaunchDaemon plist, and privileged daemon install script
+# are shipped in share/pelagos-mac for the post-install steps.
+mkdir -p "$BIN_STAGING/share"
+cp "$REPO/pelagos-mac/entitlements.plist"                      "$BIN_STAGING/share/entitlements.plist"
+cp "$REPO/scripts/com.pelagos.pfctl.plist"                     "$BIN_STAGING/share/com.pelagos.pfctl.plist"
+cp "$REPO/scripts/install-pfctl-daemon.sh"                     "$BIN_STAGING/share/install-pfctl-daemon.sh"
 
 echo "[release] packing ${BIN_TARBALL}..."
 COPYFILE_DISABLE=1 tar -czf "$DIST/$BIN_TARBALL" -C "$BIN_STAGING" .
@@ -136,7 +146,33 @@ class PelagosMac < Formula
     bin.install "pelagos"
     bin.install "pelagos-docker"
     bin.install "pelagos-tui"
-    resource("vm").stage { (share/"pelagos-mac").install Dir["*"] }
+    # pelagos-pfctl is a privileged root daemon; ship it in pkgshare so the
+    # post-install script can copy it to /usr/local/lib/pelagos/.
+    (pkgshare).install "pelagos-pfctl"
+    (pkgshare).install "share/entitlements.plist"
+    (pkgshare).install "share/com.pelagos.pfctl.plist"
+    (pkgshare).install "share/install-pfctl-daemon.sh"
+    resource("vm").stage { pkgshare.install Dir["*"] }
+  end
+
+  def post_install
+    # macOS 26 taskgated validates the AVF entitlement signature at the binary's
+    # actual run path.  Re-sign after install so the signature covers the Cellar path.
+    entitlements = pkgshare/"entitlements.plist"
+    system "codesign", "--sign", "-", "--entitlements", entitlements.to_s,
+           "--force", (bin/"pelagos").to_s
+  end
+
+  def caveats
+    <<~EOS
+      pelagos requires a privileged helper daemon (pelagos-pfctl) to create
+      the utun interface and load pf NAT rules.  Run once after install:
+
+        sudo bash #{pkgshare}/install-pfctl-daemon.sh
+
+      This installs /usr/local/lib/pelagos/pelagos-pfctl and registers
+      the com.pelagos.pfctl LaunchDaemon (starts automatically on reboot).
+    EOS
   end
 
   test do
