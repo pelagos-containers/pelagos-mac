@@ -110,9 +110,7 @@ fn install_helper() -> io::Result<()> {
     std::fs::write(&script_tmp, INSTALL_SCRIPT)?;
     std::fs::set_permissions(&script_tmp, std::fs::Permissions::from_mode(0o755))?;
 
-    log::info!(
-        "bless: installing privileged helper — macOS will prompt for admin credentials"
-    );
+    log::info!("bless: installing privileged helper — macOS will prompt for admin credentials");
 
     // Build the shell command.  All three paths are in /tmp or a standard
     // Homebrew/release directory; none contain single quotes or spaces, so
@@ -121,13 +119,11 @@ fn install_helper() -> io::Result<()> {
         "'{script}' '{helper}' '{plist}'",
         script = script_tmp.display(),
         helper = helper_src.display(),
-        plist  = plist_tmp.display(),
+        plist = plist_tmp.display(),
     );
     // osascript runs the shell command synchronously as root and returns only
     // after the script exits — no async race with temp-file cleanup.
-    let applescript = format!(
-        "do shell script {shell_cmd:?} with administrator privileges"
-    );
+    let applescript = format!("do shell script {shell_cmd:?} with administrator privileges");
 
     let output = std::process::Command::new("osascript")
         .args(["-e", &applescript])
@@ -169,9 +165,9 @@ fn install_helper() -> io::Result<()> {
 /// 2. Homebrew: `<exe_dir>/../share/pelagos-mac/com.pelagos.pfctl`
 fn find_helper_binary() -> io::Result<PathBuf> {
     let exe = std::env::current_exe()?;
-    let exe_dir = exe.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "cannot determine exe directory")
-    })?;
+    let exe_dir = exe
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cannot determine exe directory"))?;
 
     let dev_path = exe_dir
         .join("Contents/Library/LaunchServices")

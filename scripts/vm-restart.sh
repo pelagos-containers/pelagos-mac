@@ -29,13 +29,11 @@ else
     STATE_DIR="$PELAGOS_BASE/profiles/$PROFILE"
 fi
 
-# Kill ALL running pelagos daemons, not just this profile's.
-# All profiles share the same socket_vmnet NAT IP (192.168.105.2); only one
-# VM can hold that address at a time. If a different profile's daemon is still
-# running when we start, it wins the IP and the new VM becomes unreachable.
+# Kill only this profile's running daemon before restart.
+# Each profile has its own vm_ip subnet so multiple profiles can run
+# simultaneously; only stop the one we're about to restart.
 for pid_file in \
-    "$PELAGOS_BASE/vm.pid" \
-    "$PELAGOS_BASE"/profiles/*/vm.pid; do
+    "$STATE_DIR/vm.pid"; do
     [[ -f "$pid_file" ]] || continue
     pid="$(cat "$pid_file")"
     if kill -0 "$pid" 2>/dev/null; then

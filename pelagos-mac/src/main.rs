@@ -289,7 +289,6 @@ enum Commands {
     /// Internal: run as the persistent VM daemon. Not for direct use.
     #[command(hide = true)]
     VmDaemonInternal,
-
 }
 
 #[derive(Subcommand, Debug)]
@@ -838,8 +837,12 @@ fn main() {
                 .arg("-o")
                 .arg("LogLevel=ERROR");
 
-            // utun relay: the VM is directly routable at VM_IP4 via the utun interface.
-            cmd.arg(format!("root@{}", pelagos_vz::vm::VM_IP4));
+            // utun relay: the VM is directly routable at its per-profile guest IP.
+            let guest_ip = state::VmProfileConfig::load(&profile)
+                .ok()
+                .and_then(|c| c.vm_ip)
+                .unwrap_or(state::DEFAULT_GUEST_IP);
+            cmd.arg(format!("root@{}", guest_ip));
 
             for arg in &extra {
                 cmd.arg(arg);
@@ -1516,10 +1519,8 @@ fn main() {
                 process::exit(1);
             }
         }
-
     }
 }
-
 
 fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
     // Load per-profile vm.conf as a fallback layer below CLI flags.
@@ -2200,9 +2201,16 @@ fn discover_vm_artifacts() -> Option<DiscoveredArtifacts> {
         disk_dirs.push(base);
     }
     disk_dirs.extend(kernel_dirs.iter().cloned());
-    let disk = disk_dirs.iter().map(|d| d.join("root.img")).find(|p| p.exists())?;
+    let disk = disk_dirs
+        .iter()
+        .map(|d| d.join("root.img"))
+        .find(|p| p.exists())?;
 
-    Some(DiscoveredArtifacts { kernel, initrd, disk })
+    Some(DiscoveredArtifacts {
+        kernel,
+        initrd,
+        disk,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3440,8 +3448,8 @@ fn read_winsize() -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        recv_frame, send_frame, Cli, Commands, GuestCommand, GuestMount, GuestResponse,
-        FRAME_EXIT, FRAME_RESIZE, FRAME_STDIN, FRAME_STDOUT,
+        recv_frame, send_frame, Cli, Commands, GuestCommand, GuestMount, GuestResponse, FRAME_EXIT,
+        FRAME_RESIZE, FRAME_STDIN, FRAME_STDOUT,
     };
     use clap::Parser as _;
     use std::io::Cursor;

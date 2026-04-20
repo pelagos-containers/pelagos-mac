@@ -14,7 +14,7 @@
 //!   utunN (kernel L3 interface, e.g. utun5)
 //!        │  fd00::1/64 assigned by pelagos-pfctl (ip6.forwarding=1)
 //!        │
-//!  macOS pf  ──  NAT44: 192.168.105.0/24 → egress IP
+//!  macOS pf  ──  NAT44: 192.168.N.0/24 → egress IP   (N = profile subnet)
 //!           ├─  NAT66: fd00::/64 → egress IPv6 (GUA)
 //!           └─  RDR port-forward rules (managed by pelagos-pfctl)
 //!        │
@@ -25,12 +25,16 @@
 //!
 //! ```text
 //! Gateway MAC:      02:00:00:00:00:01   (relay answers ARP/NDP with this)
-//! Gateway IPv4:     192.168.105.1       (host-side utun address)
-//! VM IPv4:          192.168.105.2/24    (configured in guest)
+//! Gateway IPv4:     192.168.N.1         (host-side utun; N chosen per profile)
+//! VM IPv4:          192.168.N.2/24      (configured in guest)
 //! Gateway IPv6 ULA: fd00::1/64          (host-side utun address; pf NAT66 source)
 //! Gateway IPv6 LL:  fe80::1             (relay answers NDP for this)
 //! VM IPv6 ULA:      fd00::2/64          (configured in guest; NAT66 via pf)
 //! ```
+//!
+//! IPv4 addressing is per-profile so multiple VMs can run simultaneously
+//! without routing conflicts.  IPv6 is fixed (fd00::/64) because each VM gets
+//! its own utun interface and the NAT rules are scoped to that interface.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -43,9 +47,39 @@ use serde::Serialize;
 // ---------------------------------------------------------------------------
 
 const GATEWAY_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
-const GATEWAY_IP4: [u8; 4] = [192, 168, 105, 1];
+// GATEWAY_IP4 is now per-VM (stored in RelayState); IPv6 is fixed across all profiles.
 const GATEWAY_IP6_ULA: [u8; 16] = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 const GATEWAY_IP6_LL: [u8; 16] = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+
+// ---------------------------------------------------------------------------
+// Per-VM subnet
+// ---------------------------------------------------------------------------
+
+/// IPv4 subnet assigned to one VM profile.
+///
+/// Each profile gets a distinct `/24` from `192.168.105.0/24` – `192.168.254.0/24`
+/// so multiple VMs can run simultaneously without macOS routing conflicts.
+pub struct VmSubnet {
+    /// Host-side gateway IP on the utun interface (e.g. `[192, 168, 105, 1]`).
+    pub host_ip4: [u8; 4],
+    /// Guest IP inside the VM (e.g. `[192, 168, 105, 2]`).
+    pub guest_ip4: [u8; 4],
+    /// CIDR notation for pf NAT44 rule (e.g. `"192.168.105.0/24"`).
+    pub cidr: String,
+}
+
+impl VmSubnet {
+    /// Build a subnet from the guest IP.  Host IP = `X.X.X.1`, CIDR = `X.X.X.0/24`.
+    pub fn from_guest_ip(guest: [u8; 4]) -> Self {
+        let host = [guest[0], guest[1], guest[2], 1];
+        let cidr = format!("{}.{}.{}.0/24", guest[0], guest[1], guest[2]);
+        VmSubnet {
+            host_ip4: host,
+            guest_ip4: guest,
+            cidr,
+        }
+    }
+}
 
 // 4-byte tun packet prefix (network byte order AF value).
 const TUN_HDR_IPV4: [u8; 4] = [0, 0, 0, 2]; // AF_INET  = 2
@@ -64,7 +98,7 @@ const PFCTL_SOCK: &str = "/var/run/pelagos-pfctl.sock";
 /// - `avf_fd` is one end of a `socketpair(AF_UNIX, SOCK_DGRAM)` ready to be
 ///   wrapped in `NSFileHandle` and passed to `VZFileHandleNetworkDeviceAttachment`.
 /// - `relay` holds the relay thread and utun fd.  Drop it to initiate shutdown.
-pub fn start() -> Result<(RawFd, TunRelayHandle), crate::Error> {
+pub fn start(subnet: VmSubnet) -> Result<(RawFd, TunRelayHandle), crate::Error> {
     let (avf_fd, relay_fd) = create_socketpair()?;
 
     // 128 KB / 512 KB per AVF documentation.
@@ -82,7 +116,7 @@ pub fn start() -> Result<(RawFd, TunRelayHandle), crate::Error> {
         .ok_or_else(|| crate::Error::Runtime("could not detect default route interface".into()))?;
 
     // Ask pelagos-pfctl to assign IPs to the utun interface and load pf NAT44 rules.
-    pfctl_setup_utun(&utun_iface, &egress)?;
+    pfctl_setup_utun(&utun_iface, &egress, &subnet)?;
 
     log::info!("tun_relay: started utun={utun_iface} egress={egress}");
 
@@ -91,9 +125,10 @@ pub fn start() -> Result<(RawFd, TunRelayHandle), crate::Error> {
     set_nonblocking(utun_fd);
 
     let iface_clone = utun_iface.clone();
+    let gateway_ip4 = subnet.host_ip4;
     let thread = std::thread::Builder::new()
         .name("tun-relay".into())
-        .spawn(move || run_relay(relay_fd, utun_fd, &iface_clone))
+        .spawn(move || run_relay(relay_fd, utun_fd, &iface_clone, gateway_ip4))
         .expect("spawn tun-relay");
 
     Ok((
@@ -269,11 +304,16 @@ fn pfctl_create_utun() -> Result<(OwnedFd, String), crate::Error> {
 struct RelayState {
     /// VM MAC address, learned from the first Ethernet frame received from the VM.
     vm_mac: Option<[u8; 6]>,
+    /// Host-side gateway IPv4 for this VM (per-profile; used in ARP replies).
+    gateway_ip4: [u8; 4],
 }
 
-fn run_relay(relay_fd: RawFd, utun_fd: RawFd, utun_iface: &str) {
+fn run_relay(relay_fd: RawFd, utun_fd: RawFd, utun_iface: &str, gateway_ip4: [u8; 4]) {
     log::info!("tun_relay: relay loop started (relay_fd={relay_fd} utun_fd={utun_fd})");
-    let mut state = RelayState { vm_mac: None };
+    let mut state = RelayState {
+        vm_mac: None,
+        gateway_ip4,
+    };
     let mut avf_buf = vec![0u8; 65536 + 14]; // MTU + Ethernet header
     let mut tun_buf = vec![0u8; 65536 + 4]; // MTU + 4-byte tun prefix
 
@@ -405,7 +445,7 @@ fn handle_arp(frame: &[u8], relay_fd: RawFd, state: &RelayState) {
         return; // only reply to requests
     }
     let target_ip = &frame[38..42];
-    if target_ip != GATEWAY_IP4 {
+    if target_ip != state.gateway_ip4 {
         return; // not asking for our IP
     }
 
@@ -415,7 +455,7 @@ fn handle_arp(frame: &[u8], relay_fd: RawFd, state: &RelayState) {
         .unwrap_or_else(|| frame[22..28].try_into().unwrap_or([0u8; 6]));
     let sender_ip: [u8; 4] = frame[28..32].try_into().unwrap_or([0u8; 4]);
 
-    let reply = build_arp_reply(&vm_mac, &sender_ip);
+    let reply = build_arp_reply(&vm_mac, &sender_ip, &state.gateway_ip4);
     send_to_avf(relay_fd, &reply);
 }
 
@@ -520,8 +560,8 @@ fn send_to_avf(relay_fd: RawFd, frame: &[u8]) {
 // ARP and NDP packet construction
 // ---------------------------------------------------------------------------
 
-/// Build an ARP reply advertising GATEWAY_MAC as the owner of GATEWAY_IP4.
-fn build_arp_reply(vm_mac: &[u8; 6], vm_ip4: &[u8; 4]) -> Vec<u8> {
+/// Build an ARP reply advertising GATEWAY_MAC as the owner of `gateway_ip4`.
+fn build_arp_reply(vm_mac: &[u8; 6], vm_ip4: &[u8; 4], gateway_ip4: &[u8; 4]) -> Vec<u8> {
     let mut f = vec![0u8; 42]; // 14 eth + 28 arp
                                // Ethernet
     f[0..6].copy_from_slice(vm_mac);
@@ -538,7 +578,7 @@ fn build_arp_reply(vm_mac: &[u8; 6], vm_ip4: &[u8; 4]) -> Vec<u8> {
     f[20] = 0x00;
     f[21] = 0x02; // reply
     f[22..28].copy_from_slice(&GATEWAY_MAC);
-    f[28..32].copy_from_slice(&GATEWAY_IP4);
+    f[28..32].copy_from_slice(gateway_ip4);
     f[32..38].copy_from_slice(vm_mac);
     f[38..42].copy_from_slice(vm_ip4);
     f
@@ -661,22 +701,24 @@ fn pfctl_send(json: &str) -> Result<(), crate::Error> {
     }
 }
 
-fn pfctl_setup_utun(iface: &str, egress: &str) -> Result<(), crate::Error> {
+fn pfctl_setup_utun(iface: &str, egress: &str, subnet: &VmSubnet) -> Result<(), crate::Error> {
     #[derive(Serialize)]
     struct Req<'a> {
         action: &'static str,
         iface: &'a str,
-        ipv4_addr: &'static str,
-        ipv4_peer: &'static str,
-        ipv4_cidr: &'static str,
+        ipv4_addr: String,
+        ipv4_peer: String,
+        ipv4_cidr: &'a str,
         egress_iface: &'a str,
     }
+    let host = subnet.host_ip4;
+    let guest = subnet.guest_ip4;
     let json = serde_json::to_string(&Req {
         action: "setup_utun",
         iface,
-        ipv4_addr: "192.168.105.1",
-        ipv4_peer: "192.168.105.2",
-        ipv4_cidr: "192.168.105.0/24",
+        ipv4_addr: format!("{}.{}.{}.{}", host[0], host[1], host[2], host[3]),
+        ipv4_peer: format!("{}.{}.{}.{}", guest[0], guest[1], guest[2], guest[3]),
+        ipv4_cidr: &subnet.cidr,
         egress_iface: egress,
     })
     .map_err(|e| crate::Error::Runtime(e.to_string()))?;

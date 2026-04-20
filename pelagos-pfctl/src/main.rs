@@ -283,6 +283,21 @@ fn handle_setup_utun(
     }
 
     // 1. Assign IPv4 (point-to-point: local peer)
+    //
+    // macOS utun interfaces are NOT automatically destroyed when their file
+    // descriptors close (unlike Linux tun/tap).  A zombie utun from a crashed
+    // or unclean previous session retains its IPv4 P2P address and keeps a
+    // host route for ipv4_peer pointing at itself.  Delete any lingering host
+    // route for ipv4_peer before assigning; the kernel will add a fresh route
+    // for the new interface when `ifconfig ... up` runs.
+    //
+    // NOTE: we do NOT remove IPv4 addresses from other utun interfaces here
+    // because those may belong to concurrently-running VM relays on different
+    // subnets.  Per-profile subnet allocation guarantees that no two running
+    // VMs share the same ipv4_peer, so only stale/zombie utuns would have a
+    // conflicting route — and deleting the route is sufficient.
+    let _ = run_route(&["delete", "-host", ipv4_peer]);
+
     if let Err(e) = run_ifconfig(&[iface, "inet", ipv4_addr, ipv4_peer, "up"]) {
         return err_resp(format!("ifconfig inet: {e}"));
     }
@@ -345,12 +360,23 @@ fn handle_teardown_utun(iface: &str, state: &mut DaemonState) -> Response {
         state.egress_iface = None;
         state.rdr_rules.clear();
     }
-    // Explicitly remove the IPv6 gateway address so it doesn't linger if the
-    // relay fd is closed without a clean teardown (e.g. daemon crash/restart).
+    // Explicitly remove both IPv4 and IPv6 gateway addresses so they don't
+    // linger on the interface after a crash/restart.  macOS utun interfaces
+    // are NOT automatically destroyed when their relay fd closes; the interface
+    // persists as a zombie and its addresses block the next VM start from
+    // getting the correct routing.  Removing addresses here (even on clean
+    // teardown) prevents the zombie from holding a stale route for the guest IP.
+    //
+    // The peer IPv4 address (ipv4_peer) is not passed into teardown; we instead
+    // remove all inet addresses via "inet delete" which strips any P2P address.
     let _ = run_ifconfig(&[iface, "inet6", "fd00::1", "-alias"]);
-    // Try to bring down the interface (it's destroyed when the relay fd closes anyway).
+    // Remove the P2P IPv4 address by bringing the interface down — on macOS
+    // bringing a P2P utun down removes its inet address and associated routes.
     let _ = run_ifconfig(&[iface, "down"]);
-    log::info!("utun relay teardown: iface={iface} (remaining={})", state.active_utun_count);
+    log::info!(
+        "utun relay teardown: iface={iface} (remaining={})",
+        state.active_utun_count
+    );
     ok_resp()
 }
 
@@ -590,6 +616,18 @@ fn run_sysctl_set(key: &str, val: &str) -> Result<(), String> {
         .args(["-w", &format!("{key}={val}")])
         .output()
         .map_err(|e| format!("exec /usr/sbin/sysctl: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+}
+
+fn run_route(args: &[&str]) -> Result<(), String> {
+    let out = Command::new("/sbin/route")
+        .args(args)
+        .output()
+        .map_err(|e| format!("exec /sbin/route: {e}"))?;
     if out.status.success() {
         Ok(())
     } else {

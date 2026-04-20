@@ -10,14 +10,12 @@ fn main() {
     //   (Keychain Access → Certificate Assistant → Create a Certificate →
     //    Name: "pelagos-mac Dev", Certificate Type: Code Signing).
     // For production: set PELAGOS_CALLER_DR to the Developer ID designated requirement.
-    let caller_dr = env::var("PELAGOS_CALLER_DR").unwrap_or_else(|_| {
-        r#"certificate leaf[subject.CN] = "pelagos-mac Dev""#.to_string()
-    });
+    let caller_dr = env::var("PELAGOS_CALLER_DR")
+        .unwrap_or_else(|_| r#"certificate leaf[subject.CN] = "pelagos-mac Dev""#.to_string());
 
     // Substitute @CALLER_DR@ in the template and write to OUT_DIR.
-    let template =
-        fs::read_to_string(manifest.join("assets/com.pelagos.pfctl.embedded.plist.in"))
-            .expect("pelagos-pfctl/assets/com.pelagos.pfctl.embedded.plist.in not found");
+    let template = fs::read_to_string(manifest.join("assets/com.pelagos.pfctl.embedded.plist.in"))
+        .expect("pelagos-pfctl/assets/com.pelagos.pfctl.embedded.plist.in not found");
     let plist = template.replace("@CALLER_DR@", &caller_dr);
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());

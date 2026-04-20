@@ -21,9 +21,8 @@ fn main() {
     // Must match the SMAuthorizedClients entry in pelagos-pfctl's embedded plist.
     // For development: matches the "pelagos-mac Dev" local certificate.
     // For production: set PELAGOS_HELPER_DR to the Developer ID designated requirement.
-    let helper_dr = env::var("PELAGOS_HELPER_DR").unwrap_or_else(|_| {
-        r#"certificate leaf[subject.CN] = "pelagos-mac Dev""#.to_string()
-    });
+    let helper_dr = env::var("PELAGOS_HELPER_DR")
+        .unwrap_or_else(|_| r#"certificate leaf[subject.CN] = "pelagos-mac Dev""#.to_string());
 
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let template = fs::read_to_string(manifest.join("assets/Info.plist.in"))

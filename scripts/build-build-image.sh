@@ -288,8 +288,8 @@ cat > "\$MNT/etc/systemd/network/10-eth.network" << 'NETCFG'
 Name=en* eth*
 
 [Network]
-Address=192.168.105.2/24
-Gateway=192.168.105.1
+Address=192.168.106.2/24
+Gateway=192.168.106.1
 DNS=8.8.8.8
 DNS=1.1.1.1
 # Keep any IP pre-configured by the initramfs so the relay can reach the
@@ -663,6 +663,7 @@ initrd    = $UBUNTU_INITRD
 memory    = $MEMORY_MIB
 cpus      = $CPUS
 ping_mode = ssh
+vm_ip     = 192.168.106.2
 # net.ifnames=0: prevent udev from renaming eth0 → enp0sN.
 # Without this, udev brings eth0 down to rename it, dropping the IP configured
 # by the initramfs before switch_root, leaving smoltcp unable to ARP the VM.
