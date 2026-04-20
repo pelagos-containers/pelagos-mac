@@ -50,7 +50,16 @@ echo "Signed: $PFCTL_BINARY"
 # named exactly by its bundle identifier.  Create a signed copy named
 # com.pelagos.pfctl adjacent to pelagos so the dev workflow works without
 # a Homebrew install.
-HELPER_COPY="$RELEASE/com.pelagos.pfctl"
+# SMJobBless looks for the helper at Contents/Library/LaunchServices/<label>
+# relative to the main bundle path.  For a CLI binary, NSBundle.mainBundle.bundlePath
+# is the executable's directory — so the helper must live at:
+#   <release_dir>/Contents/Library/LaunchServices/com.pelagos.pfctl
+HELPER_DIR="$RELEASE/Contents/Library/LaunchServices"
+HELPER_COPY="$HELPER_DIR/com.pelagos.pfctl"
+mkdir -p "$HELPER_DIR"
 cp "$PFCTL_BINARY" "$HELPER_COPY"
-codesign --sign "$IDENTITY" --entitlements "$PFCTL_ENTITLEMENTS" --force "$HELPER_COPY"
+# --identifier is mandatory: codesign otherwise strips the last dot-segment as
+# a file extension (com.pelagos.pfctl → com.pelagos).
+codesign --sign "$IDENTITY" --identifier "com.pelagos.pfctl" \
+         --entitlements "$PFCTL_ENTITLEMENTS" --force "$HELPER_COPY"
 echo "Signed: $HELPER_COPY"
