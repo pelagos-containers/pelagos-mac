@@ -8,7 +8,9 @@
 # Usage:
 #   bash scripts/install-dev.sh
 #
-# Requires: sudo (prompted once for pfctl daemon install)
+# /opt/homebrew is user-owned on Apple Silicon — no sudo needed for the copy or
+# codesign steps.  Only update-pfctl-daemon.sh (LaunchDaemon install) uses sudo,
+# and it prompts for the password itself.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,11 +30,11 @@ cargo build --release -p pelagos-mac -p pelagos-pfctl
 # Sign AFTER copy: macOS 26 taskgated validates the signature at the path where
 # the binary actually runs. Signing at target/ then copying invalidates it.
 echo ""
-echo "--- install + sign pelagos (requires sudo) ---"
+echo "--- install + sign pelagos ---"
 INSTALLED_PELAGOS="$(realpath /opt/homebrew/bin/pelagos 2>/dev/null || echo /opt/homebrew/bin/pelagos)"
-sudo cp "$RELEASE/pelagos" "$INSTALLED_PELAGOS"
+cp "$RELEASE/pelagos" "$INSTALLED_PELAGOS"
 echo "  installed: $INSTALLED_PELAGOS"
-sudo codesign --sign - --entitlements "$REPO/pelagos-mac/entitlements.plist" --force "$INSTALLED_PELAGOS"
+codesign --sign - --entitlements "$REPO/pelagos-mac/entitlements.plist" --force "$INSTALLED_PELAGOS"
 echo "  signed:    $INSTALLED_PELAGOS"
 
 # ── 4. Install pelagos-pfctl daemon ──────────────────────────────────────────
@@ -49,18 +51,12 @@ pelagos --version
 # ── 6. Point vm.conf at local out/ artifacts ─────────────────────────────────
 echo ""
 echo "--- vm init (local out/) ---"
-# Run vm init as the original user so the vm.conf is owned by that user.
-# When the script is invoked via sudo, SUDO_USER holds the original username.
-REAL_USER="${SUDO_USER:-$USER}"
-sudo -u "$REAL_USER" pelagos vm init --force --vm-data "$REPO/out"
+pelagos vm init --force --vm-data "$REPO/out"
 
 # ── 7. Start VM ───────────────────────────────────────────────────────────────
 echo ""
 echo "--- VM ---"
-# Start the VM daemon as the real (non-root) user so VZDiskImageStorageDeviceAttachment
-# succeeds. Running as root causes the disk attachment to fail on subsequent
-# non-root starts because the VZ XPC service tracks per-user VM state.
-sudo -u "$REAL_USER" pelagos vm start && echo "  VM running" || echo "  VM already running or failed — check: pelagos vm status"
+pelagos vm start && echo "  VM running" || echo "  VM already running or failed — check: pelagos vm status"
 
 # ── 8. pelagos-ui ─────────────────────────────────────────────────────────────
 UI_DIR="$HOME/Projects/pelagos-ui"
