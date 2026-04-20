@@ -1,56 +1,35 @@
 //! Kernel-assisted NAT relay using a macOS `utun` interface.
 //!
-//! # Why utun instead of smoltcp
-//!
-//! The smoltcp relay processes raw Ethernet frames entirely in userspace via a
-//! SOCK_DGRAM socketpair.  macOS pf never sees those packets — so pf NAT rules
-//! are completely bypassed.  Per-protocol proxy code must be written for every
-//! protocol the VM wants to use.
-//!
-//! The utun relay creates a kernel `utun` interface, bridges L2↔L3 between the
-//! AVF socketpair and the utun fd, and lets the kernel handle everything else:
+//! # Architecture
 //!
 //! ```text
 //! VM virtio-net (raw Ethernet via SOCK_DGRAM socketpair)
 //!        │
 //!  [tun_relay thread — poll loop on relay_fd + utun_fd]
 //!        │  strip/add 14-byte Ethernet header
-//!        │  synthesise ARP replies and NDP Neighbour Advertisements
+//!        │  ARP replies and NDP Neighbour Advertisements (synthesised locally)
+//!        │  IPv4: forward as-is — kernel handles NAT44 via pf
+//!        │  IPv6: forward as-is — kernel handles NAT66 via pf
 //!        │
 //!   utunN (kernel L3 interface, e.g. utun5)
+//!        │  fd00::1/64 assigned by pelagos-pfctl (ip6.forwarding=1)
 //!        │
 //!  macOS pf  ──  NAT44: 192.168.105.0/24 → egress IP
-//!           └─  NAT66: fd00::/64        → egress IPv6
+//!           ├─  NAT66: fd00::/64 → egress IPv6 (GUA)
 //!           └─  RDR port-forward rules (managed by pelagos-pfctl)
 //!        │
 //!   egress interface (en0 / WiFi / …)
 //! ```
 //!
-//! All IP protocols (TCP, UDP, ICMP, ICMPv6, QUIC, …) work automatically
-//! because the kernel handles them.
-//!
-//! # ARP / NDP synthesis
-//!
-//! `utunN` is an L3 interface — it has no MAC address and processes no ARP or
-//! NDP.  The relay synthesises:
-//! - ARP replies for 192.168.105.1 (gateway IPv4)
-//! - NDP Neighbour Advertisements for fd00::1 and fe80::1 (gateway IPv6)
-//!
-//! # Feature flag
-//!
-//! The relay is selected via `VmConfig.relay_type = RelayType::Utun`.
-//! The default remains `RelayType::Smoltcp` throughout development so the
-//! existing smoltcp path is always available on the branch.
-//!
 //! # VM network constants
 //!
 //! ```text
-//! Gateway MAC:     02:00:00:00:00:01  (relay answers ARP/NDP with this)
-//! Gateway IPv4:    192.168.105.1      (host-side utun address)
-//! VM IPv4:         192.168.105.2/24   (configured in guest)
-//! Gateway IPv6 ULA: fd00::1           (host-side utun address)
-//! Gateway IPv6 LL:  fe80::1           (relay answers NDP for this)
-//! VM IPv6 ULA:     fd00::2/64         (configured in guest)
+//! Gateway MAC:      02:00:00:00:00:01   (relay answers ARP/NDP with this)
+//! Gateway IPv4:     192.168.105.1       (host-side utun address)
+//! VM IPv4:          192.168.105.2/24    (configured in guest)
+//! Gateway IPv6 ULA: fd00::1/64          (host-side utun address; pf NAT66 source)
+//! Gateway IPv6 LL:  fe80::1             (relay answers NDP for this)
+//! VM IPv6 ULA:      fd00::2/64          (configured in guest; NAT66 via pf)
 //! ```
 
 use std::io::{BufRead, BufReader, Write};
@@ -102,7 +81,7 @@ pub fn start() -> Result<(RawFd, TunRelayHandle), crate::Error> {
     let egress = detect_egress_iface()
         .ok_or_else(|| crate::Error::Runtime("could not detect default route interface".into()))?;
 
-    // Ask pelagos-pfctl to assign IPs to the utun interface and load pf NAT rules.
+    // Ask pelagos-pfctl to assign IPs to the utun interface and load pf NAT44 rules.
     pfctl_setup_utun(&utun_iface, &egress)?;
 
     log::info!("tun_relay: started utun={utun_iface} egress={egress}");
@@ -400,6 +379,8 @@ fn process_avf_frame(frame: &[u8], relay_fd: RawFd, utun_fd: RawFd, state: &mut 
             if is_ndp_ns(frame) && handle_ndp_ns(frame, relay_fd, state) {
                 return; // handled locally
             }
+            // Strip Ethernet header, prepend tun prefix, write to utun.
+            // pf NAT66 (fd00::/64 → egress GUA) is handled by the kernel.
             forward_to_utun(utun_fd, &frame[14..], &TUN_HDR_IPV6);
         }
         _ => {
