@@ -292,6 +292,9 @@ Address=192.168.106.2/24
 Gateway=192.168.106.1
 DNS=8.8.8.8
 DNS=1.1.1.1
+# Accept Router Advertisements so the VM gets a real GUA via SLAAC
+# (the tun_relay synthesises the RA from the host's /64 prefix).
+IPv6AcceptRA=yes
 # Keep any IP pre-configured by the initramfs so the relay can reach the
 # VM before networkd re-applies config.
 KeepConfiguration=static

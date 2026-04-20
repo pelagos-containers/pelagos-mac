@@ -8,12 +8,13 @@
 //! utun relay requests (for `tun_relay.rs`):
 //!   {"action":"create_utun"}
 //!     → creates a utun fd as root, sends {"ok":true,"iface":"utunN"} + fd via SCM_RIGHTS.
-//!       The relay process receives the fd via recvmsg and holds it for the relay lifetime.
 //!   {"action":"setup_utun","iface":"utun5",
 //!    "ipv4_addr":"192.168.105.1","ipv4_peer":"192.168.105.2",
 //!    "ipv4_cidr":"192.168.105.0/24","egress_iface":"en0"}
-//!   Assigns fd00::1/64 to the utun for NAT66, enables ip4/ip6 forwarding,
-//!   and loads both NAT44 and NAT66 pf anchors.
+//!     → assigns IPv4 P2P address, enables ip4/ip6 forwarding, loads NAT44 pf anchor.
+//!   {"action":"assign_utun_alias","iface":"utun5","addr":"2601:x:y:z::a1b2"}
+//!     → aliases a GUA to the utun so the kernel delivers inbound IPv6 to the VM.
+//!       Called by the relay after observing the VM's SLAAC DAD Neighbour Solicitation.
 //!   {"action":"teardown_utun","iface":"utun5"}
 //!   {"action":"add_rdr","proto":"tcp","host_port":2222,
 //!    "vm_ip":"192.168.105.2","vm_port":22}
@@ -85,6 +86,9 @@ struct DaemonState {
     /// Number of utun relays currently set up. IP forwarding is only disabled
     /// when this reaches zero, preventing a racing teardown from killing a live relay.
     active_utun_count: u32,
+    /// GUA aliases assigned to utun interfaces via assign_utun_alias.
+    /// Removed on teardown_utun for the corresponding interface.
+    ipv6_aliases: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -102,6 +106,7 @@ impl DaemonState {
             egress_iface: None,
             rdr_rules: Vec::new(),
             active_utun_count: 0,
+            ipv6_aliases: Vec::new(),
         }
     }
 }
@@ -135,6 +140,12 @@ enum Request {
     },
     /// Create a utun fd as root and pass it to the relay via SCM_RIGHTS.
     CreateUtun,
+    /// Assign a GUA IPv6 alias to a utun interface so the kernel delivers
+    /// inbound traffic for that address to the utun (and thus the VM).
+    AssignUtunAlias {
+        iface: String,
+        addr: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -257,6 +268,9 @@ fn handle_connection(stream: std::os::unix::net::UnixStream, state: Arc<Mutex<Da
             vm_port,
         } => handle_add_rdr(&proto, host_port, &vm_ip, vm_port, &mut st),
         Request::RemoveRdr { proto, host_port } => handle_remove_rdr(&proto, host_port, &mut st),
+        Request::AssignUtunAlias { iface, addr } => {
+            handle_assign_utun_alias(&iface, &addr, &mut st)
+        }
         Request::CreateUtun => unreachable!("handled above"),
     };
 
@@ -302,21 +316,9 @@ fn handle_setup_utun(
         return err_resp(format!("ifconfig inet: {e}"));
     }
 
-    // 2. Assign IPv6 ULA address for the VM gateway.
-    // macOS returns exit 0 but does nothing if fd00::1 is already assigned to another
-    // interface (e.g. a stale utun from a crashed/unclean previous session).
-    // Sweep the utun range and remove any stale fd00::1 assignment first.
-    for i in 0u32..=20 {
-        let candidate = format!("utun{i}");
-        if candidate != iface {
-            let _ = run_ifconfig(&[&candidate, "inet6", "fd00::1", "-alias"]);
-        }
-    }
-    if let Err(e) = run_ifconfig(&[iface, "inet6", "fd00::1", "prefixlen", "64"]) {
-        return err_resp(format!("ifconfig inet6: {e}"));
-    }
-
-    // 3. Enable kernel IP forwarding for NAT44 and NAT66.
+    // 2. Enable kernel IPv4 forwarding for NAT44 (utun → egress).
+    //    IPv6 forwarding is also needed so packets from utun can be routed to
+    //    the egress interface (VM → internet without NAT).
     if let Err(e) = run_sysctl_set("net.inet.ip.forwarding", "1") {
         return err_resp(format!("sysctl net.inet.ip.forwarding: {e}"));
     }
@@ -324,11 +326,9 @@ fn handle_setup_utun(
         return err_resp(format!("sysctl net.inet6.ip6.forwarding: {e}"));
     }
 
-    // 4. Write and load NAT44 + NAT66 anchor.
-    let nat_rules = format!(
-        "nat on {egress_iface} inet from {ipv4_cidr} to any -> ({egress_iface})\n\
-         nat on {egress_iface} inet6 from fd00::/64 to any -> ({egress_iface})\n"
-    );
+    // 3. Write and load NAT44 anchor (IPv4 only; no NAT66 — VM has real GUA via SLAAC).
+    let nat_rules =
+        format!("nat on {egress_iface} inet from {ipv4_cidr} to any -> ({egress_iface})\n");
     if let Err(e) = std::fs::write(ANCHOR_FILE_NAT, &nat_rules) {
         return err_resp(format!("write {ANCHOR_FILE_NAT}: {e}"));
     }
@@ -360,23 +360,40 @@ fn handle_teardown_utun(iface: &str, state: &mut DaemonState) -> Response {
         state.egress_iface = None;
         state.rdr_rules.clear();
     }
-    // Explicitly remove both IPv4 and IPv6 gateway addresses so they don't
-    // linger on the interface after a crash/restart.  macOS utun interfaces
-    // are NOT automatically destroyed when their relay fd closes; the interface
-    // persists as a zombie and its addresses block the next VM start from
-    // getting the correct routing.  Removing addresses here (even on clean
-    // teardown) prevents the zombie from holding a stale route for the guest IP.
-    //
-    // The peer IPv4 address (ipv4_peer) is not passed into teardown; we instead
-    // remove all inet addresses via "inet delete" which strips any P2P address.
-    let _ = run_ifconfig(&[iface, "inet6", "fd00::1", "-alias"]);
-    // Remove the P2P IPv4 address by bringing the interface down — on macOS
-    // bringing a P2P utun down removes its inet address and associated routes.
+    // Remove any GUA aliases assigned to this utun via assign_utun_alias.
+    state.ipv6_aliases.retain(|(alias_iface, addr)| {
+        if alias_iface == iface {
+            let _ = run_ifconfig(&[iface, "inet6", addr.as_str(), "-alias"]);
+            false // remove from list
+        } else {
+            true
+        }
+    });
+    // Bring the interface down to clear the P2P IPv4 address and associated routes.
+    // macOS utun interfaces persist after their fd closes; bringing them down
+    // prevents the zombie from holding a stale route for the guest IP.
     let _ = run_ifconfig(&[iface, "down"]);
     log::info!(
         "utun relay teardown: iface={iface} (remaining={})",
         state.active_utun_count
     );
+    ok_resp()
+}
+
+fn handle_assign_utun_alias(iface: &str, addr: &str, state: &mut DaemonState) -> Response {
+    if !is_safe_iface(iface) {
+        return err_resp("invalid interface name");
+    }
+    if addr.parse::<std::net::Ipv6Addr>().is_err() {
+        return err_resp(format!("invalid IPv6 address: {addr:?}"));
+    }
+    if let Err(e) = run_ifconfig(&[iface, "inet6", addr, "alias"]) {
+        return err_resp(format!("ifconfig inet6 alias: {e}"));
+    }
+    log::info!("assigned IPv6 alias {addr} to {iface}");
+    state
+        .ipv6_aliases
+        .push((iface.to_string(), addr.to_string()));
     ok_resp()
 }
 

@@ -1136,10 +1136,9 @@ busybox ip link set lo up
 busybox ip link set eth0 up
 busybox ip addr add 192.168.105.2/24 dev eth0
 busybox ip route add default via 192.168.105.1
-# Static IPv6 for utun-relay NAT66 (fd00::1 is the host utun peer / gateway).
-busybox ip -6 addr add fd00::2/64 dev eth0
-busybox ip -6 route add default via fd00::1 dev eth0
-echo "[pelagos-init] network: static 192.168.105.2/24 + fd00::2/64"
+# IPv6 is configured via SLAAC: the tun_relay synthesises an RA containing
+# the host's real /64 prefix when the VM sends a Router Solicitation.
+echo "[pelagos-init] network: static 192.168.105.2/24 + IPv6 via SLAAC"
 # Enable IP forwarding unconditionally — this is a container runtime VM.
 # pelagos port-forwarding uses nftables DNAT in PREROUTING to redirect
 # host-port connections to the container IP, which requires ip_forward=1
