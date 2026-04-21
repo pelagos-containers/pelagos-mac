@@ -626,6 +626,10 @@ fn handle_connection(
         Ok(fd) => fd,
         Err(e) => {
             log::error!("[{conn_id:?}] vsock connect: {}", e);
+            // Send a protocol-level error so the client receives a meaningful
+            // message rather than a silent EOF that causes a JSON parse error.
+            let msg = serde_json::to_string(&e.to_string()).unwrap_or_default();
+            let _ = writeln!(unix, r#"{{"error":{msg}}}"#);
             return;
         }
     };
