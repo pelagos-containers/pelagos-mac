@@ -1743,6 +1743,17 @@ fn cmd_build(
     target: Option<&str>,
     context: &str,
 ) -> i32 {
+    // When the Dockerfile path is relative (e.g. the default "Dockerfile"),
+    // resolve it against the build context directory so `docker build ctx/`
+    // finds ctx/Dockerfile rather than looking in the current working directory.
+    let abs_file_buf;
+    let file = if std::path::Path::new(file).is_relative() {
+        abs_file_buf = format!("{}/{}", context, file);
+        abs_file_buf.as_str()
+    } else {
+        file
+    };
+
     // Preprocess: substitute --build-arg values into FROM lines so pelagos
     // receives fully-resolved image/stage references.
     let resolved = preprocess_dockerfile_args(file, build_args);
