@@ -835,7 +835,13 @@ fn main() {
                 .arg("-o")
                 .arg("UserKnownHostsFile=/dev/null")
                 .arg("-o")
-                .arg("LogLevel=ERROR");
+                .arg("LogLevel=ERROR")
+                .arg("-o")
+                // Disable mux multiplexing entirely so user-level ~/.ssh/config
+                // ControlMaster settings don't cause "Broken pipe" noise on first
+                // connection.  Option B (pelagos-managed ControlPersist socket for
+                // faster repeated connections) is tracked in issue #252.
+                .arg("ControlMaster=no");
 
             // utun relay: the VM is directly routable at its per-profile guest IP.
             let guest_ip = state::VmProfileConfig::load(&profile)
@@ -3007,6 +3013,8 @@ fn ping_ssh(cli: &Cli) -> i32 {
             .arg("UserKnownHostsFile=/dev/null")
             .arg("-o")
             .arg("LogLevel=ERROR")
+            .arg("-o")
+            .arg("ControlMaster=no")
             .arg("-o")
             .arg("ConnectTimeout=30")
             .arg("-o")
