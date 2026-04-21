@@ -40,10 +40,6 @@ const SOCK_PATH: &str = "/var/run/pelagos-pfctl.sock";
 const ANCHOR_NAT: &str = "com.apple/pelagos-nat";
 const ANCHOR_FILE_NAT: &str = "/etc/pf.anchors/pelagos-nat";
 
-// RDR anchor used by the utun relay for port forwarding.
-const ANCHOR_RDR: &str = "com.apple/pelagos-rdr";
-const ANCHOR_FILE_RDR: &str = "/etc/pf.anchors/pelagos-rdr";
-
 // ---------------------------------------------------------------------------
 // macOS utun constants and C structs (used by create_utun_privileged)
 // ---------------------------------------------------------------------------
@@ -83,7 +79,9 @@ struct DaemonState {
     utun_iface: Option<String>,
     /// Egress interface used by the active utun setup — needed for RDR rules.
     egress_iface: Option<String>,
-    /// Active port-forward rules, rebuilt into the RDR anchor on every change.
+    /// VM subnet CIDR (e.g. "192.168.105.0/24") for the NAT and pass rules.
+    ipv4_cidr: Option<String>,
+    /// Active port-forward rules, rebuilt into the combined anchor on every change.
     rdr_rules: Vec<RdrRule>,
     /// Number of utun relays currently set up. IP forwarding is only disabled
     /// when this reaches zero, preventing a racing teardown from killing a live relay.
@@ -106,6 +104,7 @@ impl DaemonState {
         Self {
             utun_iface: None,
             egress_iface: None,
+            ipv4_cidr: None,
             rdr_rules: Vec::new(),
             active_utun_count: 0,
             ipv6_aliases: Vec::new(),
@@ -338,20 +337,39 @@ fn handle_setup_utun(
     }
 
     // 3. Write and load NAT44 anchor (IPv4 only; no NAT66 — VM has real GUA via SLAAC).
-    let nat_rules =
-        format!("nat on {egress_iface} inet from {ipv4_cidr} to any -> ({egress_iface})\n");
-    if let Err(e) = std::fs::write(ANCHOR_FILE_NAT, &nat_rules) {
-        return err_resp(format!("write {ANCHOR_FILE_NAT}: {e}"));
-    }
-    let _ = Command::new("/sbin/pfctl").arg("-e").output();
-    if let Err(e) = run_pfctl(&["-a", ANCHOR_NAT, "-f", ANCHOR_FILE_NAT]) {
-        return err_resp(format!("pfctl nat anchor: {e}"));
-    }
+    //
+    // The anchor file includes a `pass quick` filter rule for the VM subnet
+    // so that macOS Internet Sharing's network_isolation anchor (which uses
+    // `block drop quick` for subnets it manages) cannot silently drop
+    // host-to-VM traffic.  The `com.apple/*` anchor (which contains this
+    // anchor) is evaluated before `com.apple.internet-sharing` in the main
+    // ruleset, so `pass quick` here wins.
+    //
+    // We also remove the VM subnet from the network_isolation_table_v4 table
+    // (best-effort: the table may not exist or may not contain this subnet).
+    // The `pass quick` rule above is the durable fix; the table removal
+    // prevents the block from re-appearing on the same pf pass.
+    let _ = run_pfctl(&[
+        "-a",
+        "com.apple.internet-sharing/network_isolation",
+        "-t",
+        "network_isolation_table_v4",
+        "-T",
+        "delete",
+        ipv4_cidr,
+    ]);
 
-    log::info!("utun relay setup: iface={iface} egress={egress_iface}");
     state.utun_iface = Some(iface.to_string());
     state.egress_iface = Some(egress_iface.to_string());
+    state.ipv4_cidr = Some(ipv4_cidr.to_string());
     state.active_utun_count += 1;
+
+    let _ = Command::new("/sbin/pfctl").arg("-e").output();
+    let resp = reload_nat_anchor(state);
+    if !resp.ok {
+        return resp;
+    }
+    log::info!("utun relay setup: iface={iface} egress={egress_iface}");
     ok_resp()
 }
 
@@ -361,14 +379,14 @@ fn handle_teardown_utun(iface: &str, state: &mut DaemonState) -> Response {
     let last_relay = state.active_utun_count == 0;
 
     if last_relay {
-        // Flush NAT and RDR anchors — ignore errors (anchor may not be active).
+        // Flush the combined NAT/RDR/filter anchor — ignore errors (may not be active).
         let _ = run_pfctl(&["-a", ANCHOR_NAT, "-F", "all"]);
-        let _ = run_pfctl(&["-a", ANCHOR_RDR, "-F", "all"]);
         // Disable IP forwarding only when no utun relays remain.
         let _ = run_sysctl_set("net.inet.ip.forwarding", "0");
         let _ = run_sysctl_set("net.inet6.ip6.forwarding", "0");
         state.utun_iface = None;
         state.egress_iface = None;
+        state.ipv4_cidr = None;
         state.rdr_rules.clear();
     }
     // Remove any GUA aliases assigned to this utun via assign_utun_alias.
@@ -446,9 +464,9 @@ fn handle_assign_utun_alias(iface: &str, addr: &str, state: &mut DaemonState) ->
                                     Err(e) => log::warn!("NDP probe NS failed: {e}"),
                                 }
                             }
-                            None => log::warn!(
-                                "router MAC not in NDP table yet, skipping NS probe"
-                            ),
+                            None => {
+                                log::warn!("router MAC not in NDP table yet, skipping NS probe")
+                            }
                         },
                         None => {
                             log::warn!("no IPv6 default gateway on {egress}, skipping NS probe")
@@ -487,25 +505,39 @@ fn handle_add_rdr(
         vm_ip: vm_ip.to_string(),
         vm_port,
     });
-    reload_rdr_anchor(state)
+    reload_nat_anchor(state)
 }
 
 fn handle_remove_rdr(proto: &str, host_port: u16, state: &mut DaemonState) -> Response {
     state
         .rdr_rules
         .retain(|r| !(r.proto == proto && r.host_port == host_port));
-    reload_rdr_anchor(state)
+    reload_nat_anchor(state)
 }
 
-fn reload_rdr_anchor(state: &DaemonState) -> Response {
-    if state.rdr_rules.is_empty() {
-        let _ = run_pfctl(&["-a", ANCHOR_RDR, "-F", "all"]);
-        return ok_resp();
+/// Rebuild and reload the combined pelagos-nat anchor.
+///
+/// pf requires rules in section order: translation (nat, rdr) then filtering (pass/block).
+/// All pelagos rules live in a single `com.apple/pelagos-nat` anchor so that the
+/// `nat-anchor "com.apple/*"`, `rdr-anchor "com.apple/*"`, and `anchor "com.apple/*"`
+/// wildcards in the main ruleset all traverse the same anchor file.  Using separate
+/// `pelagos-nat` and `pelagos-rdr` sub-anchors does NOT work because pf's wildcard
+/// expansion only finds sub-anchors that are explicitly referenced from their parent —
+/// loading rules directly into `com.apple/pelagos-rdr` via pfctl does not register it
+/// under the `com.apple` anchor for wildcard traversal.
+fn reload_nat_anchor(state: &DaemonState) -> Response {
+    let mut rules = String::new();
+
+    // Translation section: NAT (IPv4 masquerade) — only when egress is known.
+    if let (Some(egress), Some(cidr)) = (&state.egress_iface, &state.ipv4_cidr) {
+        rules.push_str(&format!(
+            "nat on {egress} inet from {cidr} to any -> ({egress})\n"
+        ));
     }
 
-    let mut rules = String::new();
+    // Translation section: RDR port-forward rules.
     for r in &state.rdr_rules {
-        // Redirect on loopback for local connections (e.g. `pelagos vm ssh`).
+        // Redirect on loopback so localhost connections reach the VM.
         rules.push_str(&format!(
             "rdr pass on lo0 proto {proto} from any to 127.0.0.1 port {hp} -> {vm_ip} port {vp}\n",
             proto = r.proto,
@@ -513,7 +545,7 @@ fn reload_rdr_anchor(state: &DaemonState) -> Response {
             vm_ip = r.vm_ip,
             vp = r.vm_port,
         ));
-        // Also redirect on the egress interface for external connections.
+        // Also redirect on the egress interface for external inbound connections.
         if let Some(egress) = &state.egress_iface {
             rules.push_str(&format!(
                 "rdr pass on {egress} proto {proto} from any to any port {hp} -> {vm_ip} port {vp}\n",
@@ -525,11 +557,22 @@ fn reload_rdr_anchor(state: &DaemonState) -> Response {
         }
     }
 
-    if let Err(e) = std::fs::write(ANCHOR_FILE_RDR, &rules) {
-        return err_resp(format!("write {ANCHOR_FILE_RDR}: {e}"));
+    // Filter section: allow host<->VM traffic before the internet-sharing
+    // network_isolation anchor can block it.
+    if let Some(cidr) = &state.ipv4_cidr {
+        rules.push_str(&format!("pass quick inet from {cidr} to {cidr}\n"));
     }
-    if let Err(e) = run_pfctl(&["-a", ANCHOR_RDR, "-f", ANCHOR_FILE_RDR]) {
-        return err_resp(format!("pfctl rdr anchor: {e}"));
+
+    if rules.is_empty() {
+        let _ = run_pfctl(&["-a", ANCHOR_NAT, "-F", "all"]);
+        return ok_resp();
+    }
+
+    if let Err(e) = std::fs::write(ANCHOR_FILE_NAT, &rules) {
+        return err_resp(format!("write {ANCHOR_FILE_NAT}: {e}"));
+    }
+    if let Err(e) = run_pfctl(&["-a", ANCHOR_NAT, "-f", ANCHOR_FILE_NAT]) {
+        return err_resp(format!("pfctl nat anchor: {e}"));
     }
     ok_resp()
 }
@@ -784,8 +827,12 @@ fn detect_ipv6_gateway(egress: &str) -> Option<[u8; 16]> {
         // Use `else { continue }` — `?` inside a loop exits the whole function.
         let mut fields = line.split_whitespace();
         let Some(dest) = fields.next() else { continue };
-        let Some(gw_raw) = fields.next() else { continue };
-        let Some(_flags) = fields.next() else { continue };
+        let Some(gw_raw) = fields.next() else {
+            continue;
+        };
+        let Some(_flags) = fields.next() else {
+            continue;
+        };
         let Some(iface) = fields.next() else { continue };
         if dest == "default" && iface == egress {
             let gw_str = gw_raw.split('%').next().unwrap_or(gw_raw);
@@ -801,10 +848,7 @@ fn detect_ipv6_gateway(egress: &str) -> Option<[u8; 16]> {
 /// Returns None if the entry is absent or unresolved (INCOMPLETE).
 fn get_ndp_mac(addr: [u8; 16]) -> Option<[u8; 6]> {
     let target = std::net::Ipv6Addr::from(addr).to_string();
-    let out = Command::new("/usr/sbin/ndp")
-        .args(["-an"])
-        .output()
-        .ok()?;
+    let out = Command::new("/usr/sbin/ndp").args(["-an"]).output().ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
     for line in s.lines() {
         let mut fields = line.split_whitespace();
@@ -881,18 +925,15 @@ fn send_ndp_probe_ns(
     frame[12..14].copy_from_slice(&[0x86, 0xdd]);
     frame[14] = 0x60; // IPv6
     frame[18..20].copy_from_slice(&32u16.to_be_bytes()); // payload length
-    frame[20] = 58;   // ICMPv6
-    frame[21] = 255;  // hop limit
-    frame[22..38].copy_from_slice(&vm_gua);  // src
-    frame[38..54].copy_from_slice(&router);  // dst: unicast router address
+    frame[20] = 58; // ICMPv6
+    frame[21] = 255; // hop limit
+    frame[22..38].copy_from_slice(&vm_gua); // src
+    frame[38..54].copy_from_slice(&router); // dst: unicast router address
     frame[54..86].copy_from_slice(&icmp);
 
     let r = unsafe { libc::write(bpf_fd, frame.as_ptr() as *const libc::c_void, frame.len()) };
     if r < 0 {
-        Err(format!(
-            "BPF write NS: {}",
-            std::io::Error::last_os_error()
-        ))
+        Err(format!("BPF write NS: {}", std::io::Error::last_os_error()))
     } else {
         Ok(())
     }
@@ -911,16 +952,14 @@ fn send_ndp_probe_ns(
 ///   option: TLLA (type 2) = en0_mac
 fn send_gratuitous_na(bpf_fd: i32, en0_mac: [u8; 6], vm_gua: [u8; 16]) -> Result<(), String> {
     const ALL_NODES_MAC: [u8; 6] = [0x33, 0x33, 0x00, 0x00, 0x00, 0x01];
-    const ALL_NODES_IP6: [u8; 16] = [
-        0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
-    ];
+    const ALL_NODES_IP6: [u8; 16] = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
 
     // ICMPv6 NA payload (32 bytes):
     //   type(1) code(1) checksum(2) flags(4) target(16) TLLA-option(8)
     let mut icmp = [0u8; 32];
     icmp[0] = 136; // NA
-    icmp[1] = 0;   // code
-    // [2..4] checksum — filled below
+    icmp[1] = 0; // code
+                 // [2..4] checksum — filled below
     icmp[4] = 0x20; // R=0 S=0 O=1 → byte 4 of the flags word = 0b0010_0000
     icmp[8..24].copy_from_slice(&vm_gua);
     icmp[24] = 2; // option type: Target Link-Layer Address
@@ -936,23 +975,20 @@ fn send_gratuitous_na(bpf_fd: i32, en0_mac: [u8; 6], vm_gua: [u8; 16]) -> Result
     frame[0..6].copy_from_slice(&ALL_NODES_MAC);
     frame[6..12].copy_from_slice(&en0_mac);
     frame[12..14].copy_from_slice(&[0x86, 0xdd]); // ethertype IPv6
-    // IPv6 header (offset 14)
+                                                  // IPv6 header (offset 14)
     frame[14] = 0x60; // version=6, TC=0, FL=0
-    // [15..18] = 0 (TC/FL continued)
+                      // [15..18] = 0 (TC/FL continued)
     frame[18..20].copy_from_slice(&32u16.to_be_bytes()); // payload length
-    frame[20] = 58;  // next-header = ICMPv6
+    frame[20] = 58; // next-header = ICMPv6
     frame[21] = 255; // hop limit
-    frame[22..38].copy_from_slice(&vm_gua);       // src
+    frame[22..38].copy_from_slice(&vm_gua); // src
     frame[38..54].copy_from_slice(&ALL_NODES_IP6); // dst ff02::1
-    // ICMPv6 payload (offset 54)
+                                                   // ICMPv6 payload (offset 54)
     frame[54..86].copy_from_slice(&icmp);
 
     let r = unsafe { libc::write(bpf_fd, frame.as_ptr() as *const libc::c_void, frame.len()) };
     if r < 0 {
-        Err(format!(
-            "BPF write: {}",
-            std::io::Error::last_os_error()
-        ))
+        Err(format!("BPF write: {}", std::io::Error::last_os_error()))
     } else {
         Ok(())
     }

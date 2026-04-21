@@ -27,23 +27,120 @@ use pelagos_vz::vm::{Vm, VmConfig};
 use crate::state::StateDir;
 
 // ---------------------------------------------------------------------------
-// PortRouter — port-forward abstraction over Arc<Vm>
+// PortProxy — userspace TCP port-forward listener
 // ---------------------------------------------------------------------------
+//
+// macOS pf RDR rules do not intercept locally-generated loopback packets
+// (the kernel RSTs them before pf's translation hook fires).  A userspace
+// TcpListener bound on 0.0.0.0:host_port is reliable for both localhost and
+// external callers, and requires no root privileges.
 
-/// Routes port-forward add/remove to the utun relay (pf RDR rules via pelagos-pfctl).
+struct PortProxy {
+    shutdown: Arc<AtomicBool>,
+    host_port: u16,
+}
+
+impl PortProxy {
+    fn start(host_port: u16, guest_ip: [u8; 4], container_port: u16) -> Self {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown);
+        std::thread::Builder::new()
+            .name(format!("port-proxy-{host_port}"))
+            .spawn(move || port_proxy_loop(host_port, guest_ip, container_port, shutdown_clone))
+            .expect("spawn port-proxy");
+        PortProxy {
+            shutdown,
+            host_port,
+        }
+    }
+}
+
+impl Drop for PortProxy {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        // Wake the accept() call so the loop can observe the flag.
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.host_port));
+    }
+}
+
+fn port_proxy_loop(
+    host_port: u16,
+    guest_ip: [u8; 4],
+    container_port: u16,
+    shutdown: Arc<AtomicBool>,
+) {
+    let listener = match std::net::TcpListener::bind(("0.0.0.0", host_port)) {
+        Ok(l) => l,
+        Err(e) => {
+            log::error!("port-proxy: bind 0.0.0.0:{host_port}: {e}");
+            return;
+        }
+    };
+    log::info!(
+        "port-proxy: 0.0.0.0:{host_port} -> {}.{}.{}.{}:{container_port}",
+        guest_ip[0],
+        guest_ip[1],
+        guest_ip[2],
+        guest_ip[3]
+    );
+    for stream in listener.incoming() {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        match stream {
+            Ok(client) => {
+                std::thread::spawn(move || relay_tcp(client, guest_ip, container_port));
+            }
+            Err(e) => {
+                if !shutdown.load(Ordering::Relaxed) {
+                    log::warn!("port-proxy: accept: {e}");
+                }
+            }
+        }
+    }
+    log::info!("port-proxy: 0.0.0.0:{host_port} stopped");
+}
+
+fn relay_tcp(client: std::net::TcpStream, guest_ip: [u8; 4], container_port: u16) {
+    let peer = std::net::SocketAddr::from((guest_ip, container_port));
+    let server = match std::net::TcpStream::connect(peer) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("port-proxy: connect to {peer}: {e}");
+            return;
+        }
+    };
+    let client_r = match client.try_clone() {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("port-proxy: clone client: {e}");
+            return;
+        }
+    };
+    let server_r = match server.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("port-proxy: clone server: {e}");
+            return;
+        }
+    };
+    let t = std::thread::spawn(move || {
+        let _ = io::copy(&mut &client_r, &mut &server);
+    });
+    let _ = io::copy(&mut &server_r, &mut &client);
+    let _ = t.join();
+}
+
+/// Routes port-forward add/remove to the userspace TCP proxy.
 struct PortRouter(Arc<Vm>);
 
 impl PortRouter {
-    fn add(&self, host_port: u16, container_port: u16) {
-        if let Err(e) = self.0.add_port_forward("tcp", host_port, container_port) {
-            log::warn!("add_rdr :{host_port}→:{container_port}: {e}");
-        }
+    fn add(&self, host_port: u16, container_port: u16) -> PortProxy {
+        PortProxy::start(host_port, self.0.guest_ip(), container_port)
     }
 
-    fn remove(&self, host_port: u16) {
-        if let Err(e) = self.0.remove_port_forward("tcp", host_port) {
-            log::warn!("remove_rdr :{host_port}: {e}");
-        }
+    fn remove(&self, _host_port: u16) {
+        // Removal is handled by dropping the PortProxy from PortState.
     }
 }
 
@@ -124,13 +221,15 @@ pub enum DaemonResponse {
     Err { message: String },
 }
 
-/// Live port-forward state shared between connection handler threads and (in a
-/// future PR) the subscription watcher thread.
+/// Live port-forward state shared between connection handler threads.
 struct PortState {
     /// Maps host_port → container_port for every currently active forward.
     active: HashMap<u16, u16>,
     /// Maps compose project name → list of host ports it registered.
     compose_projects: HashMap<String, Vec<u16>>,
+    /// Live userspace TCP proxy handles keyed by host_port.
+    /// Dropping a handle stops the proxy listener.
+    proxies: HashMap<u16, PortProxy>,
 }
 
 impl PortState {
@@ -138,6 +237,7 @@ impl PortState {
         Self {
             active: HashMap::new(),
             compose_projects: HashMap::new(),
+            proxies: HashMap::new(),
         }
     }
 }
@@ -324,7 +424,8 @@ pub fn run(args: DaemonArgs) -> ! {
     {
         let mut ps = port_state.lock().unwrap();
         for pf in &args.port_forwards {
-            router.add(pf.host_port, pf.container_port);
+            let proxy = router.add(pf.host_port, pf.container_port);
+            ps.proxies.insert(pf.host_port, proxy);
             ps.active.insert(pf.host_port, pf.container_port);
         }
     }
@@ -563,17 +664,30 @@ fn handle_daemon_cmd(
             container_port,
         } => {
             let mut ps = port_state.lock().unwrap();
-            if let std::collections::hash_map::Entry::Vacant(e) = ps.active.entry(host_port) {
-                router.add(host_port, container_port);
-                e.insert(container_port);
+            if !ps.active.contains_key(&host_port) {
+                let proxy = router.add(host_port, container_port);
+                ps.proxies.insert(host_port, proxy);
+                ps.active.insert(host_port, container_port);
                 log::info!(
                     "[{conn_id:?}] registered port {}:{}",
                     host_port,
                     container_port
                 );
                 DaemonResponse::Ok
+            } else if ps.active[&host_port] == container_port {
+                // Idempotent: same mapping already registered (pre-registered at daemon
+                // startup via --port and now requested again by the run command).
+                log::debug!(
+                    "[{conn_id:?}] port {} already registered with same mapping — ok",
+                    host_port
+                );
+                DaemonResponse::Ok
             } else {
-                let msg = format!("port {} is already registered", host_port);
+                let existing = ps.active[&host_port];
+                let msg = format!(
+                    "port {} is already registered to container port {}",
+                    host_port, existing
+                );
                 log::warn!("[{conn_id:?}] register port: {}", msg);
                 DaemonResponse::Err { message: msg }
             }
@@ -581,7 +695,7 @@ fn handle_daemon_cmd(
         DaemonCmd::UnregisterPort { host_port } => {
             let mut ps = port_state.lock().unwrap();
             if ps.active.remove(&host_port).is_some() {
-                router.remove(host_port);
+                ps.proxies.remove(&host_port); // Drop PortProxy → shuts down listener
                 log::info!("[{conn_id:?}] unregistered port {}", host_port);
             }
             DaemonResponse::Ok
