@@ -170,10 +170,118 @@ Inbound IPv6 reply arrives at en0
 
 ---
 
-## Known limitations
+## Current status
 
-| Limitation | Issue | Notes |
+### What works
+
+- **SLAAC end-to-end** — relay detects host /64, synthesises RA, VM self-assigns GUA.
+- **Outbound IPv6** — VM → utun10 → kernel routing → en0 → internet, no NAT.
+- **Inbound IPv6 (immediately after alias time)** — host route `/128` + gratuitous NA +
+  unicast probe NS seed the router's NDP cache at alias time; return traffic is delivered.
+- **Both gateway addresses resolve** — `fe80::1` and `fd00::1` both answer NDP NS.
+
+### What doesn't work / known gaps
+
+**Inbound reachability expires after ~30 s idle (Phase 2 not done, #250).**
+Router NDP caches expire.  After the first expiry the router re-probes with NS for
+`vm_gua` — nobody answers — and marks it incomplete.  Recovery happens the next time
+the VM sends an outbound packet (re-triggering the gratuitous NA), but there is a
+window of broken inbound.  Active connections and bulk transfers are unlikely to hit
+this; inbound connection attempts from the LAN will be flaky.  Phase 2 is a BPF
+listener on en0 that answers ongoing NS probes.
+
+**IPv6 inside containers (#244).**
+Container network namespaces get IPv4 NAT only.  No GUA, no SLAAC, no NDP proxy.
+
+**Prefix mobility not handled (#248).**
+If the host moves to a different network, the VM's GUA becomes invalid.  The relay
+does not re-issue RA or update the host route.  VM requires restart to recover.
+
+**~60 s delay before IPv6 is functional.**
+The alias and NDP seeding fire on the first GUA-sourced packet, which only arrives
+after SLAAC completes.  In practice 50–70 s after VM start.
+
+---
+
+## Edge cases
+
+**Router ignores gratuitous NAs.**
+Some managed routers enforce RA Guard / RFC 6583 and refuse unsolicited NAs.  In that
+case only the probe NS exchange seeds the cache.  If the router's MAC is absent from
+the host NDP table at alias time, the probe NS is skipped and only the gratuitous NA
+is sent — which may silently fail.  Phase 2 (BPF listener responding to the router's
+NS probe) is the reliable fix; that exchange is always accepted.
+
+**Host NDP entry for router is stale at alias time.**
+`get_ndp_mac` reads `ndp -an`.  If the host hasn't talked to the router recently,
+the entry may be absent and the unicast probe NS is skipped entirely with a warning.
+
+**Multiple simultaneous VMs.**
+Each profile gets a distinct /24 for IPv4; all VMs share the host's /64 for IPv6.
+Each VM gets its own EUI-64 GUA.  `ipv6_aliases` in the pfctl daemon is a Vec and
+handles multiple entries; teardown cleans them individually.  Functionally correct,
+but with Phase 2 absent each VM needs a separate NDP cache maintenance pass.
+
+**VM MAC (and GUA) changes on every restart.**
+virtio generates a random MAC each boot.  The GUA is EUI-64-derived, so it changes
+too.  Teardown removes the stale host route; the router's NDP cache expires naturally.
+This is correct but means the VM's IPv6 address is not stable — relevant if LAN hosts
+are trying to reach the VM directly.
+
+**Host has no GUA.**
+Handled gracefully: relay logs a warning and skips RA synthesis.  VM gets no IPv6.
+No crash, no hang.
+
+---
+
+## Performance
+
+The relay path is:
+
+```
+VM → vsock socketpair → relay userspace → utun fd write → kernel → en0
+```
+
+One userspace hop with a non-blocking write.  Measured RTT overhead vs. the host's
+own `ping6` is negligible (sub-ms).  The bottleneck for throughput is the vsock
+socketpair buffer (128 KB / 512 KB), not IPv6 logic.
+
+The 60-second SLAAC delay is the main usability concern — not packet throughput.
+
+---
+
+## Security
+
+**VM is a full LAN peer.**
+The host advertises `vm_gua → en0_mac` to the upstream router.  Any host on the same
+/64 can attempt direct connections to the VM's open ports.  There is no pf filter
+between en0 and utun10 for IPv6 (unlike IPv4 where NAT is the implicit firewall).
+Services bound on the VM are directly reachable from the LAN.
+
+**BPF raw frame injection runs as root.**
+The pfctl daemon opens `/dev/bpf` and writes raw Ethernet frames (gratuitous NA,
+probe NS).  A bug in frame construction could inject malformed or spoofed frames onto
+en0.  The code is simple and auditable, but it is a privilege surface.
+
+**Host IP forwarding (`ip6.forwarding = 1`).**
+The host will forward IPv6 packets between all interfaces.  Only the `/128` host route
+for `vm_gua` points to utun10, so the surface is narrow, but a pf rule explicitly
+restricting inbound-to-utun10 forwarding to `vm_gua` only would close it properly.
+
+**GUA source is not validated.**
+The relay forwards any IPv6 packet from the VM regardless of source address.  A
+compromised VM could send packets with a spoofed source in the /64 (or any prefix).
+pf on the host does not currently validate that outbound IPv6 is sourced from the
+known `vm_gua`.
+
+---
+
+## Priority order for remaining work
+
+| Work | Issue | Why |
 |---|---|---|
-| NDP cache expiry breaks inbound after ~30 s idle | #250 Phase 2 | BPF listener needed |
-| Prefix mobility (host roams to new network) | #248 | Re-issue RA when GUA prefix changes |
-| IPv6 assignment inside container network namespaces | #244 | Post-SLAAC work |
+| Phase 2 BPF NS listener on en0 | #250 | Inbound reachability breaks during idle without it |
+| pf rules: restrict IPv6 forwarding to vm_gua only | — | Close LAN→utun10 forwarding surface |
+| Prefix mobility | #248 | Correctness on network change / roaming |
+| IPv6 in container namespaces | #244 | Feature completeness |
+| Stable VM MAC across restarts | — | Stable GUA; simpler NDP cache lifecycle |
