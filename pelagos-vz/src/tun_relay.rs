@@ -62,6 +62,10 @@ const GATEWAY_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 // GATEWAY_IP4 is per-VM (stored in RelayState).
 // GATEWAY_IP6_LL is the link-local gateway address advertised in the RA and answered by NDP.
 const GATEWAY_IP6_LL: [u8; 16] = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+// GATEWAY_IP6_ULA is the ULA anchor address (fd00::1/128) added to the utun interface so the
+// kernel accepts host routes via it.  The VM static network config uses fd00::1 as the default
+// IPv6 gateway, so we must answer NDP NS for it here (the kernel routes it via lo0, not utun).
+const GATEWAY_IP6_ULA: [u8; 16] = [0xfd, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 // Ethernet multicast destination for IPv6 all-nodes (ff02::1).
 const ALL_NODES_MAC: [u8; 6] = [0x33, 0x33, 0x00, 0x00, 0x00, 0x01];
 const ALL_NODES_IP6: [u8; 16] = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
@@ -523,9 +527,10 @@ fn handle_ndp_ns(frame: &[u8], relay_fd: RawFd, state: &RelayState) -> bool {
         Err(_) => return false,
     };
 
-    // Only respond for our link-local gateway address (fe80::1).
-    // The VM's default route (from the RA) is via fe80::1, so it will NS for it.
-    if target != GATEWAY_IP6_LL {
+    // Respond for fe80::1 (RA-advertised default router) and fd00::1 (ULA anchor / static
+    // default gateway in the VM network config).  The kernel routes fd00::1 via lo0, so NDP
+    // NS for it would never get a reply unless we synthesise the NA here.
+    if target != GATEWAY_IP6_LL && target != GATEWAY_IP6_ULA {
         return false;
     }
 
