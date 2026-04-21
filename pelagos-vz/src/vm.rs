@@ -330,6 +330,10 @@ impl Vm {
         &self.config
     }
 
+    pub fn guest_ip(&self) -> [u8; 4] {
+        self.guest_ip
+    }
+
     /// Request a clean shutdown (ACPI power-off) and wait until the VM
     /// reaches the Stopped state.
     ///

@@ -556,7 +556,7 @@ if suite_active E; then
 
     # TC-T2-14: exec works in restarted container
     if [ -n "$E_CONT" ]; then
-        E_EXEC=$(pelagos exec-into "$E_CONT" uname -s 2>&1 | tr -d '\r\n')
+        E_EXEC=$(pelagos exec "$E_CONT" uname -s 2>&1 | tr -d '\r\n')
         if [ "$E_EXEC" = "Linux" ]; then
             pass "TC-T2-14: exec works in restarted container: uname -s = Linux"
         else

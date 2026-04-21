@@ -11,12 +11,9 @@
 #   - make sign    (builds and signs target/aarch64-apple-darwin/release/pelagos)
 #
 # Cold-start timing note:
-#   The --cold mode stops the daemon and boots a fresh VM. socket_vmnet provides
-#   NAT via vmnet.framework (VMNET_SHARED_MODE); the first boot after a long idle
-#   period may take ~2-5 s for the gateway to establish.
-#
-# If image pulls fail with "error sending request", socket_vmnet NAT has degraded.
-# Fix with: sudo brew services restart socket_vmnet
+#   The --cold mode stops the daemon and boots a fresh VM. NAT is provided by
+#   the utun/pf relay inside pelagos-mac; the first boot may take ~2-5 s
+#   for the guest network to come up.
 
 set -uo pipefail
 
@@ -229,8 +226,13 @@ echo "=== test 7: exec (non-tty) ==="
 pelagos ping > /dev/null 2>&1 || true
 sleep 1
 
+# Start a named detached container to exec into.
+EXEC_CTR="pelagos-exec-$$"
+pelagos run --detach --name "$EXEC_CTR" "$TEST_IMAGE" /bin/sh -c "sleep 30" > /dev/null 2>&1
+sleep 1
+
 # Simple exec: output from echo
-OUT=$(pelagos exec "$TEST_IMAGE" /bin/echo hello)
+OUT=$(pelagos exec "$EXEC_CTR" /bin/echo hello)
 echo "$OUT" | grep -v "^\["
 if echo "$OUT" | grep -q "^hello$"; then
     pass "exec: output correct"
@@ -239,13 +241,16 @@ else
 fi
 
 # Stdin forwarding: pipe data to cat
-OUT=$(echo "hello from stdin" | pelagos exec "$TEST_IMAGE" cat)
+OUT=$(echo "hello from stdin" | pelagos exec "$EXEC_CTR" cat)
 echo "$OUT" | grep -v "^\["
 if echo "$OUT" | grep -q "hello from stdin"; then
     pass "exec: stdin forwarded and echoed back"
 else
     fail "exec: expected 'hello from stdin', got: $(echo "$OUT" | grep -v '^\[')"
 fi
+
+pelagos stop "$EXEC_CTR" > /dev/null 2>&1 || true
+pelagos rm   "$EXEC_CTR" > /dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 # Test 7a: vm shell (non-TTY) — shell directly in the VM, not in a container
@@ -318,13 +323,18 @@ fi
 
 echo ""
 echo "=== test 7d: exec -t (tty mode) ==="
-OUT=$(pelagos exec -t "$TEST_IMAGE" /bin/echo hello-tty 2>&1 | tr -d '\r')
+EXEC_CTR_TTY="pelagos-exec-tty-$$"
+pelagos run --detach --name "$EXEC_CTR_TTY" "$TEST_IMAGE" /bin/sh -c "sleep 30" > /dev/null 2>&1
+sleep 1
+OUT=$(pelagos exec -t "$EXEC_CTR_TTY" /bin/echo hello-tty 2>&1 | tr -d '\r')
 echo "$OUT" | grep -v "^\["
 if echo "$OUT" | grep -q "hello-tty"; then
     pass "exec -t: PTY output correct"
 else
     fail "exec -t: expected 'hello-tty', got: $(echo "$OUT" | grep -v '^\[')"
 fi
+pelagos stop "$EXEC_CTR_TTY" > /dev/null 2>&1 || true
+pelagos rm   "$EXEC_CTR_TTY" > /dev/null 2>&1 || true
 
 # Stop daemon so port-forward and lifecycle tests get a clean slate.
 pelagos vm stop > /dev/null 2>&1 || true
@@ -616,6 +626,9 @@ fi
 
 echo ""
 echo "=== test 7s: docker volume create/ls/rm ==="
+# Ensure daemon is alive — test 7r stops it; a dead daemon fakes volume ops silently.
+pelagos ping > /dev/null 2>&1 || true
+sleep 1
 VOL_NAME="pelagos-e2e-vol-$$"
 shim volume create "$VOL_NAME" > /dev/null 2>&1; CREATE_EXIT=$?
 LS_OUT=$(shim volume ls 2>&1)
@@ -855,7 +868,7 @@ if [ "$FAIL" -eq 0 ]; then
 else
     echo "FAIL  ($FAIL failed, $PASS passed)"
     echo ""
-    echo "If image pulls are failing with 'error sending request', socket_vmnet"
-    echo "NAT has degraded. Fix with:  sudo brew services restart socket_vmnet"
+    echo "If image pulls are failing with 'error sending request', the utun/pf"
+    echo "NAT relay may have stalled. Fix with:  pelagos vm stop && pelagos ping"
     exit 1
 fi
