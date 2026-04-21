@@ -14,7 +14,9 @@
 //!     → assigns IPv4 P2P address, enables ip4/ip6 forwarding, loads NAT44 pf anchor.
 //!   {"action":"assign_utun_alias","iface":"utun5","addr":"2601:x:y:z::a1b2"}
 //!     → aliases a GUA to the utun so the kernel delivers inbound IPv6 to the VM.
-//!       Called by the relay after observing the VM's SLAAC DAD Neighbour Solicitation.
+//!       Called by the relay after observing the VM's SLAAC DAD completion.
+//!       Also sends an unsolicited Neighbour Advertisement on the egress interface
+//!       (e.g. en0) to populate the upstream router's NDP cache immediately.
 //!   {"action":"teardown_utun","iface":"utun5"}
 //!   {"action":"add_rdr","proto":"tcp","host_port":2222,
 //!    "vm_ip":"192.168.105.2","vm_port":22}
@@ -316,6 +318,15 @@ fn handle_setup_utun(
         return err_resp(format!("ifconfig inet: {e}"));
     }
 
+    // Add an IPv6 anchor address (fd00::1/128) so the kernel accepts host
+    // routes via this interface.  macOS silently rejects `route add -inet6
+    // -host ... -interface <iface>` with ENETUNREACH when the interface has
+    // no IPv6 address at all.  A /128 creates only a local (lo0) host route
+    // for fd00::1 — no /64 prefix, no NDP entries on en0.
+    // The VM's guest daemon configures fd00::2/64 on its side; fd00::1/128
+    // here is the matching host anchor.
+    let _ = run_ifconfig(&[iface, "inet6", "fd00::1", "prefixlen", "128", "alias"]);
+
     // 2. Enable kernel IPv4 forwarding for NAT44 (utun → egress).
     //    IPv6 forwarding is also needed so packets from utun can be routed to
     //    the egress interface (VM → internet without NAT).
@@ -363,12 +374,14 @@ fn handle_teardown_utun(iface: &str, state: &mut DaemonState) -> Response {
     // Remove any GUA aliases assigned to this utun via assign_utun_alias.
     state.ipv6_aliases.retain(|(alias_iface, addr)| {
         if alias_iface == iface {
-            let _ = run_ifconfig(&[iface, "inet6", addr.as_str(), "-alias"]);
+            let _ = run_route(&["delete", "-inet6", "-host", addr.as_str()]);
             false // remove from list
         } else {
             true
         }
     });
+    // Remove the IPv6 anchor address added at setup time.
+    let _ = run_ifconfig(&[iface, "inet6", "fd00::1", "-alias"]);
     // Bring the interface down to clear the P2P IPv4 address and associated routes.
     // macOS utun interfaces persist after their fd closes; bringing them down
     // prevents the zombie from holding a stale route for the guest IP.
@@ -384,16 +397,73 @@ fn handle_assign_utun_alias(iface: &str, addr: &str, state: &mut DaemonState) ->
     if !is_safe_iface(iface) {
         return err_resp("invalid interface name");
     }
-    if addr.parse::<std::net::Ipv6Addr>().is_err() {
-        return err_resp(format!("invalid IPv6 address: {addr:?}"));
+    let gua: std::net::Ipv6Addr = match addr.parse() {
+        Ok(a) => a,
+        Err(_) => return err_resp(format!("invalid IPv6 address: {addr:?}")),
+    };
+    // Add a host route for vm_gua via the utun interface instead of an ifconfig
+    // alias.  An ifconfig inet6 alias on a P2P tunnel always creates a /64
+    // neighbor entry regardless of the prefixlen argument; the kernel then tries
+    // NDP resolution into the tunnel, gets nothing, stays INCOMPLETE, and drops
+    // inbound packets.  A direct host route bypasses NDP entirely.
+    if let Err(e) = run_route(&["add", "-inet6", "-host", addr, "-interface", iface]) {
+        return err_resp(format!("route add -inet6 -host: {e}"));
     }
-    if let Err(e) = run_ifconfig(&[iface, "inet6", addr, "alias"]) {
-        return err_resp(format!("ifconfig inet6 alias: {e}"));
-    }
-    log::info!("assigned IPv6 alias {addr} to {iface}");
+    log::info!("added host route {addr} → {iface}");
     state
         .ipv6_aliases
         .push((iface.to_string(), addr.to_string()));
+
+    // Send an unsolicited Neighbour Advertisement on the egress interface to
+    // populate the upstream router's NDP cache.  This resolves "who has
+    // <vm_gua>?" before the router ever asks — or, if the router already has
+    // an INCOMPLETE entry (it tried and failed), the NA with O=1 will update
+    // that entry to REACHABLE immediately.
+    if let Some(egress) = &state.egress_iface {
+        let egress = egress.clone();
+        match get_iface_mac(&egress) {
+            Ok(mac) => match open_bpf(&egress) {
+                Ok(bpf_fd) => {
+                    let gua_bytes = gua.octets();
+                    match send_gratuitous_na(bpf_fd, mac, gua_bytes) {
+                        Ok(()) => log::info!("sent gratuitous NA for {addr} on {egress}"),
+                        Err(e) => log::warn!("gratuitous NA send failed: {e}"),
+                    }
+                    // Send a unicast probe NS from vm_gua to the upstream router so
+                    // the router creates a cache entry for vm_gua → en0_mac.
+                    // The NS is sent with Ethernet dst = router_mac (unicast), so our
+                    // own en0 NIC discards the frame — preventing the host's NDP stack
+                    // from creating a spurious en0 entry that would override the utun10
+                    // host route.
+                    match detect_ipv6_gateway(&egress) {
+                        Some(router) => match get_ndp_mac(router) {
+                            Some(router_mac) => {
+                                match send_ndp_probe_ns(bpf_fd, mac, router_mac, gua_bytes, router)
+                                {
+                                    Ok(()) => log::info!(
+                                        "sent unicast NDP probe NS for {addr} on {egress}"
+                                    ),
+                                    Err(e) => log::warn!("NDP probe NS failed: {e}"),
+                                }
+                            }
+                            None => log::warn!(
+                                "router MAC not in NDP table yet, skipping NS probe"
+                            ),
+                        },
+                        None => {
+                            log::warn!("no IPv6 default gateway on {egress}, skipping NS probe")
+                        }
+                    }
+                    unsafe { libc::close(bpf_fd) };
+                }
+                Err(e) => log::warn!("open_bpf({egress}): {e}"),
+            },
+            Err(e) => log::warn!("get_iface_mac({egress}): {e}"),
+        }
+    } else {
+        log::warn!("assign_utun_alias: no egress_iface in state, skipping gratuitous NA");
+    }
+
     ok_resp()
 }
 
@@ -603,6 +673,292 @@ fn handle_create_utun_with_fd(stream: &std::os::unix::net::UnixStream) {
 }
 
 // ---------------------------------------------------------------------------
+// NDP proxy helpers — gratuitous NA via BPF raw injection
+// ---------------------------------------------------------------------------
+
+// BIOCSETIF = _IOW('B', 108, struct ifreq) on macOS.
+// sizeof(struct ifreq) on arm64 macOS = ifr_name[16] + union sockaddr(16) = 32.
+const BIOCSETIF: libc::c_ulong = 0x8020_426c;
+
+/// Minimal ifreq layout: only ifr_name is read by BIOCSETIF.
+#[repr(C)]
+struct Ifreq {
+    ifr_name: [libc::c_char; 16],
+    _ifr_union: [u8; 16],
+}
+
+/// Read the Ethernet MAC address of `iface` from `ifconfig` output.
+fn get_iface_mac(iface: &str) -> Result<[u8; 6], String> {
+    let out = Command::new("/sbin/ifconfig")
+        .arg(iface)
+        .output()
+        .map_err(|e| format!("ifconfig {iface}: {e}"))?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    for line in s.lines() {
+        if let Some(rest) = line.trim().strip_prefix("ether ") {
+            let mac_str = rest.split_whitespace().next().unwrap_or("");
+            let parts: Vec<u8> = mac_str
+                .split(':')
+                .filter_map(|x| u8::from_str_radix(x, 16).ok())
+                .collect();
+            if parts.len() == 6 {
+                return Ok([parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]]);
+            }
+        }
+    }
+    Err(format!("no MAC address found for {iface}"))
+}
+
+/// Open the first available `/dev/bpfN` device and attach it to `iface`.
+/// Returns the raw fd; caller must close it.
+fn open_bpf(iface: &str) -> Result<i32, String> {
+    for i in 0..10u32 {
+        let path = CString::new(format!("/dev/bpf{i}")).unwrap();
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR) };
+        if fd < 0 {
+            continue; // device busy or past the end
+        }
+        let mut ifr: Ifreq = unsafe { std::mem::zeroed() };
+        let name_bytes = iface.as_bytes();
+        let copy_len = name_bytes.len().min(15);
+        for (dst, &src) in ifr.ifr_name[..copy_len].iter_mut().zip(name_bytes) {
+            *dst = src as libc::c_char;
+        }
+        let r = unsafe { libc::ioctl(fd, BIOCSETIF, &ifr) };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(format!("BIOCSETIF /dev/bpf{i} {iface}: {e}"));
+        }
+        return Ok(fd);
+    }
+    Err(format!("no available /dev/bpf device for {iface}"))
+}
+
+/// Compute ICMPv6 checksum over the IPv6 pseudo-header and `payload`
+/// (with the checksum field zeroed).  Per RFC 4443 §2.3.
+fn icmpv6_checksum(src: &[u8; 16], dst: &[u8; 16], payload: &[u8]) -> u16 {
+    // Pseudo-header: src(16) + dst(16) + upper-layer length(4) + zeros(3) + next-header(1)
+    let ulen = payload.len() as u32;
+    let pseudo = {
+        let mut p = [0u8; 40];
+        p[0..16].copy_from_slice(src);
+        p[16..32].copy_from_slice(dst);
+        p[32..36].copy_from_slice(&ulen.to_be_bytes());
+        // p[36..39] = 0 (zeroed)
+        p[39] = 58; // next-header = ICMPv6
+        p
+    };
+
+    let mut sum: u32 = 0;
+    let mut add = |bytes: &[u8]| {
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            sum += u16::from_be_bytes([bytes[i], bytes[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < bytes.len() {
+            sum += (bytes[i] as u32) << 8;
+        }
+    };
+    add(&pseudo);
+    add(payload);
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Parse the default IPv6 gateway for `egress` from `netstat -rn -f inet6`.
+///
+/// Returns the gateway address (link-local or global) as raw bytes, without
+/// any zone-id suffix.  Returns None if no default route is found.
+fn detect_ipv6_gateway(egress: &str) -> Option<[u8; 16]> {
+    let out = Command::new("/usr/sbin/netstat")
+        .args(["-rn", "-f", "inet6"])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    for line in s.lines() {
+        // e.g. "default  fe80::1afd:74ff:fec2:614f%en0  UGcg  en0"
+        // Use `else { continue }` — `?` inside a loop exits the whole function.
+        let mut fields = line.split_whitespace();
+        let Some(dest) = fields.next() else { continue };
+        let Some(gw_raw) = fields.next() else { continue };
+        let Some(_flags) = fields.next() else { continue };
+        let Some(iface) = fields.next() else { continue };
+        if dest == "default" && iface == egress {
+            let gw_str = gw_raw.split('%').next().unwrap_or(gw_raw);
+            if let Ok(ip6) = gw_str.parse::<std::net::Ipv6Addr>() {
+                return Some(ip6.octets());
+            }
+        }
+    }
+    None
+}
+
+/// Look up the link-layer address of `addr` in the local NDP table (`ndp -an`).
+/// Returns None if the entry is absent or unresolved (INCOMPLETE).
+fn get_ndp_mac(addr: [u8; 16]) -> Option<[u8; 6]> {
+    let target = std::net::Ipv6Addr::from(addr).to_string();
+    let out = Command::new("/usr/sbin/ndp")
+        .args(["-an"])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    for line in s.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(entry_raw) = fields.next() else {
+            continue;
+        };
+        // Strip zone ID (e.g. "%en0") before comparing.
+        let entry_addr = entry_raw.split('%').next().unwrap_or(entry_raw);
+        if entry_addr != target {
+            continue;
+        }
+        let Some(mac_str) = fields.next() else {
+            continue;
+        };
+        // Skip unresolved entries (shown as "(incomplete)" etc.)
+        if !mac_str.contains(':') {
+            continue;
+        }
+        let parts: Vec<&str> = mac_str.split(':').collect();
+        if parts.len() != 6 {
+            continue;
+        }
+        let mut mac = [0u8; 6];
+        for (i, p) in parts.iter().enumerate() {
+            mac[i] = u8::from_str_radix(p, 16).ok()?;
+        }
+        return Some(mac);
+    }
+    None
+}
+
+/// Inject a **unicast** Neighbour Solicitation from `vm_gua` (SLLA=`en0_mac`)
+/// targeting `router` via `bpf_fd`, with Ethernet dst = `router_mac`.
+///
+/// Sending unicast (Ethernet dst = router_mac, not a multicast address) means
+/// the frame is delivered only to the router.  Our own en0 NIC discards it
+/// because dst_mac ≠ en0_mac — so the host's NDP stack never processes the
+/// frame and never creates a spurious cache entry for vm_gua on en0.
+///
+/// The router, per RFC 4861 §7.2.3, creates a Neighbor Cache entry for
+/// `vm_gua → en0_mac` (STALE) on receipt, enabling it to deliver return
+/// packets to vm_gua without an additional NS/NA round-trip.
+///
+/// Frame: Ethernet (unicast) → IPv6 → ICMPv6 NS (type 135)
+///   eth dst: router_mac  (unicast — host NIC will not pass this up the stack)
+///   eth src: en0_mac
+///   ip6 src: vm_gua
+///   ip6 dst: router (unicast)
+///   target:  router
+///   option:  SLLA (type 1) = en0_mac
+fn send_ndp_probe_ns(
+    bpf_fd: i32,
+    en0_mac: [u8; 6],
+    router_mac: [u8; 6],
+    vm_gua: [u8; 16],
+    router: [u8; 16],
+) -> Result<(), String> {
+    // ICMPv6 NS payload (32 bytes):
+    //   type(1) code(1) checksum(2) reserved(4) target(16) SLLA-option(8)
+    let mut icmp = [0u8; 32];
+    icmp[0] = 135; // NS
+                   // [1] code = 0, [2..4] checksum, [4..8] reserved = 0
+    icmp[8..24].copy_from_slice(&router); // target
+    icmp[24] = 1; // option type: Source Link-Layer Address
+    icmp[25] = 1; // length in units of 8 bytes
+    icmp[26..32].copy_from_slice(&en0_mac);
+    // Checksum pseudo-header uses the unicast router address as dst.
+    let csum = icmpv6_checksum(&vm_gua, &router, &icmp);
+    icmp[2..4].copy_from_slice(&csum.to_be_bytes());
+
+    let mut frame = [0u8; 86];
+    frame[0..6].copy_from_slice(&router_mac); // Ethernet dst: unicast to router
+    frame[6..12].copy_from_slice(&en0_mac);
+    frame[12..14].copy_from_slice(&[0x86, 0xdd]);
+    frame[14] = 0x60; // IPv6
+    frame[18..20].copy_from_slice(&32u16.to_be_bytes()); // payload length
+    frame[20] = 58;   // ICMPv6
+    frame[21] = 255;  // hop limit
+    frame[22..38].copy_from_slice(&vm_gua);  // src
+    frame[38..54].copy_from_slice(&router);  // dst: unicast router address
+    frame[54..86].copy_from_slice(&icmp);
+
+    let r = unsafe { libc::write(bpf_fd, frame.as_ptr() as *const libc::c_void, frame.len()) };
+    if r < 0 {
+        Err(format!(
+            "BPF write NS: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Build and inject an unsolicited Neighbour Advertisement for `vm_gua` onto
+/// the link via `bpf_fd`.  Advertises `en0_mac` as the link-layer address so
+/// the upstream router updates its NDP cache (INCOMPLETE → REACHABLE) without
+/// waiting for a probe/reply cycle.
+///
+/// Frame: Ethernet → IPv6 → ICMPv6 NA (type 136)
+///   dst:    ff02::1 / 33:33:00:00:00:01  (all-nodes multicast)
+///   src:    vm_gua  / en0_mac
+///   flags:  O=1 (override — forces cache update for existing entries)
+///   target: vm_gua
+///   option: TLLA (type 2) = en0_mac
+fn send_gratuitous_na(bpf_fd: i32, en0_mac: [u8; 6], vm_gua: [u8; 16]) -> Result<(), String> {
+    const ALL_NODES_MAC: [u8; 6] = [0x33, 0x33, 0x00, 0x00, 0x00, 0x01];
+    const ALL_NODES_IP6: [u8; 16] = [
+        0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+    ];
+
+    // ICMPv6 NA payload (32 bytes):
+    //   type(1) code(1) checksum(2) flags(4) target(16) TLLA-option(8)
+    let mut icmp = [0u8; 32];
+    icmp[0] = 136; // NA
+    icmp[1] = 0;   // code
+    // [2..4] checksum — filled below
+    icmp[4] = 0x20; // R=0 S=0 O=1 → byte 4 of the flags word = 0b0010_0000
+    icmp[8..24].copy_from_slice(&vm_gua);
+    icmp[24] = 2; // option type: Target Link-Layer Address
+    icmp[25] = 1; // option length in units of 8 bytes
+    icmp[26..32].copy_from_slice(&en0_mac);
+
+    let csum = icmpv6_checksum(&vm_gua, &ALL_NODES_IP6, &icmp);
+    icmp[2..4].copy_from_slice(&csum.to_be_bytes());
+
+    // Full Ethernet + IPv6 + ICMPv6 frame = 14 + 40 + 32 = 86 bytes.
+    let mut frame = [0u8; 86];
+    // Ethernet header
+    frame[0..6].copy_from_slice(&ALL_NODES_MAC);
+    frame[6..12].copy_from_slice(&en0_mac);
+    frame[12..14].copy_from_slice(&[0x86, 0xdd]); // ethertype IPv6
+    // IPv6 header (offset 14)
+    frame[14] = 0x60; // version=6, TC=0, FL=0
+    // [15..18] = 0 (TC/FL continued)
+    frame[18..20].copy_from_slice(&32u16.to_be_bytes()); // payload length
+    frame[20] = 58;  // next-header = ICMPv6
+    frame[21] = 255; // hop limit
+    frame[22..38].copy_from_slice(&vm_gua);       // src
+    frame[38..54].copy_from_slice(&ALL_NODES_IP6); // dst ff02::1
+    // ICMPv6 payload (offset 54)
+    frame[54..86].copy_from_slice(&icmp);
+
+    let r = unsafe { libc::write(bpf_fd, frame.as_ptr() as *const libc::c_void, frame.len()) };
+    if r < 0 {
+        Err(format!(
+            "BPF write: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // System command helpers
 // ---------------------------------------------------------------------------
 
@@ -645,11 +1001,17 @@ fn run_route(args: &[&str]) -> Result<(), String> {
         .args(args)
         .output()
         .map_err(|e| format!("exec /sbin/route: {e}"))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    // macOS `route` often exits 0 even when the kernel rejects the route,
+    // printing the error to stderr instead.  Treat any stderr output as failure.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() || !stderr.trim().is_empty() {
+        return Err(format!(
+            "{}{}",
+            stderr,
+            String::from_utf8_lossy(&out.stdout)
+        ));
     }
+    Ok(())
 }
 
 fn run_ifconfig(args: &[&str]) -> Result<(), String> {
