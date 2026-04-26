@@ -25,6 +25,7 @@
 //! Response: {"ok":true} | {"ok":false,"error":"..."} | {"ok":true,"active":true}
 //!           create_utun additionally sends the utun fd as SCM_RIGHTS ancillary data.
 
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -74,18 +75,18 @@ struct SockaddrCtl {
 // Daemon state (shared across sequential connection handling)
 // ---------------------------------------------------------------------------
 
+/// Per-utun relay state, tracked separately for each active VM profile.
+struct UtunSetup {
+    egress_iface: String,
+    ipv4_cidr: String,
+}
+
 struct DaemonState {
-    /// utun interface currently active (set by setup_utun, cleared by teardown_utun).
-    utun_iface: Option<String>,
-    /// Egress interface used by the active utun setup — needed for RDR rules.
-    egress_iface: Option<String>,
-    /// VM subnet CIDR (e.g. "192.168.105.0/24") for the NAT and pass rules.
-    ipv4_cidr: Option<String>,
+    /// Active utun relays keyed by interface name (e.g. "utun10", "utun12").
+    /// Each VM profile gets its own entry so their NAT rules coexist.
+    active_utuns: HashMap<String, UtunSetup>,
     /// Active port-forward rules, rebuilt into the combined anchor on every change.
     rdr_rules: Vec<RdrRule>,
-    /// Number of utun relays currently set up. IP forwarding is only disabled
-    /// when this reaches zero, preventing a racing teardown from killing a live relay.
-    active_utun_count: u32,
     /// GUA aliases assigned to utun interfaces via assign_utun_alias.
     /// Removed on teardown_utun for the corresponding interface.
     ipv6_aliases: Vec<(String, String)>,
@@ -102,11 +103,8 @@ struct RdrRule {
 impl DaemonState {
     fn new() -> Self {
         Self {
-            utun_iface: None,
-            egress_iface: None,
-            ipv4_cidr: None,
+            active_utuns: HashMap::new(),
             rdr_rules: Vec::new(),
-            active_utun_count: 0,
             ipv6_aliases: Vec::new(),
         }
     }
@@ -359,10 +357,13 @@ fn handle_setup_utun(
         ipv4_cidr,
     ]);
 
-    state.utun_iface = Some(iface.to_string());
-    state.egress_iface = Some(egress_iface.to_string());
-    state.ipv4_cidr = Some(ipv4_cidr.to_string());
-    state.active_utun_count += 1;
+    state.active_utuns.insert(
+        iface.to_string(),
+        UtunSetup {
+            egress_iface: egress_iface.to_string(),
+            ipv4_cidr: ipv4_cidr.to_string(),
+        },
+    );
 
     let _ = Command::new("/sbin/pfctl").arg("-e").output();
     let resp = reload_nat_anchor(state);
@@ -374,9 +375,8 @@ fn handle_setup_utun(
 }
 
 fn handle_teardown_utun(iface: &str, state: &mut DaemonState) -> Response {
-    // Decrement active relay count; only flush global state when the last relay stops.
-    state.active_utun_count = state.active_utun_count.saturating_sub(1);
-    let last_relay = state.active_utun_count == 0;
+    state.active_utuns.remove(iface);
+    let last_relay = state.active_utuns.is_empty();
 
     if last_relay {
         // Flush the combined NAT/RDR/filter anchor — ignore errors (may not be active).
@@ -384,10 +384,10 @@ fn handle_teardown_utun(iface: &str, state: &mut DaemonState) -> Response {
         // Disable IP forwarding only when no utun relays remain.
         let _ = run_sysctl_set("net.inet.ip.forwarding", "0");
         let _ = run_sysctl_set("net.inet6.ip6.forwarding", "0");
-        state.utun_iface = None;
-        state.egress_iface = None;
-        state.ipv4_cidr = None;
         state.rdr_rules.clear();
+    } else {
+        // Other VMs still active — rebuild anchor without this utun's subnet.
+        let _ = reload_nat_anchor(state);
     }
     // Remove any GUA aliases assigned to this utun via assign_utun_alias.
     state.ipv6_aliases.retain(|(alias_iface, addr)| {
@@ -406,7 +406,7 @@ fn handle_teardown_utun(iface: &str, state: &mut DaemonState) -> Response {
     let _ = run_ifconfig(&[iface, "down"]);
     log::info!(
         "utun relay teardown: iface={iface} (remaining={})",
-        state.active_utun_count
+        state.active_utuns.len()
     );
     ok_resp()
 }
@@ -437,8 +437,8 @@ fn handle_assign_utun_alias(iface: &str, addr: &str, state: &mut DaemonState) ->
     // <vm_gua>?" before the router ever asks — or, if the router already has
     // an INCOMPLETE entry (it tried and failed), the NA with O=1 will update
     // that entry to REACHABLE immediately.
-    if let Some(egress) = &state.egress_iface {
-        let egress = egress.clone();
+    if let Some(setup) = state.active_utuns.get(iface) {
+        let egress = setup.egress_iface.clone();
         match get_iface_mac(&egress) {
             Ok(mac) => match open_bpf(&egress) {
                 Ok(bpf_fd) => {
@@ -528,12 +528,24 @@ fn handle_remove_rdr(proto: &str, host_port: u16, state: &mut DaemonState) -> Re
 fn reload_nat_anchor(state: &DaemonState) -> Response {
     let mut rules = String::new();
 
-    // Translation section: NAT (IPv4 masquerade) — only when egress is known.
-    if let (Some(egress), Some(cidr)) = (&state.egress_iface, &state.ipv4_cidr) {
+    // Translation section: one NAT masquerade rule per active utun relay.
+    // Iterating a HashMap is non-deterministic, but pf evaluates NAT rules
+    // first-match; since each rule covers a distinct CIDR there is no overlap.
+    for setup in state.active_utuns.values() {
+        let egress = &setup.egress_iface;
+        let cidr = &setup.ipv4_cidr;
         rules.push_str(&format!(
             "nat on {egress} inet from {cidr} to any -> ({egress})\n"
         ));
     }
+
+    // Derive a representative egress for RDR rules (all VMs share the same
+    // physical egress interface, e.g. en0 — any active utun's egress will do).
+    let any_egress: Option<&str> = state
+        .active_utuns
+        .values()
+        .next()
+        .map(|s| s.egress_iface.as_str());
 
     // Translation section: RDR port-forward rules.
     for r in &state.rdr_rules {
@@ -546,7 +558,7 @@ fn reload_nat_anchor(state: &DaemonState) -> Response {
             vp = r.vm_port,
         ));
         // Also redirect on the egress interface for external inbound connections.
-        if let Some(egress) = &state.egress_iface {
+        if let Some(egress) = any_egress {
             rules.push_str(&format!(
                 "rdr pass on {egress} proto {proto} from any to any port {hp} -> {vm_ip} port {vp}\n",
                 proto = r.proto,
@@ -557,9 +569,10 @@ fn reload_nat_anchor(state: &DaemonState) -> Response {
         }
     }
 
-    // Filter section: allow host<->VM traffic before the internet-sharing
-    // network_isolation anchor can block it.
-    if let Some(cidr) = &state.ipv4_cidr {
+    // Filter section: one pass rule per active utun so that macOS
+    // internet-sharing's network_isolation anchor cannot block host<->VM traffic.
+    for setup in state.active_utuns.values() {
+        let cidr = &setup.ipv4_cidr;
         rules.push_str(&format!("pass quick inet from {cidr} to {cidr}\n"));
     }
 
