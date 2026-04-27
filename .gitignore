@@ -2,18 +2,24 @@ target/
 *.img
 *.qcow2
 *.raw
-Cargo.lock
 .DS_Store
 
 # VM image build output and initramfs staging directories
 out/
 bin/
+dev/
 etc/
 lib/
+media/
+newroot/
+proc/
 root/
+run/
 sbin/
+sys/
 usr/
 var/
+.modloop/
 init
 echo
 
