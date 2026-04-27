@@ -7,9 +7,11 @@ host-side machinery that gives the VM a real Global Unicast Address (GUA).*
 
 ## Overview
 
-The VM gets a real GUA — the same /64 prefix as the macOS host — via SLAAC.  No NAT
-occurs for IPv6; packets flow with the VM's address as source and destination, fully
-visible to the upstream router.  This requires active cooperation from the host:
+The VM gets a real GUA — the same /64 prefix as the macOS host — via SLAAC.  At the
+VM level, no NAT occurs for IPv6; packets flow with the VM's GUA as source and
+destination, fully visible to the upstream router.  Containers use ULA addresses with
+NAT66 masquerade through the VM's GUA — see IPv6 Addressing Background below.  The
+VM-level machinery requires active cooperation from the host:
 
 1. **RA synthesis** — the relay synthesises a Router Advertisement so the VM learns
    the /64 prefix and default router without needing one from the actual router.
@@ -18,6 +20,53 @@ visible to the upstream router.  This requires active cooperation from the host:
    reach the VM.
 3. **NDP proxy (Phase 2, pending #250)** — a BPF listener on en0 that responds to
    ongoing NS probes from the router, keeping the cache valid after expiry.
+
+---
+
+## IPv6 Addressing Background
+
+### Address structure
+
+An IPv6 address is 128 bits split into two 64-bit halves at a hard boundary:
+
+- **Network prefix (high 64 bits)** — identifies the network. For a GUA like
+  `2601:600:9300:849::/64`, the high bits are the ISP allocation and the subnet
+  ID assigned by the router from its delegated prefix.
+- **Host identifier (low 64 bits)** — identifies the interface within the network.
+  Typically EUI-64 (derived from the MAC address) or a random privacy extension
+  value.
+
+The `/64` boundary is not merely convention — SLAAC, NDP, and every major
+implementation treat it as fixed. A `/65` is expressible in CIDR but nothing
+behaves correctly within it. To create a new subnet you must go up to a shorter
+prefix and carve another `/64` from it; you cannot subdivide an existing `/64`.
+
+### Why ISP prefix size matters
+
+SLAAC and DHCPv6-PD assume a flat LAN gets one `/64`. Any hierarchy — VLANs,
+VPN tunnel subnets, container bridges, downstream routers — requires additional
+`/64`s. ISPs are supposed to delegate at least a `/56` (256 subnets) to
+residential customers, but some delegate only a `/64`, making the network flat
+by constraint with nothing left to sub-delegate to downstream segments.
+
+### NAT66 and the end-to-end principle
+
+The IETF position (RFC 5902, RFC 6296) is that NAT66 (many-to-one ULA-to-GUA
+masquerade) is an antipattern that recreates IPv4 NAT's problems: stateful
+translation at the border, broken application-layer protocols, and asymmetric
+reachability. The correct solution is proper prefix delegation so every host has
+a real GUA.
+
+pelagos uses NAT66 for container network namespaces as a deliberate pragmatic
+choice, not a philosophical one. The objection to NAT66 assumes the NATted host
+should be a full internet participant. Containers on a developer laptop are
+production-grade workloads under active development: they need real outbound IPv6
+(pulling packages, hitting APIs, testing against external services) and may need
+inbound IPv6 (testing services from the LAN or internet). NAT66 satisfies both
+requirements correctly in this context. The alternative — giving every container
+a GUA from the host's /64 — requires the host to have a properly delegated prefix
+with room to spare, which cannot be assumed on a developer laptop on any arbitrary
+network.
 
 ---
 
@@ -191,7 +240,13 @@ this; inbound connection attempts from the LAN will be flaky.  Phase 2 is a BPF
 listener on en0 that answers ongoing NS probes.
 
 **IPv6 inside containers (#244).**
-Container network namespaces get IPv4 NAT only.  No GUA, no SLAAC, no NDP proxy.
+Container network namespaces get IPv4 NAT only.  The intended model is ULA addresses
+with NAT66 masquerade through the VM's GUA for outbound, and pasta DNAT for inbound
+port-forwarded connections.  For inbound, no host-side forwarding machinery is needed:
+`vm_gua` is already directly routable from the LAN and internet via the NDP proxy;
+the upstream router delivers packets addressed to `vm_gua:port` through the existing
+utun path, and pasta handles DNAT inside the VM to the container.  Depends on Phase 2
+(#250) for reliable inbound reachability.
 
 **Prefix mobility not handled (#248).**
 If the host moves to a different network, the VM's GUA becomes invalid.  The relay
@@ -239,7 +294,7 @@ No crash, no hang.
 The relay path is:
 
 ```
-VM → vsock socketpair → relay userspace → utun fd write → kernel → en0
+VM → socketpair (AF_UNIX/SOCK_DGRAM) → relay userspace → utun fd write → kernel → en0
 ```
 
 One userspace hop with a non-blocking write.  Measured RTT overhead vs. the host's
@@ -280,8 +335,8 @@ known `vm_gua`.
 
 | Work | Issue | Why |
 |---|---|---|
-| Phase 2 BPF NS listener on en0 | #250 | Inbound reachability breaks during idle without it |
+| Phase 2 BPF NS listener on en0 | #250 | Inbound reachability breaks during idle without it; also a prerequisite for reliable inbound container port forwarding |
+| IPv6 in container namespaces | #244 | ULA+NAT66 outbound + pasta DNAT inbound; port forwarding falls out naturally once this and Phase 2 are done |
 | pf rules: restrict IPv6 forwarding to vm_gua only | — | Close LAN→utun10 forwarding surface |
 | Prefix mobility | #248 | Correctness on network change / roaming |
-| IPv6 in container namespaces | #244 | Feature completeness |
 | Stable VM MAC across restarts | — | Stable GUA; simpler NDP cache lifecycle |
