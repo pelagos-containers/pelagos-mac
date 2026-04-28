@@ -170,9 +170,15 @@ jobs:
                   pelagos ping
                   pelagos run alpine echo hello
 
-                To upgrade:
+                To upgrade (binary + kernel only — preserves your OCI image cache):
                   brew upgrade pelagos-containers/tap/pelagos-mac
-                  pelagos vm init --force   # stops old VM, re-inits with new image
+                  pelagos ping
+
+                To replace the VM disk (destroys OCI image cache — only needed when
+                the release notes say the disk format changed):
+                  pelagos vm stop
+                  brew upgrade pelagos-containers/tap/pelagos-mac
+                  pelagos vm init --force
                   pelagos ping
 
                 To uninstall completely:
