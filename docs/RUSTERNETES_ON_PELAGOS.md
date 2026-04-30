@@ -212,8 +212,9 @@ Wait a few seconds, then check container output (in VM):
 
 Expected: `hello-from-kubectl`
 
-Note: `kubectl logs hello` returns mock data from rusternetes and cannot be
-used to verify real container output.
+Note: `kubectl logs` is not usable — it either returns mock data or hangs
+indefinitely waiting for a streaming connection that never closes. Use the
+VM-side log file above instead.
 
 Clean up:
 
