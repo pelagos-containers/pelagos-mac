@@ -204,13 +204,16 @@ Check the scheduler picked it up (in VM):
 
 Expected: `Successfully bound pod to node pelagos-node`
 
-Wait a few seconds, then check logs:
+Wait a few seconds, then check container output (in VM):
 
 ```bash
-kubectl logs hello
+(in VM) cat /run/pelagos/containers/hello_app/stdout.log
 ```
 
 Expected: `hello-from-kubectl`
+
+Note: `kubectl logs hello` returns mock data from rusternetes and cannot be
+used to verify real container output.
 
 Clean up:
 
