@@ -9,19 +9,40 @@ the pelagos build VM, using pelagos as the container runtime via `pelagos-docker
 ### Build VM
 
 The build VM (profile `build`, IP `192.168.106.2`) must be running with the
-pelagos source mounted via virtiofs at `/mnt/Projects`.
+pelagos source mounted via virtiofs at `/mnt/Projects`. See
+[VM_LIFECYCLE.md](VM_LIFECYCLE.md) for full details on starting, stopping, and
+managing VMs.
 
-Rusternetes source is expected at `/mnt/Projects/rusternetes`.
+The key commands for the build VM:
+
+```bash
+# On macOS — start the VM (or verify it is running)
+pelagos --profile build ping
+
+# On macOS — SSH into the build VM
+pelagos --profile build vm ssh
+
+# On macOS — run a single command inside the VM
+pelagos --profile build vm ssh -- <command>
+```
+
+`ping` auto-starts the VM if it is not already running and returns `pong` when
+ready. `vm ssh` auto-starts the VM if needed and drops into an interactive
+shell.
+
+Rusternetes source is expected at `/mnt/Projects/rusternetes` (inside the VM).
 
 ### pelagos-dockerd
 
 `pelagos-dockerd` must be running inside the build VM before starting the
-kubelet. SSH in and start it:
+kubelet:
 
 ```bash
-# (in VM)
-sudo pelagos dockerd &
+# On macOS — start pelagos-dockerd in the background inside the VM
+pelagos --profile build vm ssh -- sudo pelagos dockerd &
 ```
+
+Or SSH in interactively and run `sudo pelagos dockerd &` in the VM shell.
 
 ## Building
 
