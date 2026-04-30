@@ -123,8 +123,9 @@ Verify with `kubectl get nodes` — should show `pelagos-node`.
 
 ## Applying Pods
 
-With the scheduler running, `nodeName` is not required in pod specs. Save the
-following as `pod.yaml`:
+With the scheduler running, `nodeName` is not required in pod specs. On the
+macOS host, save the following as `pod.yaml` in a working directory of your
+choice (e.g. `~/rusternetes-test/`):
 
 ```yaml
 apiVersion: v1
@@ -152,7 +153,9 @@ kubectl get pods
 This section walks through verifying the full stack end-to-end from the macOS
 host. Run these in order after completing the setup steps above.
 
-All commands run on macOS unless prefixed with `(in VM)`.
+All commands and YAML files are on the macOS host unless prefixed with
+`(in VM)`. Create all YAML files in a working directory on macOS (e.g.
+`~/rusternetes-test/`) and run `kubectl` from that directory.
 
 ### 1. Smoke tests
 
