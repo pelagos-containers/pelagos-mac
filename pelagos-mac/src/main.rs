@@ -289,6 +289,12 @@ enum Commands {
     /// Internal: run as the persistent VM daemon. Not for direct use.
     #[command(hide = true)]
     VmDaemonInternal,
+    /// Internal: TCP relay used as an SSH ProxyCommand. Not for direct use.
+    #[command(hide = true)]
+    SshRelayProxy {
+        /// TCP port to connect to on the VM guest IP
+        port: u16,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -715,6 +721,10 @@ fn main() {
         Commands::VmDaemonInternal => {
             let args = daemon_args_from_cli(&cli);
             daemon::run(args); // -> !
+        }
+
+        Commands::SshRelayProxy { port } => {
+            process::exit(ssh_relay_proxy(&cli.profile, port));
         }
 
         Commands::Vm {
@@ -3047,6 +3057,64 @@ fn ping_ssh(cli: &Cli) -> i32 {
         // Wait between retries (15s gap matches the utun ping timeout).
         std::thread::sleep(std::time::Duration::from_secs(15));
     }
+}
+
+/// SSH ProxyCommand relay: connect to {guest_ip}:{port} and splice stdin/stdout.
+fn ssh_relay_proxy(profile: &str, port: u16) -> i32 {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    let guest_ip = state::VmProfileConfig::load(profile)
+        .ok()
+        .and_then(|c| c.vm_ip)
+        .unwrap_or(state::DEFAULT_GUEST_IP);
+    let addr = format!("{}:{}", guest_ip, port);
+    let sock = match TcpStream::connect(&addr) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("ssh-relay-proxy: connect {}: {}", addr, e);
+            return 1;
+        }
+    };
+    let mut sock_r = match sock.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("ssh-relay-proxy: clone socket: {}", e);
+            return 1;
+        }
+    };
+    let mut sock_w = sock;
+    // stdin -> socket
+    let t = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match std::io::stdin().read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if sock_w.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = sock_w.shutdown(std::net::Shutdown::Write);
+    });
+    // socket -> stdout, flushing after each chunk so SSH sees packets immediately
+    let stdout = std::io::stdout();
+    let mut buf = [0u8; 4096];
+    loop {
+        match sock_r.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let mut out = stdout.lock();
+                if out.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+                let _ = out.flush();
+            }
+        }
+    }
+    let _ = t.join();
+    0
 }
 
 /// Run an exec command: send the exec JSON handshake, read ready ack, then
