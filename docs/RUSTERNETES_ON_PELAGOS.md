@@ -15,9 +15,11 @@ Rusternetes source is expected at `/mnt/Projects/rusternetes`.
 
 ### pelagos-dockerd
 
-`pelagos-dockerd` must be running before starting the kubelet:
+`pelagos-dockerd` must be running inside the build VM before starting the
+kubelet. SSH in and start it:
 
 ```bash
+# (in VM)
 sudo pelagos dockerd &
 ```
 
