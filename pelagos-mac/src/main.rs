@@ -1829,14 +1829,16 @@ fn vm_stop(profile: &str) {
             // this wait a caller that immediately re-invokes pelagos (e.g.
             // the e2e test restarting with different mounts) sees the still-
             // alive daemon and gets a "different mount configuration" error.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            // 45 s: the daemon sends an ACPI power-off and waits for the guest
+            // to complete its systemd shutdown sequence before exiting.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
             while std::time::Instant::now() < deadline {
                 if state.running_pid().is_none() {
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            log::warn!("daemon (pid {}) did not exit within 15 s", pid);
+            log::warn!("daemon (pid {}) did not exit within 45 s", pid);
         }
     }
 }
@@ -2091,7 +2093,7 @@ fn vm_init(profile: &str, vm_data: Option<&std::path::Path>, force: bool) -> std
             if let Some(pid) = state.running_pid() {
                 println!("Stopping running VM (pid {}) …", pid);
                 unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
                 while std::time::Instant::now() < deadline {
                     if state.running_pid().is_none() {
                         break;
@@ -2099,7 +2101,7 @@ fn vm_init(profile: &str, vm_data: Option<&std::path::Path>, force: bool) -> std
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
                 if state.running_pid().is_some() {
-                    log::warn!("VM daemon (pid {}) did not exit within 15 s", pid);
+                    log::warn!("VM daemon (pid {}) did not exit within 45 s", pid);
                 }
             }
         }

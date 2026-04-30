@@ -474,9 +474,13 @@ pub fn run(args: DaemonArgs) -> ! {
             log::info!("shutdown requested, stopping VM...");
 
             drop(router);
-            // Drop the Arc. If no proxy threads are active, Vm::drop runs stop().
-            // If threads still hold clones the VM will stop when the last clone
-            // drops. Either way the process exits immediately after cleanup.
+            // Send ACPI power-off explicitly before releasing the Arc.
+            // Vm::drop also calls stop(), but only when the refcount reaches 0.
+            // Active connection-handler threads hold Arc<Vm> clones that may
+            // prevent the refcount from reaching 0 here, causing process::exit
+            // to hard-kill the guest with unflushed writes — corrupting the
+            // guest filesystem.  Calling stop() directly avoids that race.
+            let _ = vm.stop();
             drop(vm);
             state.clear();
             std::process::exit(0);
