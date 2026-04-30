@@ -39,16 +39,23 @@ kubelet:
 
 ```bash
 # On macOS — start pelagos-dockerd in the background inside the VM
-pelagos --profile build vm ssh -- sudo pelagos dockerd &
+pelagos --profile build vm ssh -- sudo /mnt/Projects/pelagos/target/debug/pelagos-dockerd &
 ```
 
-Or SSH in interactively and run `sudo pelagos dockerd &` in the VM shell.
+Or SSH in interactively and run `sudo /mnt/Projects/pelagos/target/debug/pelagos-dockerd &` in the VM shell.
 
 ## Building
 
-All three binaries require the `sqlite` feature flag. Without it, the
-`--storage-backend sqlite` flag is silently ignored and the binary falls
-through to etcd, failing with a DNS error.
+SSH into the build VM first:
+
+```bash
+pelagos --profile build vm ssh
+```
+
+All commands in this section run inside the VM. All three binaries require
+the `sqlite` feature flag. Without it, the `--storage-backend sqlite` flag
+is silently ignored and the binary falls through to etcd, failing with a DNS
+error.
 
 ```bash
 cd /mnt/Projects/rusternetes
@@ -63,6 +70,8 @@ Incremental builds are fast after the first full build. If you hit an OOM
 during compilation, check that swap is active (`free -h`).
 
 ## Running the Stack
+
+All commands in this section run inside the VM (via `pelagos --profile build vm ssh`).
 
 All three components share one SQLite database file. Start them in order:
 
