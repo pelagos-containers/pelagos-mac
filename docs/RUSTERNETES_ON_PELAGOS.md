@@ -212,9 +212,9 @@ Wait a few seconds, then check container output (in VM):
 
 Expected: `hello-from-kubectl`
 
-Note: `kubectl logs` is not usable — it either returns mock data or hangs
-indefinitely waiting for a streaming connection that never closes. Use the
-VM-side log file above instead.
+Note: `kubectl logs` hangs indefinitely — pelagos-dockerd holds the streaming
+connection open even after the container exits. Use the VM-side log file
+above instead.
 
 Clean up:
 
