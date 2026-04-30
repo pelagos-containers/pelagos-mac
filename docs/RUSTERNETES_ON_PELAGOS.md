@@ -39,16 +39,23 @@ kubelet:
 
 ```bash
 # On macOS — start pelagos-dockerd in the background inside the VM
-pelagos --profile build vm ssh -- sudo pelagos dockerd &
+pelagos --profile build vm ssh -- sudo /mnt/Projects/pelagos/target/debug/pelagos-dockerd &
 ```
 
-Or SSH in interactively and run `sudo pelagos dockerd &` in the VM shell.
+Or SSH in interactively and run `sudo /mnt/Projects/pelagos/target/debug/pelagos-dockerd &` in the VM shell.
 
 ## Building
 
-All three binaries require the `sqlite` feature flag. Without it, the
-`--storage-backend sqlite` flag is silently ignored and the binary falls
-through to etcd, failing with a DNS error.
+SSH into the build VM first:
+
+```bash
+pelagos --profile build vm ssh
+```
+
+All commands in this section run inside the VM. All three binaries require
+the `sqlite` feature flag. Without it, the `--storage-backend sqlite` flag
+is silently ignored and the binary falls through to etcd, failing with a DNS
+error.
 
 ```bash
 cd /mnt/Projects/rusternetes
@@ -63,6 +70,8 @@ Incremental builds are fast after the first full build. If you hit an OOM
 during compilation, check that swap is active (`free -h`).
 
 ## Running the Stack
+
+All commands in this section run inside the VM (via `pelagos --profile build vm ssh`).
 
 All three components share one SQLite database file. Start them in order:
 
@@ -114,7 +123,9 @@ Verify with `kubectl get nodes` — should show `pelagos-node`.
 
 ## Applying Pods
 
-With the scheduler running, `nodeName` is not required in pod specs:
+With the scheduler running, `nodeName` is not required in pod specs. On the
+macOS host, save the following as `pod.yaml` in a working directory of your
+choice (e.g. `~/rusternetes-test/`):
 
 ```yaml
 apiVersion: v1
@@ -130,6 +141,8 @@ spec:
     command: ["sh", "-c", "echo hello-from-kubectl"]
 ```
 
+Then apply it:
+
 ```bash
 kubectl apply -f pod.yaml
 kubectl get pods
@@ -140,7 +153,9 @@ kubectl get pods
 This section walks through verifying the full stack end-to-end from the macOS
 host. Run these in order after completing the setup steps above.
 
-All commands run on macOS unless prefixed with `(in VM)`.
+All commands and YAML files are on the macOS host unless prefixed with
+`(in VM)`. Create all YAML files in a working directory on macOS (e.g.
+`~/rusternetes-test/`) and run `kubectl` from that directory.
 
 ### 1. Smoke tests
 
