@@ -4,7 +4,31 @@ Rusternetes is a Kubernetes implementation in Rust. This document covers how to
 build and run the full rusternetes stack (api-server, scheduler, kubelet) inside
 the pelagos build VM, using pelagos as the container runtime via `pelagos-dockerd`.
 
-## Prerequisites
+## Automated testing
+
+The script `scripts/test-rusternetes.sh` is the recommended way to verify the
+full stack. It is one-shot: it starts the VM, ensures swap is active, builds all
+rusternetes binaries, configures kubectl, starts the stack fresh, and runs every
+test in the Manual Testing section below.
+
+```bash
+bash scripts/test-rusternetes.sh
+```
+
+The only manual prerequisite is that the pelagos binaries must already be built
+inside the VM:
+
+```bash
+pelagos --profile build vm ssh
+cd /mnt/Projects/pelagos && cargo build
+```
+
+Everything else — rusternetes builds, kubectl context, stack startup, and all
+tests — is handled by the script.
+
+---
+
+## Prerequisites (manual workflow)
 
 ### Build VM
 
@@ -35,14 +59,18 @@ Rusternetes source is expected at `/mnt/Projects/rusternetes` (inside the VM).
 ### pelagos-dockerd
 
 `pelagos-dockerd` must be running inside the build VM before starting the
-kubelet:
+kubelet. SSH in interactively and run:
 
 ```bash
-# On macOS — start pelagos-dockerd in the background inside the VM
-pelagos --profile build vm ssh -- sudo /mnt/Projects/pelagos/target/debug/pelagos-dockerd &
+# Inside the VM
+/mnt/Projects/pelagos/target/debug/pelagos-dockerd \
+  --pelagos-bin /mnt/Projects/pelagos/target/debug/pelagos &
 ```
 
-Or SSH in interactively and run `sudo /mnt/Projects/pelagos/target/debug/pelagos-dockerd &` in the VM shell.
+The `--pelagos-bin` flag is required — without it pelagos-dockerd defaults to
+looking for `pelagos` on PATH, which is not in the default root environment.
+
+Note: the build VM SSH session connects as root, so `sudo` is not needed.
 
 ## Building
 
