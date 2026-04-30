@@ -128,6 +128,220 @@ kubectl apply -f pod.yaml
 kubectl get pods
 ```
 
+## Manual Testing
+
+This section walks through verifying the full stack end-to-end from the macOS
+host. Run these in order after completing the setup steps above.
+
+All commands run on macOS unless prefixed with `(in VM)`.
+
+### 1. Smoke tests
+
+```bash
+kubectl get nodes
+```
+
+Expected: `pelagos-node` listed with an age.
+
+```bash
+kubectl get pods -A
+```
+
+Expected: returns without error. May be empty or show pods from previous
+sessions.
+
+### 2. Pod lifecycle
+
+Create a file `hello.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hello
+  namespace: default
+spec:
+  restartPolicy: Never
+  containers:
+  - name: app
+    image: alpine:latest
+    command: ["sh", "-c", "echo hello-from-kubectl"]
+```
+
+Apply it and verify:
+
+```bash
+kubectl apply -f hello.yaml
+```
+
+Check the scheduler picked it up (in VM):
+
+```bash
+(in VM) grep "Successfully bound" /tmp/scheduler.log
+```
+
+Expected: `Successfully bound pod to node pelagos-node`
+
+Wait a few seconds, then check logs:
+
+```bash
+kubectl logs hello
+```
+
+Expected: `hello-from-kubectl`
+
+Clean up:
+
+```bash
+kubectl delete pod hello
+```
+
+Verify the container was removed (in VM):
+
+```bash
+(in VM) sudo ls /run/pelagos/containers/ | grep hello
+```
+
+Expected: no output.
+
+### 3. Multi-container pod with shared network namespace
+
+Create `netns-pod.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: netns-pod
+  namespace: default
+spec:
+  restartPolicy: Never
+  containers:
+  - name: server
+    image: alpine:latest
+    command: ["sh", "-c", "nc -lp 8080 -e echo hello-from-server"]
+  - name: client
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 2 && nc localhost 8080"]
+```
+
+```bash
+kubectl apply -f netns-pod.yaml
+```
+
+Wait ~10 seconds, then check client output (in VM):
+
+```bash
+(in VM) sudo cat /run/pelagos/containers/netns-pod_client/stdout.log
+```
+
+Expected: `hello-from-server`
+
+```bash
+kubectl delete pod netns-pod
+```
+
+### 4. emptyDir volume (shared between containers)
+
+Create `emptydir-pod.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: emptydir-pod
+  namespace: default
+spec:
+  restartPolicy: Never
+  volumes:
+  - name: shared
+    emptyDir: {}
+  containers:
+  - name: writer
+    image: alpine:latest
+    command: ["sh", "-c", "echo hello-from-writer > /shared/msg.txt && sleep 10"]
+    volumeMounts:
+    - name: shared
+      mountPath: /shared
+  - name: reader
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3 && cat /shared/msg.txt"]
+    volumeMounts:
+    - name: shared
+      mountPath: /shared
+```
+
+```bash
+kubectl apply -f emptydir-pod.yaml
+```
+
+Wait ~10 seconds, then check reader output (in VM):
+
+```bash
+(in VM) sudo cat /run/pelagos/containers/emptydir-pod_reader/stdout.log
+```
+
+Expected: `hello-from-writer`
+
+```bash
+kubectl delete pod emptydir-pod
+```
+
+### 5. hostPath volume
+
+Create a test file on the build VM first:
+
+```bash
+(in VM) mkdir -p /tmp/hostpath-test && echo written-from-host > /tmp/hostpath-test/file.txt
+```
+
+Create `hostpath-pod.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hostpath-pod
+  namespace: default
+spec:
+  restartPolicy: Never
+  volumes:
+  - name: data
+    hostPath:
+      path: /tmp/hostpath-test
+  containers:
+  - name: app
+    image: alpine:latest
+    command: ["sh", "-c", "cat /data/file.txt && echo written-from-container > /data/out.txt"]
+    volumeMounts:
+    - name: data
+      mountPath: /data
+```
+
+```bash
+kubectl apply -f hostpath-pod.yaml
+```
+
+Wait ~10 seconds, then verify container read the host file (in VM):
+
+```bash
+(in VM) sudo cat /run/pelagos/containers/hostpath-pod_app/stdout.log
+```
+
+Expected: `written-from-host`
+
+Verify container wrote back to the host (in VM):
+
+```bash
+(in VM) cat /tmp/hostpath-test/out.txt
+```
+
+Expected: `written-from-container`
+
+```bash
+kubectl delete pod hostpath-pod
+```
+
 ## Known Limitations
 
 ### Volume mounts reference build VM paths
