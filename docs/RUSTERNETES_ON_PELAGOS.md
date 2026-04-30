@@ -219,8 +219,11 @@ above instead.
 Clean up:
 
 ```bash
-kubectl delete pod hello
+kubectl delete pod hello --wait=false
 ```
+
+Note: `--wait=false` is required throughout — without it `kubectl delete`
+hangs waiting for a watch termination signal that rusternetes never sends.
 
 Verify the container was removed (in VM):
 
@@ -264,7 +267,7 @@ Wait ~10 seconds, then check client output (in VM):
 Expected: `hello-from-server`
 
 ```bash
-kubectl delete pod netns-pod
+kubectl delete pod netns-pod --wait=false
 ```
 
 ### 4. emptyDir volume (shared between containers)
@@ -310,7 +313,7 @@ Wait ~10 seconds, then check reader output (in VM):
 Expected: `hello-from-writer`
 
 ```bash
-kubectl delete pod emptydir-pod
+kubectl delete pod emptydir-pod --wait=false
 ```
 
 ### 5. hostPath volume
@@ -365,7 +368,7 @@ Verify container wrote back to the host (in VM):
 Expected: `written-from-container`
 
 ```bash
-kubectl delete pod hostpath-pod
+kubectl delete pod hostpath-pod --wait=false
 ```
 
 ## Known Limitations
