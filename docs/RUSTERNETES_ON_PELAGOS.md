@@ -35,14 +35,16 @@ Rusternetes source is expected at `/mnt/Projects/rusternetes` (inside the VM).
 ### pelagos-dockerd
 
 `pelagos-dockerd` must be running inside the build VM before starting the
-kubelet:
+kubelet. SSH in interactively and run:
 
 ```bash
-# On macOS — start pelagos-dockerd in the background inside the VM
-pelagos --profile build vm ssh -- sudo /mnt/Projects/pelagos/target/debug/pelagos-dockerd &
+# Inside the VM
+sudo /mnt/Projects/pelagos/target/debug/pelagos-dockerd \
+  --pelagos-bin /mnt/Projects/pelagos/target/debug/pelagos &
 ```
 
-Or SSH in interactively and run `sudo /mnt/Projects/pelagos/target/debug/pelagos-dockerd &` in the VM shell.
+The `--pelagos-bin` flag is required — without it pelagos-dockerd defaults to
+looking for `pelagos` on PATH, which is not available under `sudo`.
 
 ## Building
 
