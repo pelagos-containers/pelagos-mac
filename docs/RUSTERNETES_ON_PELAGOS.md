@@ -13,22 +13,6 @@ pelagos source mounted via virtiofs at `/mnt/Projects`.
 
 Rusternetes source is expected at `/mnt/Projects/rusternetes`.
 
-### Swap
-
-The build VM has 4GB RAM. Compiling large rusternetes crates (api-server
-especially) will OOM without swap. A 4GB swapfile is required:
-
-```bash
-sudo fallocate -l 4G /swapfile
-sudo chmod 600 /swapfile
-sudo mkswap /swapfile
-sudo swapon /swapfile
-# Make persistent across reboots:
-echo "/swapfile none swap sw 0 0" | sudo tee -a /etc/fstab
-```
-
-This only needs to be done once per VM image. Verify with `free -h`.
-
 ### pelagos-dockerd
 
 `pelagos-dockerd` must be running before starting the kubelet:

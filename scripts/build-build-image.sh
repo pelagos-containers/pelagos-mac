@@ -418,6 +418,22 @@ chroot "\$MNT" git config --global http.sslCAInfo /etc/ssl/certs/ca-certificates
 ln -sf /lib/systemd/system/systemd-timesyncd.service \
     "\$MNT/etc/systemd/system/multi-user.target.wants/systemd-timesyncd.service" 2>/dev/null || true
 
+# ---- Swap file ----
+# rustc peaks well above 4 GB RSS when compiling large crates (e.g. rusternetes
+# api-server). Without swap the OOM killer terminates rustc mid-compile.
+# A 4 GB swapfile gives enough headroom for single-job debug builds.
+
+if [ ! -f "\$MNT/swapfile" ]; then
+    echo "[provision] creating 4 GB swapfile"
+    fallocate -l 4G "\$MNT/swapfile" || dd if=/dev/zero of="\$MNT/swapfile" bs=1M count=4096
+    chmod 600 "\$MNT/swapfile"
+    chroot "\$MNT" mkswap /swapfile
+    echo "/swapfile none swap sw 0 0" >> "\$MNT/etc/fstab"
+    echo "  swapfile created and registered in /etc/fstab"
+else
+    echo "[provision] swapfile already exists -- skipping"
+fi
+
 # ---- Extract Ubuntu kernel and initrd for AVF boot ----
 #
 # AVF VZLinuxBootLoader requires a raw arm64 EFI-stub Image (MZ + ARMd at
