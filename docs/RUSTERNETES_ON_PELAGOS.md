@@ -123,7 +123,8 @@ Verify with `kubectl get nodes` — should show `pelagos-node`.
 
 ## Applying Pods
 
-With the scheduler running, `nodeName` is not required in pod specs:
+With the scheduler running, `nodeName` is not required in pod specs. Save the
+following as `pod.yaml`:
 
 ```yaml
 apiVersion: v1
@@ -138,6 +139,8 @@ spec:
     image: alpine:latest
     command: ["sh", "-c", "echo hello-from-kubectl"]
 ```
+
+Then apply it:
 
 ```bash
 kubectl apply -f pod.yaml
