@@ -268,6 +268,7 @@ chroot "\$MNT" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-instal
     pkg-config libssl-dev \
     rsync file strace zstd \
     initramfs-tools \
+    libgtk-3-dev libwebkit2gtk-4.1-dev \
     linux-image-6.11.0-29-generic linux-modules-6.11.0-29-generic
 
 # Explicitly generate the initrd — apt's post-install hook is blocked by the
