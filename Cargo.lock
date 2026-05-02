@@ -537,7 +537,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pelagos-docker"
-version = "0.6.16"
+version = "0.6.17"
 dependencies = [
  "clap",
  "serde",
@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "pelagos-guest"
-version = "0.6.16"
+version = "0.6.17"
 dependencies = [
  "env_logger",
  "libc",
@@ -557,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "pelagos-mac"
-version = "0.6.16"
+version = "0.6.17"
 dependencies = [
  "clap",
  "env_logger",
@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "pelagos-pfctl"
-version = "0.6.16"
+version = "0.6.17"
 dependencies = [
  "env_logger",
  "libc",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "pelagos-vz"
-version = "0.6.16"
+version = "0.6.17"
 dependencies = [
  "block2",
  "dispatch2",
