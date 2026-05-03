@@ -325,6 +325,12 @@ pub enum GuestCommand {
         #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
         env: std::collections::HashMap<String, String>,
     },
+    /// Check whether rusternetes (api-server + kubelet) is running.
+    KubernetesStatus,
+    /// Start the rusternetes control plane.
+    KubernetesStart,
+    /// Stop the rusternetes control plane.
+    KubernetesStop,
 }
 
 // ---------------------------------------------------------------------------
@@ -415,6 +421,10 @@ pub enum GuestResponse {
         /// VM kernel version (`uname -r`).
         #[serde(skip_serializing_if = "Option::is_none")]
         kernel: Option<String>,
+    },
+    /// Response to KubernetesStatus command.
+    KubernetesStatus {
+        running: bool,
     },
 }
 
@@ -851,6 +861,15 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                     &args,
                     &env,
                 )?;
+            }
+            GuestCommand::KubernetesStatus => {
+                handle_kubernetes_status(&mut writer)?;
+            }
+            GuestCommand::KubernetesStart => {
+                handle_kubernetes_start(&mut writer)?;
+            }
+            GuestCommand::KubernetesStop => {
+                handle_kubernetes_stop(&mut writer)?;
             }
         }
     }
@@ -2807,6 +2826,151 @@ fn accept_vsock(_listener: &OwnedFd) -> std::io::Result<libc::c_int> {
         std::io::ErrorKind::Unsupported,
         "AF_VSOCK is Linux-only",
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Kubernetes (rusternetes) handlers
+// ---------------------------------------------------------------------------
+
+fn k8s_is_running(name: &str) -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-x", name])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn k8s_find_bin(name: &str, dirs: &[&str]) -> String {
+    for dir in dirs {
+        let p = format!("{}/{}", dir, name);
+        if std::path::Path::new(&p).exists() {
+            return p;
+        }
+    }
+    name.to_string()
+}
+
+fn k8s_wait_for_port(port: u16, timeout_secs: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+fn handle_kubernetes_status(writer: &mut impl std::io::Write) -> std::io::Result<()> {
+    let running = k8s_is_running("api-server") && k8s_is_running("kubelet");
+    send_response(writer, &GuestResponse::KubernetesStatus { running })
+}
+
+fn handle_kubernetes_start(writer: &mut impl std::io::Write) -> std::io::Result<()> {
+    let dockerd = k8s_find_bin(
+        "pelagos-dockerd",
+        &["/usr/local/bin", "/mnt/Projects/pelagos/target/debug"],
+    );
+    let api_bin = k8s_find_bin(
+        "api-server",
+        &["/usr/local/bin", "/mnt/Projects/rusternetes/target/debug"],
+    );
+    let kubelet_bin = k8s_find_bin(
+        "kubelet",
+        &["/usr/local/bin", "/mnt/Projects/rusternetes/target/debug"],
+    );
+    let data_dir = "/var/lib/rusternetes/cluster.db";
+    let _ = std::fs::create_dir_all("/var/lib/rusternetes");
+
+    if !k8s_is_running("pelagos-dockerd") {
+        let pelagos = pelagos_bin();
+        let _ = std::process::Command::new(&dockerd)
+            .arg("--pelagos-bin")
+            .arg(&pelagos)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        send_response(
+            writer,
+            &GuestResponse::Stream {
+                stream: StreamKind::Stdout,
+                data: "started pelagos-dockerd\n".into(),
+            },
+        )?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    if !k8s_is_running("api-server") {
+        let _ = std::process::Command::new(&api_bin)
+            .args([
+                "--storage-backend",
+                "sqlite",
+                "--data-dir",
+                data_dir,
+                "--skip-auth",
+                "--tls",
+                "--tls-self-signed",
+                "--tls-san",
+                "localhost,127.0.0.1",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        send_response(
+            writer,
+            &GuestResponse::Stream {
+                stream: StreamKind::Stdout,
+                data: "started api-server, waiting for ready...\n".into(),
+            },
+        )?;
+        k8s_wait_for_port(6443, 30);
+        send_response(
+            writer,
+            &GuestResponse::Stream {
+                stream: StreamKind::Stdout,
+                data: "api-server ready\n".into(),
+            },
+        )?;
+    }
+
+    if !k8s_is_running("kubelet") {
+        let _ = std::process::Command::new(&kubelet_bin)
+            .args([
+                "--node-name",
+                "pelagos-node",
+                "--storage-backend",
+                "sqlite",
+                "--data-dir",
+                data_dir,
+                "--network",
+                "bridge",
+            ])
+            .env("DOCKER_HOST", "unix:///var/run/pelagos-dockerd.sock")
+            .env("RUST_MIN_STACK", "8388608")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        send_response(
+            writer,
+            &GuestResponse::Stream {
+                stream: StreamKind::Stdout,
+                data: "started kubelet\n".into(),
+            },
+        )?;
+    }
+
+    send_response(writer, &GuestResponse::Exit { exit: 0 })
+}
+
+fn handle_kubernetes_stop(writer: &mut impl std::io::Write) -> std::io::Result<()> {
+    for name in &["kubelet", "api-server", "pelagos-dockerd"] {
+        let _ = std::process::Command::new("pkill")
+            .args(["-x", name])
+            .status();
+    }
+    send_response(writer, &GuestResponse::Exit { exit: 0 })
 }
 
 // ---------------------------------------------------------------------------
