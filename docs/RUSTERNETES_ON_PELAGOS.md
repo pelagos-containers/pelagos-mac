@@ -28,6 +28,72 @@ tests — is handled by the script.
 
 ---
 
+## One-time TLS setup (required for pelagos-ui console)
+
+The rusternetes api-server runs inside the build VM at `https://192.168.106.2:6443`.
+The build VM is directly routable from macOS via the utun interface that pelagos-pfctl
+sets up, so the api-server is reachable at that address from the macOS host.
+
+The pelagos-ui Kubernetes tab embeds the rusternetes web console in a
+`WebviewWindow` pointing at `https://192.168.106.2:6443/console/`. WKWebView
+rejects self-signed certificates by default, so a locally-trusted CA must be
+set up once before the console will load.
+
+### What the setup does
+
+`scripts/setup-kubernetes-tls.sh` performs the following steps:
+
+1. Generates a local CA (`ca.key` + `ca.crt`) valid for 10 years.
+2. Generates a server certificate (`server.key` + `server.crt`) signed by
+   that CA, with SANs covering `localhost`, `127.0.0.1`, and `192.168.106.2`.
+3. Stores all four files at **`~/Projects/pelagos-mac/tls/`** on the macOS host.
+4. Adds `ca.crt` to the macOS System keychain as a trusted root (requires `sudo`).
+
+### Where the files live
+
+| Path (macOS host) | Path (inside build VM via virtiofs) | Purpose |
+|---|---|---|
+| `~/Projects/pelagos-mac/tls/ca.crt` | _(not needed in VM)_ | CA cert — added to macOS keychain |
+| `~/Projects/pelagos-mac/tls/ca.key` | _(not needed in VM)_ | CA private key — keep secret |
+| `~/Projects/pelagos-mac/tls/server.crt` | `/mnt/Projects/pelagos-mac/tls/server.crt` | api-server TLS cert |
+| `~/Projects/pelagos-mac/tls/server.key` | `/mnt/Projects/pelagos-mac/tls/server.key` | api-server TLS key |
+
+The `tls/` directory is in `.gitignore` — these files are never committed.
+
+The virtiofs mount makes the macOS `~/Projects/pelagos-mac/tls/` directory visible
+inside the build VM at `/mnt/Projects/pelagos-mac/tls/` automatically, with no extra
+configuration. The pelagos-guest kubernetes start handler checks for the cert files
+at that path and uses them if present; if absent it falls back to `--tls-self-signed`
+(stack starts but pelagos-ui will show a certificate error).
+
+### Running the setup
+
+```bash
+bash scripts/setup-kubernetes-tls.sh
+```
+
+macOS will prompt for your password to add the CA to the System keychain.
+
+After running, restart the rusternetes stack so the api-server picks up the cert:
+
+```bash
+pelagos --profile build kubernetes stop
+pelagos --profile build kubernetes start
+```
+
+### Regenerating certificates
+
+If the build VM IP changes, or the cert expires, re-run with `--force`:
+
+```bash
+bash scripts/setup-kubernetes-tls.sh --force
+```
+
+Then remove the old CA from the macOS System keychain (Keychain Access app,
+search for "Pelagos Rusternetes Local CA", delete it), and restart the stack.
+
+---
+
 ## Prerequisites (manual workflow)
 
 ### Build VM

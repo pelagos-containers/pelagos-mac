@@ -2901,18 +2901,35 @@ fn handle_kubernetes_start(writer: &mut impl std::io::Write) -> std::io::Result<
     }
 
     if !k8s_is_running("api-server") {
-        let _ = std::process::Command::new(&api_bin)
+        // Use CA-signed cert from the virtiofs-mounted host path when available
+        // (generated once by scripts/setup-kubernetes-tls.sh on the macOS host).
+        // Falls back to a self-signed cert so the stack still starts without the
+        // one-time TLS setup, but WKWebView in pelagos-ui will reject the cert
+        // unless the CA has been added to the macOS System keychain.
+        const TLS_CERT: &str = "/mnt/Projects/pelagos-mac/tls/server.crt";
+        const TLS_KEY: &str = "/mnt/Projects/pelagos-mac/tls/server.key";
+        let tls_args: Vec<&str> =
+            if std::path::Path::new(TLS_CERT).exists() && std::path::Path::new(TLS_KEY).exists() {
+                vec!["--tls", "--tls-cert", TLS_CERT, "--tls-key", TLS_KEY]
+            } else {
+                vec![
+                    "--tls",
+                    "--tls-self-signed",
+                    "--tls-san",
+                    "localhost,127.0.0.1",
+                ]
+            };
+
+        let mut cmd = std::process::Command::new(&api_bin);
+        let _ = cmd
             .args([
                 "--storage-backend",
                 "sqlite",
                 "--data-dir",
                 data_dir,
                 "--skip-auth",
-                "--tls",
-                "--tls-self-signed",
-                "--tls-san",
-                "localhost,127.0.0.1",
             ])
+            .args(&tls_args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
