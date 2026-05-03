@@ -286,6 +286,11 @@ enum Commands {
         #[command(subcommand)]
         sub: VmCommands,
     },
+    /// Manage the rusternetes Kubernetes control plane inside the VM
+    Kubernetes {
+        #[command(subcommand)]
+        sub: KubernetesCmd,
+    },
     /// Internal: run as the persistent VM daemon. Not for direct use.
     #[command(hide = true)]
     VmDaemonInternal,
@@ -295,6 +300,16 @@ enum Commands {
         /// TCP port to connect to on the VM guest IP
         port: u16,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum KubernetesCmd {
+    /// Report whether the rusternetes control plane is running
+    Status,
+    /// Start the rusternetes control plane (pelagos-dockerd, api-server, kubelet)
+    Start,
+    /// Stop the rusternetes control plane
+    Stop,
 }
 
 #[derive(Subcommand, Debug)]
@@ -557,6 +572,9 @@ enum GuestCommand {
     Ping,
     Version,
     Subscribe,
+    KubernetesStatus,
+    KubernetesStart,
+    KubernetesStop,
     Build {
         tag: String,
         dockerfile: String,
@@ -655,6 +673,9 @@ enum GuestResponse {
     },
     Ready {
         ready: bool,
+    },
+    KubernetesStatus {
+        running: bool,
     },
     /// Precedes `size` raw bytes written directly to the socket.
     RawBytes {
@@ -1058,6 +1079,21 @@ fn main() {
             }
             let stream = connect_or_exit(&profile);
             subscribe_command(stream);
+        }
+
+        Commands::Kubernetes { sub } => {
+            let stream = connect_or_exit(&profile);
+            match sub {
+                KubernetesCmd::Status => {
+                    process::exit(kubernetes_status_command(stream));
+                }
+                KubernetesCmd::Start => {
+                    process::exit(passthrough_command(stream, GuestCommand::KubernetesStart));
+                }
+                KubernetesCmd::Stop => {
+                    process::exit(passthrough_command(stream, GuestCommand::KubernetesStop));
+                }
+            }
         }
 
         Commands::Ping => {
@@ -2906,6 +2942,37 @@ fn ping_command(stream: UnixStream) -> i32 {
         }
         other => {
             log::error!("unexpected ping response: {:?}", other);
+            1
+        }
+    }
+}
+
+fn kubernetes_status_command(stream: UnixStream) -> i32 {
+    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+    let mut writer = stream;
+
+    let mut msg = serde_json::to_string(&GuestCommand::KubernetesStatus).unwrap();
+    msg.push('\n');
+    if let Err(e) = writer.write_all(msg.as_bytes()) {
+        log::error!("write error: {}", e);
+        return 1;
+    }
+
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) | Err(_) => {
+            log::error!("no response from guest");
+            return 1;
+        }
+        Ok(_) => {}
+    }
+    match serde_json::from_str::<GuestResponse>(line.trim_end()) {
+        Ok(GuestResponse::KubernetesStatus { running }) => {
+            println!("{}", if running { "running" } else { "stopped" });
+            0
+        }
+        other => {
+            log::error!("unexpected kubernetes status response: {:?}", other);
             1
         }
     }
