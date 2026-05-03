@@ -2910,7 +2910,13 @@ fn handle_kubernetes_start(writer: &mut impl std::io::Write) -> std::io::Result<
         const TLS_KEY: &str = "/mnt/Projects/pelagos-mac/tls/server.key";
         let tls_args: Vec<&str> =
             if std::path::Path::new(TLS_CERT).exists() && std::path::Path::new(TLS_KEY).exists() {
-                vec!["--tls", "--tls-cert", TLS_CERT, "--tls-key", TLS_KEY]
+                vec![
+                    "--tls",
+                    "--tls-cert-file",
+                    TLS_CERT,
+                    "--tls-key-file",
+                    TLS_KEY,
+                ]
             } else {
                 vec![
                     "--tls",
