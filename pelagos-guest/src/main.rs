@@ -2920,6 +2920,11 @@ fn handle_kubernetes_start(writer: &mut impl std::io::Write) -> std::io::Result<
                 ]
             };
 
+        // Serve the rusternetes web console at /console/ when the build output
+        // exists. Built on macOS: cd ~/Projects/rusternetes/console && npm run build
+        // (npm is not installed in the build VM). The dist/ is accessible in the
+        // VM at this virtiofs path automatically.
+        const CONSOLE_DIR: &str = "/mnt/Projects/rusternetes/console/dist";
         let mut cmd = std::process::Command::new(&api_bin);
         let _ = cmd
             .args([
@@ -2929,7 +2934,11 @@ fn handle_kubernetes_start(writer: &mut impl std::io::Write) -> std::io::Result<
                 data_dir,
                 "--skip-auth",
             ])
-            .args(&tls_args)
+            .args(&tls_args);
+        if std::path::Path::new(CONSOLE_DIR).exists() {
+            cmd.args(["--console-dir", CONSOLE_DIR]);
+        }
+        let _ = cmd
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

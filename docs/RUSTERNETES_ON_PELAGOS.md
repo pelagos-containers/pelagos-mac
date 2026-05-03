@@ -28,6 +28,29 @@ tests — is handled by the script.
 
 ---
 
+## One-time console build (required for pelagos-ui console)
+
+The rusternetes web console is a React/Vite app at `~/Projects/rusternetes/console/`.
+It must be built on **macOS** — npm is not installed in the build VM.
+
+```bash
+cd ~/Projects/rusternetes/console && npm install && npm run build
+```
+
+This produces `~/Projects/rusternetes/console/dist/`. Because `~/Projects/` is
+virtiofs-mounted inside the build VM at `/mnt/Projects/`, the build output is
+immediately visible in the VM at `/mnt/Projects/rusternetes/console/dist/` with no
+copying required.
+
+The pelagos-guest kubernetes start handler checks for that path at startup and
+passes `--console-dir /mnt/Projects/rusternetes/console/dist` to api-server when
+it exists. The console is then served at `https://192.168.106.2:6443/console/`.
+
+Re-run the build whenever the console source changes. The built `dist/` is in
+`.gitignore` in the rusternetes repo and is never committed.
+
+---
+
 ## One-time TLS setup (required for pelagos-ui console)
 
 The rusternetes api-server runs inside the build VM at `https://192.168.106.2:6443`.
