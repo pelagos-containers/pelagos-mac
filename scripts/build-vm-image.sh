@@ -204,17 +204,17 @@ done
 # ---------------------------------------------------------------------------
 echo "[3/8] Decompressing/staging kernel"
 # ---------------------------------------------------------------------------
-if [ ! -f "$KERNEL_OUT" ]; then
-    # Prefer the Ubuntu 6.11 HWE kernel (CONFIG_KVM_GUEST=y, no RCU stalls under AVF)
-    # when build-build-image.sh has already produced it.  Fall back to the Alpine lts
-    # kernel on first-time setup (before the Ubuntu build VM exists).
-    if [ -f "$UBUNTU_VMLINUZ" ]; then
-        cp "$UBUNTU_VMLINUZ" "$KERNEL_OUT"
-        echo "  kernel: using Ubuntu 6.11 HWE ($UBUNTU_VMLINUZ)"
-        echo "  (CONFIG_KVM_GUEST=y — no RCU stalls under AVF)"
-    else
-        echo "  Ubuntu kernel not yet available — using Alpine lts (run build-build-image.sh to upgrade)"
-    fi
+# Copy Ubuntu kernel whenever it is absent or newer than the cached out/vmlinuz.
+# The old check ([ ! -f "$KERNEL_OUT" ]) only ran on first build; if build-build-image.sh
+# later produced a newer ubuntu-vmlinuz the cache was never invalidated, leaving a stale
+# Alpine kernel in place while modules were staged for the Ubuntu KVER — causing
+# "mount -t ext4 failed" on first boot because ext4.ko lived under the wrong version path.
+if [ -f "$UBUNTU_VMLINUZ" ] && { [ ! -f "$KERNEL_OUT" ] || [ "$UBUNTU_VMLINUZ" -nt "$KERNEL_OUT" ]; }; then
+    cp "$UBUNTU_VMLINUZ" "$KERNEL_OUT"
+    echo "  kernel: using Ubuntu 6.11 HWE ($UBUNTU_VMLINUZ)"
+    echo "  (CONFIG_KVM_GUEST=y — no RCU stalls under AVF)"
+elif [ ! -f "$KERNEL_OUT" ]; then
+    echo "  Ubuntu kernel not yet available — using Alpine lts (run build-build-image.sh to upgrade)"
 fi
 
 if [ ! -f "$KERNEL_OUT" ]; then
@@ -1268,5 +1268,15 @@ echo "  kernel:    $KERNEL_OUT  (linux-${ALPINE_FLAVOR} $KVER)"
 echo "  initramfs: $INITRAMFS_OUT"
 echo "  disk:      $DISK_IMG"
 echo ""
-echo "Next: make build && make sign && make test-e2e"
+
+# Auto-deploy to the local Homebrew install if one is present.
+# Copies both vmlinuz and initramfs.gz together — they are a matched pair and
+# must never be deployed separately.
+BREW_PKGSHARE=$(ls -d /opt/homebrew/Cellar/pelagos-mac/*/share/pelagos-mac 2>/dev/null | tail -1)
+if [ -n "$BREW_PKGSHARE" ]; then
+    cp "$KERNEL_OUT"    "$BREW_PKGSHARE/vmlinuz"
+    cp "$INITRAMFS_OUT" "$BREW_PKGSHARE/initramfs.gz"
+    echo "  deployed to: $BREW_PKGSHARE"
+fi
+
 echo "(kernel cmdline: console=hvc0  — no root=, initramfs is root, /init is pelagos)"
