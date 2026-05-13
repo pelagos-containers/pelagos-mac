@@ -89,7 +89,7 @@ fn port_proxy_loop(
         }
         match stream {
             Ok(client) => {
-                std::thread::spawn(move || relay_tcp(client, guest_ip, container_port));
+                std::thread::spawn(move || relay_tcp(client, guest_ip, host_port));
             }
             Err(e) => {
                 if !shutdown.load(Ordering::Relaxed) {

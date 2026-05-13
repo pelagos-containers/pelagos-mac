@@ -59,12 +59,16 @@ else
     exit 1
 fi
 
-# Give nginx and the port-dispatcher a moment to start.
-sleep 3
+# Wait for pasta to bind and nginx to start (may take longer under load).
+CURL_RC=1
+for i in $(seq 1 10); do
+    sleep 2
+    CURL_OUT=$(curl -sf --max-time 3 "http://localhost:${HOST_PORT}/" 2>&1)
+    CURL_RC=$?
+    if [ "$CURL_RC" -eq 0 ]; then break; fi
+done
 
 # 3. curl reaches nginx through the port forward
-CURL_OUT=$(curl -sf --max-time 5 "http://localhost:${HOST_PORT}/" 2>&1)
-CURL_RC=$?
 if [ "$CURL_RC" -eq 0 ] && echo "$CURL_OUT" | grep -qi "nginx\|Welcome"; then
     pass "curl http://localhost:${HOST_PORT}/ returns nginx response"
 else
