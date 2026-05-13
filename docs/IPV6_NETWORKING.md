@@ -71,44 +71,152 @@ network.
 
 ---
 
+## IPv6 Address Hierarchy
+
+There are three distinct IPv6 addresses in play — one per tier — and it matters
+which tier is the NAT boundary:
+
+| Tier | Address | Type | How assigned |
+|---|---|---|---|
+| Mac `en0` | `2601:600:9300:849::abcd` | Real GUA | Router SLAAC |
+| VM `eth0` | `2601:600:9300:849:a449:19ff:fee3:36ca` | Real GUA (same /64!) | Relay-synthesised RA + VM SLAAC |
+| Container (bridge, future) | `fd00:pelagos:<hash>::2` | ULA (private) | pelagos assigns |
+
+The Mac and VM addresses share the same `/64` prefix — they are peers on the same
+network segment from the router's perspective, not in a parent-child relationship.
+The container ULA is private and masqueraded through the VM's GUA on outbound (NAT66
+at the VM boundary only, not at the Mac boundary).
+
+pasta containers bypass this entirely: pasta relays the VM's dual-stack `eth0`
+directly, so the container appears to the internet as the VM's GUA with no NAT.
+
+```mermaid
+graph TD
+    subgraph Internet["Internet / upstream router"]
+        INET[Internet]
+        RTR[Router<br/>2601:600:9300:849::1]
+    end
+    subgraph Mac["macOS host"]
+        EN0[en0<br/>GUA: 2601:600:9300:849::abcd]
+        UTUN[utun10<br/>anchor: fd00::1/128<br/>route: vm_gua → utun10]
+        RELAY[pelagos relay<br/>RA synthesis · NDP proxy · frame wrap]
+    end
+    subgraph VM["Alpine VM"]
+        ETH0[eth0<br/>GUA: 2601:600:9300:849:a449:…:36ca<br/>same /64 as host]
+        subgraph pasta_ctr["pasta container (no --publish)"]
+            PASTA_C[container netns<br/>IPv4 + IPv6 via pasta relay]
+        end
+        subgraph bridge_ctr["bridge container (--publish, future)"]
+            BRIDGE_C[container netns<br/>ULA: fd00:pelagos:hash::2<br/>NAT66 → VM GUA]
+        end
+    end
+
+    INET <-->|IPv6| RTR
+    RTR <-->|IPv6, dst=en0_mac| EN0
+    EN0 <--> UTUN
+    UTUN <--> RELAY
+    RELAY <-->|AVF socket, Ethernet frames| ETH0
+    ETH0 <-->|pasta relays VM eth0| PASTA_C
+    ETH0 <-->|bridge + NAT66| BRIDGE_C
+```
+
+---
+
 ## Packet Path
 
-### Outbound (VM → internet)
+### Outbound VM → internet
 
-```
-VM eth0  →  relay (avf socket)  →  utun10  →  macOS routing table
-                                                    │  default via en0
-                                                    ▼
-                                               en0 → upstream router → internet
-```
+```mermaid
+sequenceDiagram
+    participant C as VM eth0
+    participant R as relay (userspace)
+    participant U as utun10
+    participant K as macOS kernel
+    participant E as en0
+    participant I as internet
 
-- The relay receives raw Ethernet frames from the AVF socket, strips the 14-byte
-  Ethernet header, prepends a 4-byte utun AF header (`AF_INET6 = 30`), and writes
-  to the utun fd.
-- The macOS kernel sees an incoming IPv6 packet on utun10 and routes it via the
-  default route (en0).  `net.inet6.ip6.forwarding = 1` must be set (it is by
-  default on most systems).
-- Source address is the VM's GUA — no NAT.
-
-### Inbound (internet → VM)
-
-```
-internet → upstream router → en0 (host)
-                                  │  kernel sees dst=vm_gua, looks up route
-                                  │  host route: vm_gua → utun10  (added by pfctl)
-                                  ▼
-                             utun10  →  relay (reads from utun fd)
-                                  │  prepend Ethernet header (dst=vm_mac, src=GATEWAY_MAC)
-                                  ▼
-                             relay (avf socket) → VM eth0
+    C->>R: raw Ethernet frame<br/>(src=vm_gua, dst=GATEWAY_MAC)
+    R->>R: strip 14-byte Ethernet header<br/>prepend 4-byte utun AF_INET6 header
+    R->>U: write IPv6 packet to utun fd
+    U->>K: kernel receives on utun10
+    K->>K: routing table: default via en0<br/>src=vm_gua (no NAT)
+    K->>E: forward via en0
+    E->>I: IPv6 packet, src=vm_gua
 ```
 
-- The pfctl helper adds a `/128` host route for the VM's GUA pointing at utun10
-  when `AssignUtunAlias` is called.
-- Inbound packets addressed to vm_gua arrive at en0, and the kernel's routing table
-  directs them to utun10.
-- The relay reads from utun_fd, wraps in an Ethernet frame with `dst = vm_mac` and
-  `src = GATEWAY_MAC (02:00:00:00:00:01)`, and delivers to the VM.
+- Source address is the VM's GUA throughout — no NAT at any hop.
+- `net.inet6.ip6.forwarding = 1` on the Mac kernel allows utun10 → en0 forwarding
+  (set by default on most macOS systems).
+
+### Inbound internet → VM
+
+```mermaid
+sequenceDiagram
+    participant I as internet
+    participant E as en0
+    participant K as macOS kernel
+    participant U as utun10
+    participant R as relay (userspace)
+    participant C as VM eth0
+
+    I->>E: IPv6 packet, dst=vm_gua
+    E->>K: arrives at en0
+    K->>K: host route: vm_gua/128 → utun10<br/>(added by pfctl at SLAAC completion)
+    K->>U: forward to utun10
+    U->>R: relay reads from utun fd
+    R->>R: strip utun header<br/>prepend Ethernet (dst=vm_mac, src=GATEWAY_MAC)
+    R->>C: inject via AVF socket
+```
+
+- The `/128` host route is added by `pfctl_assign_utun_alias` when the VM's GUA
+  is first detected (first non-DAD packet sourced from vm_gua).
+- The relay wraps the raw IP packet in an Ethernet frame so the VM's kernel sees
+  a normal L2 delivery addressed to its own MAC.
+
+### pasta container → internet (dual-stack, no NAT)
+
+```mermaid
+sequenceDiagram
+    participant APP as app in container
+    participant P as pasta (userspace, VM)
+    participant E as VM eth0
+    participant R as relay (macOS)
+    participant I as internet
+
+    APP->>P: IPv6 packet (any dst)
+    P->>P: relay via VM eth0 network stack
+    P->>E: packet exits VM eth0<br/>src=vm_gua (pasta uses VM addr)
+    E->>R: AVF socket → relay
+    R->>I: utun10 → en0 → internet<br/>src=vm_gua, no NAT
+```
+
+- pasta runs inside the VM on the VM's network namespace. It sees `eth0` (GUA),
+  so both IPv4 (NAT44) and IPv6 (no NAT) work automatically.
+- The container appears to the internet as the VM's GUA.
+
+### bridge container → internet (future: NAT66)
+
+```mermaid
+sequenceDiagram
+    participant APP as app in container
+    participant NS as container netns<br/>ULA: fd00:pelagos:h::2
+    participant BR as pelagos0 bridge<br/>(inside VM)
+    participant NFT as nftables NAT66<br/>(inside VM)
+    participant E as VM eth0<br/>GUA: 2601:…:36ca
+    participant R as relay (macOS)
+    participant I as internet
+
+    APP->>NS: IPv6 packet, dst=internet
+    NS->>BR: src=fd00:pelagos:h::2
+    BR->>NFT: MASQUERADE rule<br/>(--nat66 flag enables this)
+    NFT->>E: src rewritten → vm_gua
+    E->>R: AVF socket → relay
+    R->>I: utun10 → en0 → internet<br/>src=vm_gua
+```
+
+- One NAT boundary only: container ULA → VM GUA.
+- The Mac's `en0` GUA is never involved in the NAT — the VM's GUA is the exit point.
+- Requires `--nat66` opt-in in pelagos (not yet implemented, issue #244).
 
 ---
 
