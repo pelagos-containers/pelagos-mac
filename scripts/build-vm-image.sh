@@ -480,13 +480,25 @@ if [ ! -f "$INITRAMFS_OUT" ] \
     fi
 
     # bridge networking modules: required for pelagos bridge mode inside the VM.
-    # bridge.ko     — kernel Ethernet bridge (pelagos0)
-    # br_netfilter.ko — makes nftables/netfilter rules apply to bridged packets;
-    #                   without it the FORWARD chain is invisible to bridge traffic
-    #                   and nftables DNAT/MASQUERADE rules have no effect
-    # veth.ko       — virtual ethernet pairs that connect containers to the bridge
-    mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/net/bridge"
-    mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/net"
+    #
+    # All three .ko files are sourced from $NETMOD_BASE, which is derived from
+    # $KVER detected from the same modloop squashfs that produced the running
+    # kernel (vmlinuz-lts).  Module paths are therefore version-locked to the
+    # kernel by construction — there is no risk of staging modules from a
+    # different kernel version or flavor.
+    #
+    # These modules exist in linux-lts.  linux-virt (not the default) may omit
+    # them; missing modules emit a WARNING rather than exiting so the image build
+    # still succeeds — bridge mode will simply fail at runtime in that case.
+    #
+    # bridge.ko       — kernel Ethernet bridge (pelagos0 and named networks)
+    # br_netfilter.ko — makes nftables/netfilter rules (FORWARD, DNAT,
+    #                   MASQUERADE) visible to bridged traffic; without it the
+    #                   FORWARD chain is bypassed and port forwarding has no effect
+    # veth.ko         — virtual ethernet pairs connecting containers to the bridge
+    #
+    # The staged modules.dep (below) covers all linux-lts modules, so
+    # `modprobe bridge` automatically pulls br_netfilter as a dependency.
     for ko_src in \
         "$NETMOD_BASE/net/bridge/bridge.ko" \
         "$NETMOD_BASE/net/bridge/br_netfilter.ko" \
