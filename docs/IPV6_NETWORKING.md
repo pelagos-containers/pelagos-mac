@@ -1,7 +1,7 @@
 # IPv6 Networking in pelagos-mac
 
-*VM-level IPv6 implemented in v0.6.15 (PRs #247, #250). Container-level IPv6 (#244)
-is in progress — see Current Status and Container IPv6 Approach below.*
+*VM-level IPv6 implemented in v0.6.15 (PRs #247, #250). Container IPv6 via pasta
+is complete (PR #279) — see Container IPv6 Approach below.*
 
 ---
 
@@ -50,45 +50,39 @@ VPN tunnel subnets, container bridges, downstream routers — requires additiona
 residential customers, but some delegate only a `/64`, making the network flat
 by constraint with nothing left to sub-delegate to downstream segments.
 
-### NAT66 and the end-to-end principle
+### NAT66 — why pelagos-mac does not need it
 
-The IETF position (RFC 5902, RFC 6296) is that NAT66 (many-to-one ULA-to-GUA
-masquerade) is an antipattern that recreates IPv4 NAT's problems: stateful
-translation at the border, broken application-layer protocols, and asymmetric
-reachability. The correct solution is proper prefix delegation so every host has
-a real GUA.
+NAT66 (ULA-to-GUA masquerade) was considered as the path for giving bridge
+containers IPv6 internet access.  It is not needed.
 
-pelagos uses NAT66 for container network namespaces as a deliberate pragmatic
-choice, not a philosophical one. The objection to NAT66 assumes the NATted host
-should be a full internet participant. Containers on a developer laptop are
-production-grade workloads under active development: they need real outbound IPv6
-(pulling packages, hitting APIs, testing against external services) and may need
-inbound IPv6 (testing services from the LAN or internet). NAT66 satisfies both
-requirements correctly in this context. The alternative — giving every container
-a GUA from the host's /64 — requires the host to have a properly delegated prefix
-with room to spare, which cannot be assumed on a developer laptop on any arbitrary
-network.
+The insight is that **bridge mode is for container-to-container L2 communication
+only** — not for internet access.  A container that needs internet uses pasta as
+its primary interface, which relays the VM's dual-stack `eth0` directly: no NAT,
+real GUA source address, full IPv6.  A container that needs both internet and c2c
+uses the hybrid approach (pasta primary + bridge secondary).  A pure bridge
+container is c2c-only by design and does not need IPv6 internet.
+
+This avoids NAT66 entirely and sidesteps the `dev_forward_change()` complication
+that required its removal from pelagos v0.61.0.
 
 ---
 
 ## IPv6 Address Hierarchy
 
-There are three distinct IPv6 addresses in play — one per tier — and it matters
-which tier is the NAT boundary:
+There are two real IPv6 addresses in play — Mac and VM — plus the private IPv4
+addresses inside the VM for bridge networking:
 
 | Tier | Address | Type | How assigned |
 |---|---|---|---|
 | Mac `en0` | `2601:600:9300:849::abcd` | Real GUA | Router SLAAC |
 | VM `eth0` | `2601:600:9300:849:a449:19ff:fee3:36ca` | Real GUA (same /64!) | Relay-synthesised RA + VM SLAAC |
-| Container (bridge, future) | `fd00:pelagos:<hash>::2` | ULA (private) | pelagos assigns |
+| pasta container | appears as VM's GUA | — | pasta relays VM's stack; no separate address |
+| bridge container | `172.19.x.x` (IPv4 only) | Private | pelagos IPAM; c2c only, no IPv6 internet |
 
-The Mac and VM addresses share the same `/64` prefix — they are peers on the same
-network segment from the router's perspective, not in a parent-child relationship.
-The container ULA is private and masqueraded through the VM's GUA on outbound (NAT66
-at the VM boundary only, not at the Mac boundary).
-
-pasta containers bypass this entirely: pasta relays the VM's dual-stack `eth0`
-directly, so the container appears to the internet as the VM's GUA with no NAT.
+The Mac and VM addresses share the same `/64` prefix — peers from the router's
+perspective, not parent-child.  pasta containers inherit the VM's GUA directly with
+no NAT.  Bridge containers are c2c-only; containers needing both internet and c2c
+use the hybrid approach (pasta primary + bridge secondary).
 
 ```mermaid
 graph TD
@@ -103,11 +97,11 @@ graph TD
     end
     subgraph VM["Alpine VM"]
         ETH0[eth0<br/>GUA: 2601:600:9300:849:a449:…:36ca<br/>same /64 as host]
-        subgraph pasta_ctr["pasta container (no --publish)"]
-            PASTA_C[container netns<br/>IPv4 + IPv6 via pasta relay]
+        subgraph pasta_ctr["pasta container (default — with or without --publish)"]
+            PASTA_C[container netns<br/>IPv4 NAT44 + IPv6 no-NAT via pasta<br/>src = vm_gua]
         end
-        subgraph bridge_ctr["bridge container (--publish, future)"]
-            BRIDGE_C[container netns<br/>ULA: fd00:pelagos:hash::2<br/>NAT66 → VM GUA]
+        subgraph bridge_ctr["bridge container (explicit --network, c2c only)"]
+            BRIDGE_C[container netns<br/>172.19.x.x IPv4 only<br/>L2 segment for c2c]
         end
     end
 
@@ -116,8 +110,8 @@ graph TD
     EN0 <--> UTUN
     UTUN <--> RELAY
     RELAY <-->|AVF socket, Ethernet frames| ETH0
-    ETH0 <-->|pasta relays VM eth0| PASTA_C
-    ETH0 <-->|bridge + NAT66| BRIDGE_C
+    ETH0 <-->|pasta relays VM eth0 — no NAT for IPv6| PASTA_C
+    ETH0 <-->|bridge, IPv4 only| BRIDGE_C
 ```
 
 ---
@@ -194,29 +188,35 @@ sequenceDiagram
   so both IPv4 (NAT44) and IPv6 (no NAT) work automatically.
 - The container appears to the internet as the VM's GUA.
 
-### bridge container → internet (future: NAT66)
+### hybrid container → internet + c2c (pasta primary, bridge secondary)
+
+For containers that need both internet access and L2 c2c (e.g. a compose web
+service talking to a db on the same network), the hybrid approach attaches pasta
+as eth0 (internet + IPv6) and a bridge veth as eth1 (c2c segment).
 
 ```mermaid
 sequenceDiagram
     participant APP as app in container
-    participant NS as container netns<br/>ULA: fd00:pelagos:h::2
-    participant BR as pelagos0 bridge<br/>(inside VM)
-    participant NFT as nftables NAT66<br/>(inside VM)
-    participant E as VM eth0<br/>GUA: 2601:…:36ca
-    participant R as relay (macOS)
-    participant I as internet
+    participant ETH0 as eth0 (pasta tap)<br/>internet + IPv6
+    participant ETH1 as eth1 (bridge veth)<br/>c2c segment
+    participant P as pasta (VM userspace)
+    participant BR as pelagos0 bridge<br/>(VM kernel)
+    participant E as VM eth0
+    participant I as internet / sibling container
 
-    APP->>NS: IPv6 packet, dst=internet
-    NS->>BR: src=fd00:pelagos:h::2
-    BR->>NFT: MASQUERADE rule<br/>(--nat66 flag enables this)
-    NFT->>E: src rewritten → vm_gua
-    E->>R: AVF socket → relay
-    R->>I: utun10 → en0 → internet<br/>src=vm_gua
+    APP->>ETH0: IPv6 packet to internet<br/>(default route via pasta)
+    ETH0->>P: pasta relay
+    P->>E: exits VM eth0, src=vm_gua, no NAT
+    E->>I: internet
+
+    APP->>ETH1: IPv4 packet to sibling<br/>(bridge subnet route)
+    ETH1->>BR: L2 forwarding
+    BR->>I: sibling container direct
 ```
 
-- One NAT boundary only: container ULA → VM GUA.
-- The Mac's `en0` GUA is never involved in the NAT — the VM's GUA is the exit point.
-- Requires `--nat66` opt-in in pelagos (not yet implemented, issue #244).
+- Default route (0.0.0.0/0 and ::/0) goes via eth0 (pasta) — internet + IPv6, no NAT.
+- Bridge subnet route (e.g. 172.19.0.0/24) goes via eth1 — direct L2 to siblings.
+- pelagos supports `with_additional_network()` for attaching the bridge as secondary.
 
 ---
 
@@ -354,27 +354,13 @@ without specifying a network mode.  IPv6 is included automatically.
 
 Bridge mode provides a shared kernel L2 segment (`pelagos0` or a named bridge) so
 containers can reach each other directly by IP without going through the host.  It is
-the right choice for compose services (web container talking to a db container on the
-same network) but not for single containers that just need to expose ports.
+the right tool for compose services that need c2c communication — not for port
+forwarding or internet access.
 
 In bridge mode, containers sit on `172.19.0.0/24` (or a named network subnet) and get
-IPv4 internet via MASQUERADE.  IPv6 in bridge mode requires two additional things:
-
-1. **ULA address assignment** — each container veth needs a ULA prefix address
-   (`fd00:pelagos::<network-hash>::/64`), with a route via `fd00::1`.
-2. **NAT66 masquerade** — ULA container traffic must be masqueraded to the VM's GUA
-   on eth0 for outbound internet.
-
-**Complication from pelagos v0.61.0:** pelagos removed NAT66 because
-`net.ipv6.conf.all.forwarding=1` propagates via `dev_forward_change()` and disables
-`accept_ra` on all interfaces — breaking SLAAC on bare Linux hosts (T-Mobile tethering
-etc.).  Inside the VM this constraint does not apply: the VM's SLAAC is relay-driven,
-not kernel-native, so `all/forwarding=1` has no effect on it.
-
-The fix is a `--nat66` opt-in flag in pelagos (see issue #244).  `pelagos-guest` would
-pass `--nat66` when invoking bridge mode.  Bridge-scoped forwarding
-(`net.ipv6.conf.pelagos0.forwarding=1`, already present in v0.61.0) is sufficient for
-the per-bridge forwarding path without touching `all/forwarding`.
+IPv4 internet via MASQUERADE.  Bridge-only containers have **no IPv6 internet** —
+this is by design, not a gap.  A container that needs both c2c and internet should use
+the hybrid approach instead.
 
 ### hybrid containers (pasta primary + bridge secondary)
 
@@ -410,10 +396,12 @@ window of broken inbound.  Active connections and bulk transfers are unlikely to
 this; inbound connection attempts from the LAN will be flaky.  Phase 2 is a BPF
 listener on en0 that answers ongoing NS probes.
 
-**IPv6 for bridge containers (#244).**
-Containers using explicit bridge mode (named networks, compose c2c) get IPv4 only.  Requires
-`--nat66` opt-in flag in pelagos (see Container IPv6 Approach above) plus ULA address
-assignment on the container veth.
+**IPv6 for hybrid containers (pasta + bridge secondary) not yet wired up.**
+The hybrid attach path — pasta as primary interface, bridge veth as secondary for c2c
+— is supported by pelagos (`with_additional_network()`) but `pelagos-guest` does not
+yet expose a way to request it.  Containers needing both internet and c2c currently
+must choose one or the other.  Pure bridge-only containers are c2c and IPv4 by design
+and do not need IPv6 internet.
 
 **Prefix mobility not handled (#248).**
 If the host moves to a different network, the VM's GUA becomes invalid.  The relay
@@ -502,10 +490,9 @@ known `vm_gua`.
 
 | Work | Where | Issue | Why |
 |---|---|---|---|
-| pasta containers get IPv6 + port forwarding | pelagos-mac | PR #279 | Done — pasta is the default; relays VM's dual-stack eth0; --publish handled via pasta -t flags, no bridge needed |
-| Phase 2 BPF NS listener on en0 | pelagos-mac | #250 | Inbound reachability breaks after ~30 s idle; prerequisite for reliable inbound to bridge containers too |
-| `--nat66` opt-in flag | pelagos | pelagos#TBD | Re-enable IPv6 MASQUERADE without all/forwarding; needed for bridge-mode c2c container IPv6 only |
-| ULA address + NAT66 for bridge containers | pelagos + pelagos-mac | #244 | Depends on --nat66; only needed for explicit bridge/compose c2c networks, not single published-port containers |
+| pasta containers get IPv6 + port forwarding | pelagos-mac | PR #279 | Done — pasta is the default; relays VM's dual-stack eth0; --publish handled via pasta -t flags, no bridge or NAT66 needed |
+| Phase 2 BPF NS listener on en0 | pelagos-mac | #250 | Inbound reachability breaks after ~30 s idle; affects all containers using the VM's GUA for inbound |
+| Hybrid container support in pelagos-guest | pelagos-mac | — | Expose pasta-primary + bridge-secondary attach for containers needing both internet and c2c (compose use case) |
 | pf rules: restrict IPv6 forwarding to vm_gua only | pelagos-mac | — | Close LAN→utun10 forwarding surface |
 | Prefix mobility | pelagos-mac | #248 | Correctness on network change / roaming |
 | Stable VM MAC across restarts | pelagos-mac | — | Stable GUA; simpler NDP cache lifecycle |
