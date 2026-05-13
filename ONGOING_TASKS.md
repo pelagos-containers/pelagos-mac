@@ -132,6 +132,46 @@ to any client connecting at any time. `pelagos vm console [--profile build]` wor
   - `docs/ARCHITECTURE_MENTAL_MODEL.md`: False Assumption 2 now honestly acknowledges
     build VM is used in practice
 
+### Completed this session (2026-05-13 / SHA 1fe4041)
+
+- **Bridge module staging in Alpine fallback path** ✅
+  - `scripts/build-vm-image.sh`: stages `llc.ko → stp.ko → bridge.ko` in the
+    Alpine fallback path (Ubuntu path already fixed in #172)
+  - Previously `init` tried `modprobe bridge` but modules were absent from
+    initramfs — insmod silently failed via `|| true`
+
+- **Port forwarding design corrected** ✅
+  - Reverted auto-bridge-on-`--publish` in `run_container`: pasta already receives
+    `-t HOST_PORT:CONTAINER_PORT` from pelagos runtime (`network.rs:2412`);
+    Mac-side TCP proxy → pasta listener → container works without bridge or nftables DNAT
+  - Bridge mode is now explicit-only (`--network <name>`), not the default for ports
+
+- **NAT66 removed from design** ✅
+  - Bridge mode = c2c L2 only; no internet, no IPv6 internet by design
+  - Containers needing internet use pasta (default); containers needing both use
+    hybrid (pasta primary + bridge secondary via `with_additional_network()`)
+  - Issue #244 closed; `--nat66` pelagos flag will not be filed
+
+- **`docs/IPV6_NETWORKING.md` updated** ✅
+  - Full rewrite of Container IPv6 Approach, address hierarchy, Mermaid diagrams
+  - NAT66 section rewritten to explain why it's not needed
+  - Four packet flow sequenceDiagrams (VM outbound, VM inbound, pasta container,
+    hybrid container)
+  - Priority table updated; bridge→internet NAT66 diagram replaced with hybrid diagram
+
+- **Issue #277 updated** ✅ — rewritten as a concrete 4-test test plan for Mac execution;
+  issue #244 closed with resolved-approach explanation
+
+### Pending: test on macOS (issue #277)
+
+Rebuild VM image and run four tests inside the Alpine VM:
+1. Bridge modules load (`modprobe bridge; lsmod | grep bridge`)
+2. pasta port forwarding: `pelagos run -d --publish 8080:80 nginx` + `curl localhost:8080`
+3. Explicit bridge c2c: two containers on a named network, `ping` between them
+4. pasta sanity: `pelagos run --rm alpine wget -qO- http://ifconfig.me`
+
+Branch: `feat/bridge-networking-vm-alpine-fallback` (6 commits ahead of main)
+
 ### Open PRs (as of 2026-04-14)
 
 | PR | Repo | Branch | Status |

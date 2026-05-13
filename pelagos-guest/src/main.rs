@@ -1128,6 +1128,10 @@ fn run_container(
     for port_spec in publish {
         cmd.arg("--publish").arg(port_spec);
     }
+    // pasta handles --publish natively via its -t/-u port forwarding flags (pelagos
+    // passes them through when NetworkMode::Pasta is selected). Bridge mode is only
+    // needed when explicit container-to-container L2 connectivity is required via a
+    // named network. Do not auto-select bridge for --publish alone.
     if let Some(net) = network {
         cmd.arg("--network").arg(net);
     }

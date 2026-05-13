@@ -264,19 +264,27 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-echo "[4/8] Building pelagos-guest (cross-compile)"
+echo "[4/8] Checking pelagos-guest binary"
 # ---------------------------------------------------------------------------
-RUSTUP_CARGO="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo"
-if [ ! -x "$RUSTUP_CARGO" ]; then
-    RUSTUP_CARGO="cargo"
+# pelagos-guest is a Linux binary and should be built in the build VM
+# (full-rebuild.sh step 1 or manually). If not present, fall back to
+# cross-compiling from macOS with cargo-zigbuild as a convenience.
+if [ -x "$GUEST_BIN" ]; then
+    echo "  (pre-built: $GUEST_BIN)"
+else
+    echo "  not found -- building via cargo zigbuild (prefer building in build VM instead)..."
+    RUSTUP_CARGO="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo"
+    if [ ! -x "$RUSTUP_CARGO" ]; then
+        RUSTUP_CARGO="cargo"
+    fi
+    PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/opt/homebrew/bin:/usr/bin:$PATH" \
+        "$RUSTUP_CARGO" zigbuild \
+            --manifest-path "$REPO_ROOT/Cargo.toml" \
+            -p pelagos-guest \
+            --target aarch64-unknown-linux-musl \
+            --release
+    echo "  Built: $GUEST_BIN"
 fi
-PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/opt/homebrew/bin:/usr/bin:$PATH" \
-    "$RUSTUP_CARGO" zigbuild \
-        --manifest-path "$REPO_ROOT/Cargo.toml" \
-        -p pelagos-guest \
-        --target aarch64-unknown-linux-musl \
-        --release
-echo "  Built: $GUEST_BIN"
 
 # ---------------------------------------------------------------------------
 echo "[5/8] Downloading pelagos runtime binary (v${PELAGOS_VERSION})"
@@ -719,6 +727,23 @@ if [ ! -f "$INITRAMFS_OUT" ] \
         else
             echo "  WARNING: veth.ko not found in modloop — container bridge networking will be unavailable" >&2
         fi
+
+        # bridge + dependency chain: llc → stp → bridge
+        # The init script already loads these via busybox insmod in explicit order;
+        # they must be staged from the modloop or the insmod calls silently fail.
+        # Alpine linux-lts has the same llc → stp → bridge dependency chain as Ubuntu.
+        # (This mirrors the Ubuntu path above and the Ubuntu build-build-image.sh extraction.)
+        for ko_rel in net/llc/llc.ko net/802/stp.ko net/bridge/bridge.ko; do
+            src="$MODLOOP_DIR/modules/$KVER/kernel/$ko_rel"
+            dst="$INITRD_TMP/lib/modules/$KVER/kernel/$ko_rel"
+            if [ -f "$src" ]; then
+                mkdir -p "$(dirname "$dst")"
+                cp "$src" "$dst"
+                echo "  staged $(basename $ko_rel)"
+            else
+                echo "  WARNING: $ko_rel not found in modloop — bridge networking will be unavailable" >&2
+            fi
+        done
 
         OVERLAY_KO="$NETMOD_BASE/fs/overlayfs/overlay.ko"
         if [ -f "$OVERLAY_KO" ]; then
