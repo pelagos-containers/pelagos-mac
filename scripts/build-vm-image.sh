@@ -728,6 +728,23 @@ if [ ! -f "$INITRAMFS_OUT" ] \
             echo "  WARNING: veth.ko not found in modloop — container bridge networking will be unavailable" >&2
         fi
 
+        # bridge + dependency chain: llc → stp → bridge
+        # The init script already loads these via busybox insmod in explicit order;
+        # they must be staged from the modloop or the insmod calls silently fail.
+        # Alpine linux-lts has the same llc → stp → bridge dependency chain as Ubuntu.
+        # (This mirrors the Ubuntu path above and the Ubuntu build-build-image.sh extraction.)
+        for ko_rel in net/llc/llc.ko net/802/stp.ko net/bridge/bridge.ko; do
+            src="$MODLOOP_DIR/modules/$KVER/kernel/$ko_rel"
+            dst="$INITRD_TMP/lib/modules/$KVER/kernel/$ko_rel"
+            if [ -f "$src" ]; then
+                mkdir -p "$(dirname "$dst")"
+                cp "$src" "$dst"
+                echo "  staged $(basename $ko_rel)"
+            else
+                echo "  WARNING: $ko_rel not found in modloop — bridge networking will be unavailable" >&2
+            fi
+        done
+
         OVERLAY_KO="$NETMOD_BASE/fs/overlayfs/overlay.ko"
         if [ -f "$OVERLAY_KO" ]; then
             mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/fs/overlayfs"

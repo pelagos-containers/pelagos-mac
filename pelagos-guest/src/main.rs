@@ -1128,7 +1128,20 @@ fn run_container(
     for port_spec in publish {
         cmd.arg("--publish").arg(port_spec);
     }
-    if let Some(net) = network {
+    // Port forwarding requires bridge mode: the Mac-side TCP proxy forwards
+    // HOST_PORT → 192.168.105.2:CONTAINER_PORT, which the VM must DNAT to the
+    // container via nftables prerouting. pasta does not set up that DNAT rule.
+    // If the caller did not specify a network mode, auto-select bridge whenever
+    // --publish is present so port forwarding works without the user needing to
+    // also pass --network bridge explicitly.
+    let effective_network = network.or_else(|| {
+        if !publish.is_empty() {
+            Some("bridge")
+        } else {
+            None
+        }
+    });
+    if let Some(net) = effective_network {
         cmd.arg("--network").arg(net);
     }
     for server in dns {
