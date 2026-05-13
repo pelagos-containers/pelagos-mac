@@ -3,7 +3,10 @@
 #
 # Rebuilds and installs:
 #   1. pelagos-mac (macOS binaries) -- brew install from local tarball
-#   2. pelagos-guest (Linux aarch64-musl) -- live-replaces running guest in the build VM
+#   2. pelagos-guest -- hot-swaps pre-built binary into running build VM
+#      (pelagos-guest must already be built; use full-rebuild.sh or build
+#       in the build VM: cd /mnt/Projects/pelagos-mac && cargo build
+#       --target aarch64-unknown-linux-musl --release -p pelagos-guest)
 #
 # Prerequisites:
 #   - The build VM (profile: build, 192.168.106.2) must be running and reachable via SSH.
@@ -69,10 +72,15 @@ fi
 # 2. pelagos-guest (Linux musl, runs inside build VM)
 # ---------------------------------------------------------------------------
 if [[ $SKIP_GUEST -eq 0 ]]; then
-    echo "[dev-reinstall] building pelagos-guest (aarch64-unknown-linux-musl)..."
-    # Must use rustup's cargo and zig linker (scripts/zig-aarch64-linux-musl.sh).
-    PATH=~/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/opt/homebrew/bin:/usr/bin:$PATH \
-        cargo build --target aarch64-unknown-linux-musl --release -p pelagos-guest
+    # pelagos-guest is a Linux binary -- it should already be built in the build VM
+    # (by full-rebuild.sh or manually). We just hot-swap it here.
+    GUEST_BIN_HOST="$REPO/target/aarch64-unknown-linux-musl/release/pelagos-guest"
+    if [[ ! -f "$GUEST_BIN_HOST" ]]; then
+        echo "[dev-reinstall] ERROR: pelagos-guest not found at $GUEST_BIN_HOST" >&2
+        echo "  Build it first: pelagos --profile $BUILD_PROFILE vm ssh -- \\" >&2
+        echo "    'cd /mnt/Projects/pelagos-mac && cargo build --target aarch64-unknown-linux-musl --release -p pelagos-guest'" >&2
+        exit 1
+    fi
 
     GUEST_BIN="/mnt/Projects/pelagos-mac/target/aarch64-unknown-linux-musl/release/pelagos-guest"
     PELAGOS_IN_VM="/mnt/Projects/pelagos/target/release/pelagos"
