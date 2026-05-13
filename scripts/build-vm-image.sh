@@ -479,6 +479,30 @@ if [ ! -f "$INITRAMFS_OUT" ] \
         echo "  WARNING: tun.ko not found in modloop" >&2
     fi
 
+    # bridge networking modules: required for pelagos bridge mode inside the VM.
+    # bridge.ko     — kernel Ethernet bridge (pelagos0)
+    # br_netfilter.ko — makes nftables/netfilter rules apply to bridged packets;
+    #                   without it the FORWARD chain is invisible to bridge traffic
+    #                   and nftables DNAT/MASQUERADE rules have no effect
+    # veth.ko       — virtual ethernet pairs that connect containers to the bridge
+    mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/net/bridge"
+    mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/net"
+    for ko_src in \
+        "$NETMOD_BASE/net/bridge/bridge.ko" \
+        "$NETMOD_BASE/net/bridge/br_netfilter.ko" \
+        "$NETMOD_BASE/drivers/net/veth.ko"; do
+        ko_name="$(basename "$ko_src")"
+        ko_rel="${ko_src#$NETMOD_BASE/}"
+        ko_dst="$INITRD_TMP/lib/modules/$KVER/kernel/$ko_rel"
+        if [ -f "$ko_src" ]; then
+            mkdir -p "$(dirname "$ko_dst")"
+            cp "$ko_src" "$ko_dst"
+            echo "  staged $ko_name"
+        else
+            echo "  WARNING: $ko_name not found in modloop — bridge networking may not work" >&2
+        fi
+    done
+
     # overlayfs: add overlay.ko if present as a module.
     OVERLAY_KO="$NETMOD_BASE/fs/overlayfs/overlay.ko"
     if [ -f "$OVERLAY_KO" ]; then
@@ -626,6 +650,9 @@ if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
     modprobe virtio_net          2>/dev/null || true
     modprobe virtio_blk          2>/dev/null || true
     modprobe tun                 2>/dev/null || true
+    modprobe bridge              2>/dev/null || true
+    modprobe br_netfilter        2>/dev/null || true
+    modprobe veth                2>/dev/null || true
     modprobe ext2                2>/dev/null || true
     # Create /dev/net/tun device node.  The tun kernel module registers
     # the device (char major 10, minor 200) but does not create the node

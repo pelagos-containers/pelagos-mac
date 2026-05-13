@@ -627,6 +627,14 @@ fn run_container(
 
     let mut cmd = Command::new(&pelagos);
     cmd.arg("run");
+    // Bridge mode: provides container-to-container IPv4/IPv6 (L2), internet
+    // via NAT44, and port forwarding via nftables DNAT — which is required for
+    // pelagos-mac's TCP proxy (Mac:HOST_PORT → 192.168.105.2:PORT → container).
+    // Pasta cannot receive those connections without -t flags that the guest
+    // protocol does not carry. Pinned explicitly so this is immune to future
+    // pelagos default changes. bridge.ko/br_netfilter.ko/veth.ko are staged
+    // into the initramfs by build-vm-image.sh.
+    cmd.arg("--network").arg("bridge");
     if let Some(n) = name {
         cmd.arg("--name").arg(n);
     }
@@ -979,10 +987,11 @@ fn handle_build(
     }
 
     // Run pelagos build.
-    // Use --network pasta: pasta is a userspace TCP/UDP proxy that works without
-    // bridge/veth kernel modules. Falls back gracefully when RUN steps don't need
-    // network. The default "auto" mode would pick "bridge" (we run as root) which
-    // requires kernel bridge support we don't have in the virt kernel.
+    // Use --network pasta for RUN steps: pasta is a userspace TCP/UDP proxy
+    // that shares the VM's eth0 routing without requiring bridge setup per
+    // build step. Bridge mode works for `run` (persistent containers) but
+    // adds unnecessary overhead for ephemeral build steps that just need
+    // outbound internet access.
     let mut cmd = Command::new(pelagos_bin());
     cmd.arg("build")
         .arg("-t")
