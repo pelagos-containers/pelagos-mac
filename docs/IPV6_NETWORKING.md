@@ -330,45 +330,59 @@ Inbound IPv6 reply arrives at en0
 
 ## Container IPv6 Approach
 
-Container IPv6 is split across two modes, because the bridge and pasta network paths
-have different constraints.
+Container IPv6 depends on which network mode is in use.  The key insight is that
+**bridge mode is not needed for port forwarding** — pasta handles `--publish` natively
+via its `-t`/`-u` flags.  Bridge mode exists solely to provide a shared L2 segment for
+container-to-container communication.
 
-### pasta containers (no --publish)
+### pasta containers (default)
 
-pasta runs inside the VM as root on the VM's network namespace.  It sees the VM's
-eth0, which already has a GUA via SLAAC.  pasta automatically relays both IPv4 and
-IPv6 — containers get dual-stack internet with no additional configuration.
-`pelagos-guest` auto-selects pasta when `--publish` is absent (as of PR #279), so
-most containers pick up IPv6 for free without any pelagos changes.
+pasta runs inside the VM on the VM's network namespace.  It sees the VM's eth0, which
+already has a GUA via SLAAC.  pasta automatically relays both IPv4 and IPv6:
 
-### bridge containers (--publish present)
+- **Outbound**: container traffic exits via pasta → VM eth0 → relay → internet.
+  Source address is the VM's GUA.  No NAT at any hop.
+- **Inbound (`--publish`)**: pasta binds `-t HOST_PORT:CONTAINER_PORT` on the VM's
+  addresses (both IPv4 and IPv6) and relays into the container's netns.  The Mac-side
+  TCP proxy targets `192.168.105.2:HOST_PORT`; pasta catches it and forwards to the
+  container.  No nftables DNAT required.
 
-Bridge mode is required when the Mac-side TCP proxy needs to reach a container via
-nftables PREROUTING DNAT.  In bridge mode, containers sit on `pelagos0`
-(172.19.0.0/24 or a named network subnet) and get IPv4 internet via MASQUERADE.
-IPv6 in bridge mode requires two things from the pelagos Linux runtime:
+`pelagos-guest` selects pasta by default (no `--network` flag).  Published ports work
+without specifying a network mode.  IPv6 is included automatically.
 
-1. **ULA address assignment** — each container veth needs a ULA prefix address (e.g.
-   derived from `fd00:pelagos::<network-hash>::/64`), route via `fd00::1` gateway.
+### bridge containers (explicit `--network <name>` only)
+
+Bridge mode provides a shared kernel L2 segment (`pelagos0` or a named bridge) so
+containers can reach each other directly by IP without going through the host.  It is
+the right choice for compose services (web container talking to a db container on the
+same network) but not for single containers that just need to expose ports.
+
+In bridge mode, containers sit on `172.19.0.0/24` (or a named network subnet) and get
+IPv4 internet via MASQUERADE.  IPv6 in bridge mode requires two additional things:
+
+1. **ULA address assignment** — each container veth needs a ULA prefix address
+   (`fd00:pelagos::<network-hash>::/64`), with a route via `fd00::1`.
 2. **NAT66 masquerade** — ULA container traffic must be masqueraded to the VM's GUA
-   on eth0 for outbound internet.  Inbound port-forwarded connections arrive at
-   `vm_gua:port` via the NDP proxy path and need pasta or nftables DNAT into the
-   container.
+   on eth0 for outbound internet.
 
-**Complication from pelagos v0.61.0:** pelagos removed NAT66 in v0.61.0 because
+**Complication from pelagos v0.61.0:** pelagos removed NAT66 because
 `net.ipv6.conf.all.forwarding=1` propagates via `dev_forward_change()` and disables
-the host's SLAAC `accept_ra` — breaking IPv6 on T-Mobile tethering and similar
-networks.  This was the correct fix for bare Linux hosts.  Inside the VM the
-constraint does not apply: the VM's eth0 SLAAC is driven by the relay's synthesised
-RA, not by the kernel's native RA handler, so `all/forwarding=1` inside the VM has
-no effect on SLAAC.
+`accept_ra` on all interfaces — breaking SLAAC on bare Linux hosts (T-Mobile tethering
+etc.).  Inside the VM this constraint does not apply: the VM's SLAAC is relay-driven,
+not kernel-native, so `all/forwarding=1` has no effect on it.
 
-The fix is to add `--nat66` as an explicit opt-in flag to pelagos (filed as a pelagos
-issue, referenced from #244).  pelagos-guest passes `--nat66` when invoking `pelagos
-run` in bridge mode.  The flag re-enables IPv6 MASQUERADE nftables rules without
-restoring the `all/forwarding` write — bridge-scoped forwarding
-(`net.ipv6.conf.pelagos0.forwarding=1`) already present in pelagos v0.61.0 is
-sufficient for the per-bridge forwarding path.
+The fix is a `--nat66` opt-in flag in pelagos (see issue #244).  `pelagos-guest` would
+pass `--nat66` when invoking bridge mode.  Bridge-scoped forwarding
+(`net.ipv6.conf.pelagos0.forwarding=1`, already present in v0.61.0) is sufficient for
+the per-bridge forwarding path without touching `all/forwarding`.
+
+### hybrid containers (pasta primary + bridge secondary)
+
+A container that needs both full internet access and L2 c2c connectivity can use both
+simultaneously: pasta as the primary interface (eth0, internet + port forwarding +
+IPv6) and a bridge veth as a secondary interface (eth1, c2c segment).  pelagos already
+supports `with_additional_network()` for attaching secondary bridge interfaces.
+Routing is: default route via eth0 (pasta), bridge subnet route via eth1.
 
 ---
 
@@ -381,9 +395,10 @@ sufficient for the per-bridge forwarding path.
 - **Inbound IPv6 (immediately after alias time)** — host route `/128` + gratuitous NA +
   unicast probe NS seed the router's NDP cache at alias time; return traffic is delivered.
 - **Both gateway addresses resolve** — `fe80::1` and `fd00::1` both answer NDP NS.
-- **pasta containers get IPv6** — pelagos-guest auto-selects pasta when `--publish` is
-  absent; pasta relays the VM's dual-stack eth0, so containers get outbound IPv6 with
-  no additional work (PR #279).
+- **pasta containers get IPv6** — pasta is the default network mode; it relays the
+  VM's dual-stack eth0 so containers get outbound IPv6 with no additional work.
+  `--publish` also works via pasta's native `-t`/`-u` port forwarding — no bridge or
+  NAT66 needed for single containers (PR #279).
 
 ### What doesn't work / known gaps
 
@@ -396,7 +411,7 @@ this; inbound connection attempts from the LAN will be flaky.  Phase 2 is a BPF
 listener on en0 that answers ongoing NS probes.
 
 **IPv6 for bridge containers (#244).**
-Containers using bridge mode (those with `--publish`) get IPv4 only.  Requires
+Containers using explicit bridge mode (named networks, compose c2c) get IPv4 only.  Requires
 `--nat66` opt-in flag in pelagos (see Container IPv6 Approach above) plus ULA address
 assignment on the container veth.
 
@@ -487,10 +502,10 @@ known `vm_gua`.
 
 | Work | Where | Issue | Why |
 |---|---|---|---|
-| pasta containers get IPv6 | pelagos-mac | PR #279 | Already done — pasta auto-selected when no --publish; VM's dual-stack eth0 relayed automatically |
+| pasta containers get IPv6 + port forwarding | pelagos-mac | PR #279 | Done — pasta is the default; relays VM's dual-stack eth0; --publish handled via pasta -t flags, no bridge needed |
 | Phase 2 BPF NS listener on en0 | pelagos-mac | #250 | Inbound reachability breaks after ~30 s idle; prerequisite for reliable inbound to bridge containers too |
-| `--nat66` opt-in flag | pelagos | pelagos#TBD | Re-enable IPv6 MASQUERADE without all/forwarding; needed for bridge-mode container IPv6 |
-| ULA address + NAT66 for bridge containers | pelagos + pelagos-mac | #244 | Depends on --nat66 landing in pelagos; pelagos-guest then passes --nat66 in bridge mode |
+| `--nat66` opt-in flag | pelagos | pelagos#TBD | Re-enable IPv6 MASQUERADE without all/forwarding; needed for bridge-mode c2c container IPv6 only |
+| ULA address + NAT66 for bridge containers | pelagos + pelagos-mac | #244 | Depends on --nat66; only needed for explicit bridge/compose c2c networks, not single published-port containers |
 | pf rules: restrict IPv6 forwarding to vm_gua only | pelagos-mac | — | Close LAN→utun10 forwarding surface |
 | Prefix mobility | pelagos-mac | #248 | Correctness on network change / roaming |
 | Stable VM MAC across restarts | pelagos-mac | — | Stable GUA; simpler NDP cache lifecycle |
