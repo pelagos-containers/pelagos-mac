@@ -129,10 +129,10 @@ set -euo pipefail
 
 echo "  building pelagos glibc (target/release)..."
 cd $PELAGOS_VM_DIR
-cargo build --release -p pelagos -p pelagos-dns 2>&1
+cargo build --release --bin pelagos --bin pelagos-dns 2>&1
 
 echo "  building pelagos musl (target/aarch64-unknown-linux-musl/release)..."
-cargo build --target aarch64-unknown-linux-musl --release -p pelagos -p pelagos-dns 2>&1
+cargo build --target aarch64-unknown-linux-musl --release --bin pelagos --bin pelagos-dns 2>&1
 
 echo "  building pelagos-guest musl..."
 cd $PELAGOS_MAC_VM_DIR
