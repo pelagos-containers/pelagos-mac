@@ -1297,7 +1297,7 @@ echo ""
 # Auto-deploy to the local Homebrew install if one is present.
 # Copies both vmlinuz and initramfs.gz together — they are a matched pair and
 # must never be deployed separately.
-BREW_PKGSHARE=$(ls -d /opt/homebrew/Cellar/pelagos-mac/*/share/pelagos-mac 2>/dev/null | tail -1)
+BREW_PKGSHARE=$(ls -d /opt/homebrew/Cellar/pelagos-mac/*/share/pelagos-mac 2>/dev/null | tail -1 || true)
 if [ -n "$BREW_PKGSHARE" ]; then
     cp "$KERNEL_OUT"    "$BREW_PKGSHARE/vmlinuz"
     cp "$INITRAMFS_OUT" "$BREW_PKGSHARE/initramfs.gz"
