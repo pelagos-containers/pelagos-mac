@@ -3,7 +3,7 @@
 #
 # Ensures every component is up to date: pelagos runtime (musl + glibc),
 # pelagos-guest, Alpine VM image (initramfs + bridge modules), macOS binaries,
-# and brew installation.
+# and brew installation. Optionally builds pelagos-ui for macOS and Linux.
 #
 # Build order (strict dependencies):
 #   1. Build all Linux binaries in build VM:
@@ -13,14 +13,16 @@
 #   2. Rebuild Alpine VM image (picks up fresh musl binaries + stages bridge modules)
 #   3. dev-reinstall.sh (macOS binaries only + pelagos-guest hot-swap in build VM)
 #   4. Restart default VM with new image
+#   5. (--with-ui) Build pelagos-ui for macOS (DMG) and Linux (.deb in build VM)
 #
 # Design principle: Linux binaries are built in Linux (the build VM).
-# macOS binaries (pelagos-mac, pelagos-tui, pelagos-pfctl) are built on macOS.
+# macOS binaries (pelagos-mac, pelagos-tui, pelagos-pfctl, pelagos-ui) are built on macOS.
 #
 # Prerequisites:
 #   - Build VM (profile: build) must be running: pelagos --profile build vm start
 #   - Rust toolchain installed via rustup (not Homebrew) on macOS for pelagos-mac
 #   - Build VM has musl-tools + rustup musl target (provisioned automatically on first run)
+#   - For --with-ui: Node 22 + npm on macOS; build VM UI deps provisioned automatically
 #
 # Usage:
 #   bash scripts/full-rebuild.sh [OPTIONS]
@@ -31,6 +33,7 @@
 #   --skip-mac          Skip rebuilding macOS binaries (passed to dev-reinstall.sh)
 #   --skip-guest        Skip rebuilding pelagos-guest (passed to dev-reinstall.sh)
 #   --no-restart        Do not restart the default VM after rebuild
+#   --with-ui           Build pelagos-ui for macOS (DMG + brew cask) and Linux (.deb)
 #   --build-profile P   Build VM profile name (default: build)
 
 set -euo pipefail
@@ -44,6 +47,7 @@ SKIP_VM_IMAGE=0
 SKIP_MAC=0
 SKIP_GUEST=0
 NO_RESTART=0
+WITH_UI=0
 BUILD_PROFILE="build"
 
 while [[ $# -gt 0 ]]; do
@@ -53,6 +57,7 @@ while [[ $# -gt 0 ]]; do
         --skip-mac)        SKIP_MAC=1;            shift ;;
         --skip-guest)      SKIP_GUEST=1;          shift ;;
         --no-restart)      NO_RESTART=1;          shift ;;
+        --with-ui)         WITH_UI=1;             shift ;;
         --build-profile)   BUILD_PROFILE="$2";    shift 2 ;;
         *)                 echo "Unknown: $1" >&2; exit 1 ;;
     esac
@@ -75,6 +80,8 @@ GUEST_MUSL_TARGET="$REPO_ROOT/target/aarch64-unknown-linux-musl/release/pelagos-
 # Inside the build VM, source trees are at /mnt/Projects/* (virtiofs).
 PELAGOS_VM_DIR="/mnt/Projects/pelagos"
 PELAGOS_MAC_VM_DIR="/mnt/Projects/pelagos-mac"
+PELAGOS_UI_DIR="$HOME/Projects/pelagos-ui"
+PELAGOS_UI_VM_DIR="/mnt/Projects/pelagos-ui"
 
 # ---------------------------------------------------------------------------
 # Pre-flight checks
@@ -208,6 +215,70 @@ if [[ $NO_RESTART -eq 0 ]]; then
     done
 else
     echo "[4/4] Skipping VM restart (--no-restart)"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 5: Build pelagos-ui (macOS DMG + Linux .deb)
+# ---------------------------------------------------------------------------
+if [[ $WITH_UI -eq 1 ]]; then
+    if [[ ! -d "$PELAGOS_UI_DIR" ]]; then
+        echo "ABORT: pelagos-ui repo not found at $PELAGOS_UI_DIR" >&2
+        exit 1
+    fi
+
+    # --- macOS build ---
+    echo "[5a] Building pelagos-ui for macOS..."
+    if ! command -v node >/dev/null 2>&1; then
+        echo "ABORT: node not found. Install Node 22: brew install node@22" >&2
+        exit 1
+    fi
+    (cd "$PELAGOS_UI_DIR" && npm ci --silent && bash scripts/build-release.sh)
+    echo "  installing via brew cask..."
+    brew reinstall --cask "$PELAGOS_UI_DIR/dist/Casks/pelagos-ui.rb" 2>/dev/null \
+        || brew install --cask "$PELAGOS_UI_DIR/dist/Casks/pelagos-ui.rb"
+    echo "  done: macOS DMG"
+
+    # --- Linux build in build VM ---
+    echo "[5b] Building pelagos-ui for Linux in build VM..."
+
+    # Provision Node 22 + GTK/webkit dev deps (idempotent).
+    "$PELAGOS_BIN" --profile "$BUILD_PROFILE" vm ssh -- bash -s <<'UI_PROVISION_EOF'
+set -euo pipefail
+if ! command -v node >/dev/null 2>&1; then
+    echo "  installing Node 22..."
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+    apt-get install -y -qq nodejs
+fi
+for pkg in libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev; do
+    if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+        echo "  installing $pkg..."
+        apt-get install -y -qq "$pkg"
+    fi
+done
+if ! cargo tauri --version >/dev/null 2>&1; then
+    echo "  installing cargo-tauri..."
+    cargo install tauri-cli --locked
+fi
+UI_PROVISION_EOF
+
+    "$PELAGOS_BIN" --profile "$BUILD_PROFILE" vm ssh -- bash -s <<UI_BUILD_EOF
+set -euo pipefail
+cd $PELAGOS_UI_VM_DIR
+echo "  npm ci..."
+npm ci --silent 2>&1
+echo "  cargo tauri build..."
+npm run tauri build 2>&1 | grep -E "Bundling|Finished|Built|Error|error"
+UI_BUILD_EOF
+
+    # Find the .deb output.
+    DEB_PATH=$(find "$PELAGOS_UI_DIR/target/release/bundle/deb" -name '*.deb' 2>/dev/null | head -1)
+    if [[ -n "$DEB_PATH" ]]; then
+        echo "  done: Linux .deb at $DEB_PATH"
+    else
+        echo "  WARNING: .deb not found -- check build output" >&2
+    fi
+else
+    echo "[5] Skipping pelagos-ui build (use --with-ui to include)"
 fi
 
 # ---------------------------------------------------------------------------
