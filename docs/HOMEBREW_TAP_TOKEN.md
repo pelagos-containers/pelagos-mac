@@ -11,138 +11,134 @@ repo after a successful release. Each repo updates a different file:
 | pelagos-ui | macOS cask | `Casks/pelagos-ui.rb` |
 
 All three use a GitHub Actions secret named `TAP_GITHUB_TOKEN` -- a
-fine-grained personal access token (PAT) with write access to the
-homebrew-tap repo.
+classic personal access token (PAT) with `public_repo` scope.
 
 ---
 
-## Prerequisites: org token policy
+## Why classic tokens, not fine-grained
 
-Fine-grained tokens scoped to org repos require the org to allow them.
-This only needs to be done once.
+As of May 2026, fine-grained personal access tokens **cannot write to
+organization repositories** via the GitHub Contents API, even when:
 
-1. Go to https://github.com/organizations/pelagos-containers/settings/personal-access-tokens
-2. Ensure **Allow access via fine-grained personal access tokens** is enabled
-3. **Require administrator approval** can be on or off (if on, you must
-   approve your own token request after creating it)
+- The token has Contents: Read and Write permission
+- The token is scoped to the correct repository
+- The token owner is an org admin with full push access
+- The repo reports `push: true` in the permissions response
+- The org has fine-grained tokens enabled with no approval required
+
+The API returns `HTTP 403 Resource not accessible by personal access
+token` on any write operation (PUT via Contents API, POST via Git Data
+API, and git push over HTTPS).
+
+This is a known, widespread, unresolved issue in the GitHub community:
+
+- [Discussion #106661](https://github.com/orgs/community/discussions/106661) -- fine-grained PAT cannot create pull requests (unresolved)
+- [Discussion #89800](https://github.com/orgs/community/discussions/89800) -- resource not accessible for fine-grained token (unresolved)
+- [Discussion #40910](https://github.com/orgs/community/discussions/40910) -- unable to access organization repo with fine-grained token
+- [Discussion #171513](https://github.com/orgs/community/discussions/171513) -- fine-grained tokens not working consistently (unresolved)
+
+Classic tokens with `public_repo` scope work correctly for this use
+case. They are coarser-grained (access to all public repos, not just
+homebrew-tap) but they are the only option that works.
+
+If GitHub fixes fine-grained tokens for org repos in the future, this
+doc should be updated to use them instead.
 
 ---
 
 ## Step 1: Create the token
 
-Go to: https://github.com/settings/personal-access-tokens/new
+Go to: https://github.com/settings/tokens/new
+
+This is the **classic** token page (not fine-grained).
 
 Fill in EXACTLY these values:
 
 | Field | Value |
 |-------|-------|
-| **Token name** | `homebrew-tap-updater` |
+| **Note** | `homebrew-tap-updater` |
 | **Expiration** | Custom -> 1 year from today (set a calendar reminder) |
-| **Resource owner** | **`pelagos-containers`** (NOT your personal account -- use the dropdown) |
 
-If `pelagos-containers` does not appear in the Resource owner dropdown,
-the org token policy is not enabled (see Prerequisites above).
+Under **Select scopes**, check ONLY:
 
-Under **Repository access**, select:
+- `public_repo` (under the `repo` section)
 
-- **Only select repositories**
-- Search for and select: **`pelagos-containers/homebrew-tap`**
-
-Under **Permissions** -> **Repository permissions**, set:
-
-| Permission | Access level |
-|-----------|-------------|
-| **Contents** | **Read and write** |
-
-Everything else stays at "No access". Do NOT set any other permissions.
+Do NOT check the full `repo` scope -- only `public_repo`. This grants
+read/write access to public repositories, which is all that's needed
+since homebrew-tap is public.
 
 Click **Generate token**. Copy the token value immediately -- you cannot
 see it again.
 
-### If admin approval is required
-
-If the org has "Require administrator approval" enabled, the token is
-created in a pending state. Go to:
-
-https://github.com/organizations/pelagos-containers/settings/personal-access-token-requests
-
-Find your pending request and approve it.
-
 ---
 
-## Step 2: Add the secret to each repo
+## Step 2: Distribute the token to all repos
 
-The same token value must be added to all three repos. Open each URL
-and add the secret:
-
-1. https://github.com/pelagos-containers/pelagos/settings/secrets/actions
-2. https://github.com/pelagos-containers/pelagos-mac/settings/secrets/actions
-3. https://github.com/pelagos-containers/pelagos-ui/settings/secrets/actions
-
-For each repo:
-- Click **New repository secret**
-- **Name**: `TAP_GITHUB_TOKEN`
-- **Value**: paste the token from Step 1
-- Click **Add secret**
-
-If updating an existing secret, click the pencil icon next to
-`TAP_GITHUB_TOKEN` and paste the new value.
-
----
-
-## Verification
-
-After adding the secrets, verify by re-running a failed tap update job:
+Run the setup script:
 
 ```bash
-# Find the failed run ID
-cd ~/Projects/pelagos-ui
-gh run list --limit 5
-
-# Re-run only the failed jobs
-gh run rerun <RUN_ID> --failed
-
-# Watch for success
-gh run watch <RUN_ID>
+bash scripts/setup-tap-token.sh
 ```
 
-Or just push a new tag and watch the full release pipeline.
+Paste the token when prompted. The script sets `TAP_GITHUB_TOKEN` in:
+- pelagos-containers/pelagos
+- pelagos-containers/pelagos-mac
+- pelagos-containers/pelagos-ui
+
+---
+
+## Step 3: Verify
+
+Test the token before relying on CI:
+
+```bash
+bash scripts/test-tap-token.sh <TOKEN>
+```
+
+This tests both read and write access to the homebrew-tap repo. If both
+pass, the token is correctly configured.
 
 ---
 
 ## Rotation
 
-Fine-grained tokens expire (1 year max). When expired, the tap update
-CI job fails but the build and release still succeed.
+Classic tokens expire (max 1 year with expiration, or no expiration).
+When expired, the tap update CI job fails but the build and release
+itself still succeeds.
 
-Symptoms of an expired or misconfigured token:
+Symptoms:
 
 | Error | Cause |
 |-------|-------|
 | `HTTP 401 Bad credentials` | Token expired or deleted |
-| `HTTP 403 Resource not accessible by personal access token` | Token exists but wrong permissions or wrong repo selected |
-| `pelagos-containers` not in Resource owner dropdown | Org token policy not enabled |
+| `HTTP 403 Resource not accessible` | Wrong token type (see "Why classic tokens" above) |
 
 To rotate:
-1. Create a new token (repeat Step 1)
-2. Update the secret in all three repos (repeat Step 2)
-3. Re-run the failed tap update job or wait for the next release
+1. Create a new classic token (repeat Step 1)
+2. Run `bash scripts/setup-tap-token.sh` (repeat Step 2)
+3. Run `bash scripts/test-tap-token.sh <TOKEN>` to verify
+4. Re-run failed tap update jobs or wait for next release
 
 ---
 
 ## Manual tap update (when CI is broken)
 
-If the token is broken and you need the tap updated now:
+If the token is broken and you need the tap updated immediately:
 
 ```bash
-# pelagos-ui cask example:
 VERSION=0.1.6
-DMG_URL="https://github.com/pelagos-containers/pelagos-ui/releases/download/v${VERSION}/Pelagos_${VERSION}_aarch64.dmg"
-SHA256=$(curl -sL "$DMG_URL" | shasum -a 256 | awk '{print $1}')
-
-# Clone the tap, edit the cask, push
+# Clone the tap repo (uses your SSH key, not the PAT)
 git clone git@github.com:pelagos-containers/homebrew-tap.git
 cd homebrew-tap
-# Edit Casks/pelagos-ui.rb with new version + sha256
-git add -A && git commit -m "chore: update pelagos-ui cask to v${VERSION}" && git push
+# Edit the relevant file (Formula/pelagos.rb, Casks/pelagos-ui.rb, etc.)
+# Update version and sha256
+git add -A && git commit -m "chore: update to v${VERSION}" && git push
 ```
+
+---
+
+## Cleanup: delete old fine-grained tokens
+
+If you previously created fine-grained tokens for this purpose, delete
+them at https://github.com/settings/personal-access-tokens to avoid
+confusion. They do not work for org repo writes.
