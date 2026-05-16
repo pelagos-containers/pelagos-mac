@@ -1,5 +1,8 @@
 # pelagos-mac — Claude Instructions
 
+**Read `docs/CONVENTIONS.md` before making changes.** It contains project
+rules learned from experience that override default behavior.
+
 ## What This Project Is
 
 pelagos-mac is the macOS CLI for the [pelagos](https://github.com/pelagos-containers/pelagos)
