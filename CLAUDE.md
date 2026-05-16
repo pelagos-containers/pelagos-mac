@@ -1,7 +1,8 @@
 # pelagos-mac — Claude Instructions
 
-**Read `docs/CONVENTIONS.md` before making changes.** It contains project
-rules learned from experience that override default behavior.
+**Before making code changes, read `docs/CONVENTIONS.md`.** It contains
+project rules learned from experience. Do not load it into context
+automatically — read it on demand when starting work.
 
 ## What This Project Is
 
