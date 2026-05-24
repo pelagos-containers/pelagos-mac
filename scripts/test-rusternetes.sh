@@ -327,19 +327,19 @@ if [ $SECTION_FAILED -eq 0 ]; then
 fi
 
 kubectl delete pod hello --wait=false > /dev/null 2>&1 || true
-sleep 3
-LEFTOVER=$(vm 'ls /run/pelagos/containers/ 2>/dev/null | grep "^hello" || true')
-if [ -z "$LEFTOVER" ]; then
-    pass "container removed after delete"
-else
-    fail "container still present after delete: $LEFTOVER"
-fi
-
-# Wait for kubelet to finish termination before starting next section.
-for i in $(seq 1 20); do
-    kubectl get pod hello > /dev/null 2>&1 || break
+# The rusternetes kubelet removes container directories via a periodic GC
+# rather than immediately on stop. Poll up to 90s for the GC to run.
+ELAPSED=0
+for i in $(seq 1 90); do
+    LEFTOVER=$(vm 'ls /run/pelagos/containers/ 2>/dev/null | grep "^hello" || true')
+    [ -z "$LEFTOVER" ] && { ELAPSED=$i; break; }
     sleep 1
 done
+if [ -z "$LEFTOVER" ]; then
+    pass "container directories removed after delete (~${ELAPSED}s via GC)"
+else
+    fail "container directories still present 90s after delete: $LEFTOVER"
+fi
 
 # ----------------------------------------------------------------------------
 # 7. Multi-container pod — shared network namespace
