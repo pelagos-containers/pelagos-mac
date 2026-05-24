@@ -160,11 +160,12 @@ pass "kubectl context set to rusternetes"
 
 step "4. Stack startup"
 
-info "Stopping any existing stack processes..."
-vm 'pkill -f pelagos-dockerd 2>/dev/null; pkill -f rusternetes.*api-server 2>/dev/null; pkill -f rusternetes.*kubelet 2>/dev/null; pkill -f rusternetes.*scheduler 2>/dev/null; true' > /dev/null 2>&1 || true
-sleep 2
-vm "rm -f $DB /var/run/pelagos-dockerd.sock" > /dev/null 2>&1 || true
-info "Old state cleared"
+info "Restarting build VM for a clean slate..."
+pelagos --profile build vm stop > /dev/null 2>&1 || true
+if ! pelagos --profile build ping > /dev/null 2>&1; then
+    fatal "build VM failed to restart"
+fi
+info "VM restarted"
 
 info "Starting pelagos-dockerd..."
 vm "nohup $DOCKERD --pelagos-bin $PELAGOS > /tmp/dockerd.log 2>&1 &" > /dev/null
