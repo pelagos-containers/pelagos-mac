@@ -994,7 +994,12 @@ fn main() {
                         mounts,
                         labels,
                         publish: cli.ports.clone(),
-                        network: network.first().cloned(),
+                        network: Some(
+                            network
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| "pasta".to_string()),
+                        ),
                         dns: dns.clone(),
                     },
                     tty,
@@ -1012,7 +1017,12 @@ fn main() {
                     env: env_map,
                     labels,
                     publish: cli.ports.clone(),
-                    network: network.first().cloned(),
+                    network: Some(
+                        network
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "pasta".to_string()),
+                    ),
                     dns: dns.clone(),
                 },
             );
