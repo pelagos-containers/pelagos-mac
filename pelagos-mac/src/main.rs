@@ -1809,10 +1809,7 @@ fn parse_volumes(volumes: &[String]) -> Vec<daemon::VirtiofsShare> {
             }
             let host_path = PathBuf::from(parts[0]);
             if !host_path.exists() {
-                log::error!(
-                    "volume host path does not exist: {}",
-                    host_path.display()
-                );
+                log::error!("volume host path does not exist: {}", host_path.display());
                 process::exit(1);
             }
             let container_path = parts[1].to_string();
@@ -3819,7 +3816,8 @@ mod tests {
     #[test]
     fn parse_volumes_basic() {
         use super::parse_volumes;
-        let specs = vec!["/host/foo:/container/bar".to_string()];
+        let tmp = std::env::temp_dir();
+        let specs = vec![format!("{}:/container/bar", tmp.display())];
         let shares = parse_volumes(&specs);
         assert_eq!(shares.len(), 1);
         assert_eq!(shares[0].tag, "share0");
@@ -3830,9 +3828,10 @@ mod tests {
     #[test]
     fn parse_volumes_readonly() {
         use super::parse_volumes;
+        let tmp = std::env::temp_dir();
         let specs = vec![
-            "/host/a:/ctr/a:ro".to_string(),
-            "/host/b:/ctr/b".to_string(),
+            format!("{}:/ctr/a:ro", tmp.display()),
+            format!("{}:/ctr/b", tmp.display()),
         ];
         let shares = parse_volumes(&specs);
         assert!(shares[0].read_only);
