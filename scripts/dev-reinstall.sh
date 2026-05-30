@@ -63,7 +63,9 @@ if [[ $SKIP_MAC -eq 0 ]]; then
 
     echo "[dev-reinstall] installing via brew..."
     brew uninstall pelagos-mac 2>/dev/null || true
-    HOMEBREW_DEVELOPER=1 HOMEBREW_NO_INSTALL_FROM_API=1 brew install pelagos-containers/tap/pelagos-mac
+    # Install from the formula file directly to avoid polluting the live brew tap
+    # git repo with local file:// URLs (which conflicts with brew update).
+    HOMEBREW_NO_INSTALL_FROM_API=1 brew install "$REPO/dist/tap/Formula/pelagos-mac.rb"
 
     echo "[dev-reinstall] macOS install done -- $(pelagos --version 2>&1 | head -1)"
 fi

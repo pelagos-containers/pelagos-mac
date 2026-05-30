@@ -22,7 +22,7 @@
 # To install locally after running this script:
 #
 #   brew uninstall pelagos-mac 2>/dev/null || true
-#   HOMEBREW_DEVELOPER=1 HOMEBREW_NO_INSTALL_FROM_API=1 brew install pelagos-containers/tap/pelagos-mac
+#   HOMEBREW_NO_INSTALL_FROM_API=1 brew install dist/tap/Formula/pelagos-mac.rb
 #
 # Prerequisites: out/ must exist (run scripts/build-vm-image.sh first).
 
@@ -117,7 +117,6 @@ echo "[release]   $(du -sh "$DIST/$VM_TARBALL" | awk '{print $1}')  sha256: ${VM
 # Write formula into dist/tap (canonical source) and sync to brew tap
 # ---------------------------------------------------------------------------
 TAP_FORMULA="$DIST/tap/Formula/pelagos-mac.rb"
-BREW_TAP_FORMULA="/opt/homebrew/Library/Taps/pelagos-containers/homebrew-tap/Formula/pelagos-mac.rb"
 
 mkdir -p "$DIST/tap/Formula"
 
@@ -186,13 +185,10 @@ class PelagosMac < Formula
 end
 FORMULA
 
-# Sync to the brew tap directory so no manual copy is needed at install time.
-if [[ -d "$(dirname "$BREW_TAP_FORMULA")" ]]; then
-    cp "$TAP_FORMULA" "$BREW_TAP_FORMULA"
-    echo "[release] synced formula to brew tap"
-else
-    echo "[release] warning: brew tap not found at $(dirname "$BREW_TAP_FORMULA") — run 'brew tap skeptomai/tap dist/tap' first"
-fi
+# The formula is intentionally NOT copied to the live brew tap git repo.
+# Copying there causes merge conflicts whenever the release workflow pushes
+# the GitHub-URL formula upstream and brew update pulls it.
+# dev-reinstall.sh installs directly from $TAP_FORMULA by file path instead.
 
 # ---------------------------------------------------------------------------
 # Summary
@@ -206,4 +202,4 @@ echo "  $TAP_FORMULA"
 echo ""
 echo "  To install:"
 echo "    brew uninstall pelagos-mac 2>/dev/null || true"
-echo "    HOMEBREW_DEVELOPER=1 HOMEBREW_NO_INSTALL_FROM_API=1 brew install pelagos-containers/tap/pelagos-mac"
+echo "    HOMEBREW_NO_INSTALL_FROM_API=1 brew install \"$TAP_FORMULA\""
