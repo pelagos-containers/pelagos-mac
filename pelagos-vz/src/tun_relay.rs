@@ -51,6 +51,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -350,6 +351,11 @@ fn run_relay(
     gua_prefix: Option<[u8; 16]>,
 ) {
     log::info!("tun_relay: relay loop started (relay_fd={relay_fd} utun_fd={utun_fd})");
+    // Periodic unsolicited RA interval (RFC 4861 §6.2.4 recommends 200–600s).
+    // Keeps the VM's default IPv6 route alive and the fe80::1 neighbour REACHABLE
+    // so that NUD does not silently remove the default route between RS/RA exchanges.
+    const RA_INTERVAL: Duration = Duration::from_secs(200);
+    let mut last_ra = Instant::now();
     let mut state = RelayState {
         vm_mac: None,
         gateway_ip4,
@@ -418,6 +424,23 @@ fn run_relay(
         if pollfds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
             log::info!("tun_relay: utun fd closed — relay exiting");
             break;
+        }
+
+        // Periodic unsolicited RA: keeps the VM's default IPv6 route alive and
+        // the fe80::1 neighbour REACHABLE so NUD cannot silently remove the route.
+        if last_ra.elapsed() >= RA_INTERVAL {
+            if let Some(gua_prefix) = state.gua_prefix {
+                let ra = build_ra(&gua_prefix);
+                send_to_avf(relay_fd, &ra);
+                log::debug!(
+                    "tun_relay: sent periodic RA (prefix={:02x}{:02x}{:02x}{:02x}:...)",
+                    gua_prefix[0],
+                    gua_prefix[1],
+                    gua_prefix[2],
+                    gua_prefix[3]
+                );
+            }
+            last_ra = Instant::now();
         }
     }
 
