@@ -2887,7 +2887,12 @@ fn handle_kubernetes_start(writer: &mut impl std::io::Write) -> std::io::Result<
 
     if !k8s_is_running("pelagos-dockerd") {
         let pelagos = pelagos_bin();
-        let _ = std::process::Command::new(&dockerd)
+        // setsid --fork double-forks: the intermediate setsid process exits
+        // immediately and is reaped by pelagos-guest; the target becomes an
+        // orphan adopted by init, so it never becomes a zombie when killed.
+        let _ = std::process::Command::new("setsid")
+            .arg("--fork")
+            .arg(&dockerd)
             .arg("--pelagos-bin")
             .arg(&pelagos)
             .stdin(std::process::Stdio::null())
@@ -2935,7 +2940,8 @@ fn handle_kubernetes_start(writer: &mut impl std::io::Write) -> std::io::Result<
         // (npm is not installed in the build VM). The dist/ is accessible in the
         // VM at this virtiofs path automatically.
         const CONSOLE_DIR: &str = "/mnt/Projects/rusternetes/console/dist";
-        let mut cmd = std::process::Command::new(&api_bin);
+        let mut cmd = std::process::Command::new("setsid");
+        cmd.arg("--fork").arg(&api_bin);
         let _ = cmd
             .args([
                 "--storage-backend",
@@ -2971,7 +2977,9 @@ fn handle_kubernetes_start(writer: &mut impl std::io::Write) -> std::io::Result<
     }
 
     if !k8s_is_running("kubelet") {
-        let _ = std::process::Command::new(&kubelet_bin)
+        let _ = std::process::Command::new("setsid")
+            .arg("--fork")
+            .arg(&kubelet_bin)
             .args([
                 "--node-name",
                 "pelagos-node",
