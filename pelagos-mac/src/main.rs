@@ -1808,6 +1808,13 @@ fn parse_volumes(volumes: &[String]) -> Vec<daemon::VirtiofsShare> {
                 process::exit(1);
             }
             let host_path = PathBuf::from(parts[0]);
+            if !host_path.exists() {
+                log::error!(
+                    "volume host path does not exist: {}",
+                    host_path.display()
+                );
+                process::exit(1);
+            }
             let container_path = parts[1].to_string();
             let read_only = parts.get(2).is_some_and(|s| *s == "ro");
             daemon::VirtiofsShare {
