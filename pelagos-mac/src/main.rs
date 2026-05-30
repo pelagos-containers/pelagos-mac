@@ -868,10 +868,8 @@ fn main() {
                 .arg("-o")
                 .arg("LogLevel=ERROR")
                 .arg("-o")
-                // Disable mux multiplexing entirely so user-level ~/.ssh/config
-                // ControlMaster settings don't cause "Broken pipe" noise on first
-                // connection.  Option B (pelagos-managed ControlPersist socket for
-                // faster repeated connections) is tracked in issue #252.
+                // Disable mux multiplexing so user-level ~/.ssh/config ControlMaster
+                // settings don't cause "Broken pipe" noise on first connection.
                 .arg("ControlMaster=no");
 
             // utun relay: the VM is directly routable at its per-profile guest IP.
