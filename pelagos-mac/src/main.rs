@@ -868,10 +868,8 @@ fn main() {
                 .arg("-o")
                 .arg("LogLevel=ERROR")
                 .arg("-o")
-                // Disable mux multiplexing entirely so user-level ~/.ssh/config
-                // ControlMaster settings don't cause "Broken pipe" noise on first
-                // connection.  Option B (pelagos-managed ControlPersist socket for
-                // faster repeated connections) is tracked in issue #252.
+                // Disable mux multiplexing so user-level ~/.ssh/config ControlMaster
+                // settings don't cause "Broken pipe" noise on first connection.
                 .arg("ControlMaster=no");
 
             // utun relay: the VM is directly routable at its per-profile guest IP.
@@ -994,7 +992,12 @@ fn main() {
                         mounts,
                         labels,
                         publish: cli.ports.clone(),
-                        network: network.first().cloned(),
+                        network: Some(
+                            network
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| "pasta".to_string()),
+                        ),
                         dns: dns.clone(),
                     },
                     tty,
@@ -1012,7 +1015,12 @@ fn main() {
                     env: env_map,
                     labels,
                     publish: cli.ports.clone(),
-                    network: network.first().cloned(),
+                    network: Some(
+                        network
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "pasta".to_string()),
+                    ),
                     dns: dns.clone(),
                 },
             );
@@ -1800,6 +1808,10 @@ fn parse_volumes(volumes: &[String]) -> Vec<daemon::VirtiofsShare> {
                 process::exit(1);
             }
             let host_path = PathBuf::from(parts[0]);
+            if !host_path.exists() {
+                log::error!("volume host path does not exist: {}", host_path.display());
+                process::exit(1);
+            }
             let container_path = parts[1].to_string();
             let read_only = parts.get(2).is_some_and(|s| *s == "ro");
             daemon::VirtiofsShare {
@@ -3804,7 +3816,8 @@ mod tests {
     #[test]
     fn parse_volumes_basic() {
         use super::parse_volumes;
-        let specs = vec!["/host/foo:/container/bar".to_string()];
+        let tmp = std::env::temp_dir();
+        let specs = vec![format!("{}:/container/bar", tmp.display())];
         let shares = parse_volumes(&specs);
         assert_eq!(shares.len(), 1);
         assert_eq!(shares[0].tag, "share0");
@@ -3815,9 +3828,10 @@ mod tests {
     #[test]
     fn parse_volumes_readonly() {
         use super::parse_volumes;
+        let tmp = std::env::temp_dir();
         let specs = vec![
-            "/host/a:/ctr/a:ro".to_string(),
-            "/host/b:/ctr/b".to_string(),
+            format!("{}:/ctr/a:ro", tmp.display()),
+            format!("{}:/ctr/b", tmp.display()),
         ];
         let shares = parse_volumes(&specs);
         assert!(shares[0].read_only);

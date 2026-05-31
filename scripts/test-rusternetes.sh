@@ -49,12 +49,24 @@ vm_out() { pelagos --profile build vm ssh -- "$@" 2>/dev/null | tr -d '\r' | hea
 
 PELAGOS_SRC=/mnt/Projects/pelagos
 RUSTERNETES_SRC=/mnt/Projects/rusternetes
-PELAGOS=$PELAGOS_SRC/target/debug/pelagos
-DOCKERD=$PELAGOS_SRC/target/debug/pelagos-dockerd
-API_SERVER=$RUSTERNETES_SRC/target/debug/api-server
-KUBELET=$RUSTERNETES_SRC/target/debug/kubelet
-SCHEDULER=$RUSTERNETES_SRC/target/debug/scheduler
+
+# Build outputs (on virtiofs — used for building only, never for running)
+PELAGOS_BUILD=$PELAGOS_SRC/target/debug/pelagos
+DOCKERD_BUILD=$PELAGOS_SRC/target/debug/pelagos-dockerd
+API_SERVER_BUILD=$RUSTERNETES_SRC/target/debug/api-server
+KUBELET_BUILD=$RUSTERNETES_SRC/target/debug/kubelet
+SCHEDULER_BUILD=$RUSTERNETES_SRC/target/debug/scheduler
+
+# Runtime paths (local ext4 — daemons run from here so they die cleanly on SIGTERM/SIGKILL)
+BIN_DIR=/tmp/rusternetes-bin
+PELAGOS=$BIN_DIR/pelagos
+DOCKERD=$BIN_DIR/pelagos-dockerd
+API_SERVER=$BIN_DIR/api-server
+KUBELET=$BIN_DIR/kubelet
+SCHEDULER=$BIN_DIR/scheduler
+
 DB=/tmp/rusternetes.db
+PIDS_DIR=/tmp/rusternetes-pids
 
 VM_IP=192.168.106.2
 
@@ -77,7 +89,7 @@ pass "VM is running"
 step "1. Preflight"
 
 # Verify pelagos source and binaries
-for bin in "$PELAGOS" "$DOCKERD"; do
+for bin in "$PELAGOS_BUILD" "$DOCKERD_BUILD"; do
     if vm "test -f $bin" > /dev/null 2>&1; then
         pass "found $(basename $bin)"
     else
@@ -139,6 +151,17 @@ if ! vm_live "cd $RUSTERNETES_SRC && cargo build -p rusternetes-kubectl"; then
 fi
 pass "rusternetes-kubectl built"
 
+# Copy binaries from virtiofs to local ext4 so daemons die cleanly on SIGTERM/SIGKILL.
+# Running long-lived processes directly from a virtiofs mount causes D-state on kill.
+info "Copying binaries to local storage..."
+vm "mkdir -p $BIN_DIR && \
+    cp $API_SERVER_BUILD $API_SERVER && \
+    cp $KUBELET_BUILD    $KUBELET    && \
+    cp $SCHEDULER_BUILD  $SCHEDULER  && \
+    cp $DOCKERD_BUILD    $DOCKERD    && \
+    cp $PELAGOS_BUILD    $PELAGOS" > /dev/null
+pass "binaries copied to $BIN_DIR"
+
 # ----------------------------------------------------------------------------
 # 3. kubectl context
 # ----------------------------------------------------------------------------
@@ -161,13 +184,32 @@ pass "kubectl context set to rusternetes"
 step "4. Stack startup"
 
 info "Stopping any existing stack processes..."
-vm 'pkill -f pelagos-dockerd 2>/dev/null; pkill -f rusternetes.*api-server 2>/dev/null; pkill -f rusternetes.*kubelet 2>/dev/null; pkill -f rusternetes.*scheduler 2>/dev/null; true' > /dev/null 2>&1 || true
-sleep 2
-vm "rm -f $DB /var/run/pelagos-dockerd.sock" > /dev/null 2>&1 || true
+# Kill by stored PIDs to avoid pkill self-matching (pkill -f with a path that
+# appears in the calling shell's own argv would kill the shell itself before
+# subsequent commands like 'rm -f $DB' could run).
+vm "
+if [ -d $PIDS_DIR ]; then
+    for f in $PIDS_DIR/*.pid; do
+        [ -f \"\$f\" ] || continue
+        pid=\$(cat \"\$f\")
+        kill \"\$pid\" 2>/dev/null || true
+    done
+    sleep 3
+    for f in $PIDS_DIR/*.pid; do
+        [ -f \"\$f\" ] || continue
+        pid=\$(cat \"\$f\")
+        kill -9 \"\$pid\" 2>/dev/null || true
+    done
+fi
+rm -rf $PIDS_DIR
+" > /dev/null 2>&1 || true
+sleep 1
+
+vm "rm -f $DB ${DB}-wal ${DB}-shm /var/run/pelagos-dockerd.sock && mkdir -p $PIDS_DIR" > /dev/null 2>&1 || true
 info "Old state cleared"
 
 info "Starting pelagos-dockerd..."
-vm "nohup $DOCKERD --pelagos-bin $PELAGOS > /tmp/dockerd.log 2>&1 &" > /dev/null
+vm "nohup $DOCKERD --pelagos-bin $PELAGOS > /tmp/dockerd.log 2>&1 & echo \$! > $PIDS_DIR/dockerd.pid" > /dev/null
 sleep 2
 
 if vm "test -S /var/run/pelagos-dockerd.sock" > /dev/null 2>&1; then
@@ -179,15 +221,15 @@ else
 fi
 
 info "Starting api-server..."
-vm "nohup env DOCKER_HOST=unix:///var/run/pelagos-dockerd.sock $API_SERVER --storage-backend sqlite --data-dir $DB --skip-auth --tls --tls-self-signed --tls-san 'localhost,127.0.0.1,$VM_IP' > /tmp/apiserver.log 2>&1 &" > /dev/null
+vm "nohup env DOCKER_HOST=unix:///var/run/pelagos-dockerd.sock $API_SERVER --storage-backend sqlite --data-dir $DB --skip-auth --tls --tls-self-signed --tls-san 'localhost,127.0.0.1,$VM_IP' > /tmp/apiserver.log 2>&1 & echo \$! > $PIDS_DIR/apiserver.pid" > /dev/null
 sleep 2
 
 info "Starting kubelet..."
-vm "nohup env DOCKER_HOST=unix:///var/run/pelagos-dockerd.sock RUST_MIN_STACK=8388608 $KUBELET --node-name pelagos-node --storage-backend sqlite --data-dir $DB --network bridge > /tmp/kubelet.log 2>&1 &" > /dev/null
+vm "nohup env DOCKER_HOST=unix:///var/run/pelagos-dockerd.sock RUST_MIN_STACK=8388608 $KUBELET --node-name pelagos-node --storage-backend sqlite --data-dir $DB --network bridge > /tmp/kubelet.log 2>&1 & echo \$! > $PIDS_DIR/kubelet.pid" > /dev/null
 sleep 2
 
 info "Starting scheduler..."
-vm "nohup $SCHEDULER --storage-backend sqlite --data-dir $DB > /tmp/scheduler.log 2>&1 &" > /dev/null
+vm "nohup $SCHEDULER --storage-backend sqlite --data-dir $DB > /tmp/scheduler.log 2>&1 & echo \$! > $PIDS_DIR/scheduler.pid" > /dev/null
 sleep 1
 
 info "Waiting for pelagos-node to register (up to 30s)..."
@@ -285,12 +327,18 @@ if [ $SECTION_FAILED -eq 0 ]; then
 fi
 
 kubectl delete pod hello --wait=false > /dev/null 2>&1 || true
-sleep 3
-LEFTOVER=$(vm 'ls /run/pelagos/containers/ 2>/dev/null | grep "^hello" || true')
+# The rusternetes kubelet removes container directories via a periodic GC
+# rather than immediately on stop. Poll up to 90s for the GC to run.
+ELAPSED=0
+for i in $(seq 1 90); do
+    LEFTOVER=$(vm 'ls /run/pelagos/containers/ 2>/dev/null | grep "^hello" || true')
+    [ -z "$LEFTOVER" ] && { ELAPSED=$i; break; }
+    sleep 1
+done
 if [ -z "$LEFTOVER" ]; then
-    pass "container removed after delete"
+    pass "container directories removed after delete (~${ELAPSED}s via GC)"
 else
-    fail "container still present after delete: $LEFTOVER"
+    fail "container directories still present 90s after delete: $LEFTOVER"
 fi
 
 # ----------------------------------------------------------------------------
@@ -301,7 +349,7 @@ step "7. Multi-container pod (shared netns)"
 
 kubectl delete pod netns-pod --wait=false > /dev/null 2>&1 || true
 vm 'rm -rf /run/pelagos/containers/netns-pod_*' > /dev/null 2>&1 || true
-sleep 1
+sleep 2
 
 kubectl apply -f - > /dev/null <<'YAML'
 apiVersion: v1
@@ -335,6 +383,11 @@ else
 fi
 
 kubectl delete pod netns-pod --wait=false > /dev/null 2>&1 || true
+# Wait for kubelet to finish termination before starting next section.
+for i in $(seq 1 20); do
+    kubectl get pod netns-pod > /dev/null 2>&1 || break
+    sleep 1
+done
 
 # ----------------------------------------------------------------------------
 # 8. emptyDir volume
@@ -344,7 +397,7 @@ step "8. emptyDir volume"
 
 kubectl delete pod emptydir-pod --wait=false > /dev/null 2>&1 || true
 vm 'rm -rf /run/pelagos/containers/emptydir-pod_*' > /dev/null 2>&1 || true
-sleep 1
+sleep 2
 
 kubectl apply -f - > /dev/null <<'YAML'
 apiVersion: v1
@@ -387,6 +440,11 @@ else
 fi
 
 kubectl delete pod emptydir-pod --wait=false > /dev/null 2>&1 || true
+# Wait for kubelet to finish termination before starting next section.
+for i in $(seq 1 20); do
+    kubectl get pod emptydir-pod > /dev/null 2>&1 || break
+    sleep 1
+done
 
 # ----------------------------------------------------------------------------
 # 9. hostPath volume
@@ -396,7 +454,7 @@ step "9. hostPath volume"
 
 kubectl delete pod hostpath-pod --wait=false > /dev/null 2>&1 || true
 vm 'rm -rf /run/pelagos/containers/hostpath-pod_* /tmp/hostpath-test' > /dev/null 2>&1 || true
-sleep 1
+sleep 2
 
 vm 'mkdir -p /tmp/hostpath-test && printf "written-from-host\n" > /tmp/hostpath-test/file.txt' > /dev/null
 
