@@ -56,7 +56,7 @@ KERNEL_OUT="$OUT/vmlinuz"
 UBUNTU_VMLINUZ="$OUT/ubuntu-vmlinuz"
 UBUNTU_MODULES="$OUT/ubuntu-modules"
 
-PELAGOS_VERSION="0.64.0"
+PELAGOS_VERSION="0.65.2"
 PELAGOS_BIN="$WORK/pelagos-${PELAGOS_VERSION}-aarch64-linux"
 PELAGOS_URL="https://github.com/pelagos-containers/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-aarch64-linux"
 PELAGOS_DNS_BIN="$WORK/pelagos-dns-${PELAGOS_VERSION}-aarch64-linux"
