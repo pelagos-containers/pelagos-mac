@@ -58,14 +58,22 @@ if [[ $SKIP_MAC -eq 0 ]]; then
     echo "[dev-reinstall] signing..."
     bash "$REPO/scripts/sign.sh"
 
-    echo "[dev-reinstall] building local brew tarball..."
-    bash "$REPO/scripts/build-release.sh"
-
-    echo "[dev-reinstall] installing via brew..."
-    brew uninstall pelagos-mac 2>/dev/null || true
-    # Install from the formula file directly to avoid polluting the live brew tap
-    # git repo with local file:// URLs (which conflicts with brew update).
-    HOMEBREW_NO_INSTALL_FROM_API=1 brew install "$REPO/dist/tap/Formula/pelagos-mac.rb"
+    echo "[dev-reinstall] installing binaries (direct copy — brew 6.0+ rejects local formula paths)..."
+    RELEASE="$REPO/target/aarch64-apple-darwin/release"
+    BREW_BIN="/opt/homebrew/bin"
+    BREW_SHARE="/opt/homebrew/share/pelagos-mac"
+    # cp follows symlinks, so these overwrite the Cellar targets in place.
+    cp -f "$RELEASE/pelagos"        "$BREW_BIN/pelagos"
+    cp -f "$RELEASE/pelagos-docker" "$BREW_BIN/pelagos-docker"
+    cp -f "$RELEASE/pelagos-tui"    "$BREW_BIN/pelagos-tui"
+    mkdir -p "$BREW_SHARE"
+    cp -f "$RELEASE/pelagos-pfctl"  "$BREW_SHARE/com.pelagos.pfctl"
+    ln -sf "$BREW_SHARE/com.pelagos.pfctl" "$BREW_BIN/com.pelagos.pfctl" 2>/dev/null || true
+    # Re-sign at the run path — macOS 26 taskgated validates signature there.
+    ENTITLEMENTS="$REPO/pelagos-mac/entitlements.plist"
+    PFCTL_ENTITLEMENTS="$REPO/pelagos-pfctl/entitlements.plist"
+    codesign --sign - --entitlements "$ENTITLEMENTS" --force "$BREW_BIN/pelagos"
+    codesign --sign - --entitlements "$PFCTL_ENTITLEMENTS" --force "$BREW_SHARE/com.pelagos.pfctl"
 
     echo "[dev-reinstall] macOS install done -- $(pelagos --version 2>&1 | head -1)"
 fi

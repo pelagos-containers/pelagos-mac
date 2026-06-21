@@ -56,12 +56,15 @@ KERNEL_OUT="$OUT/vmlinuz"
 UBUNTU_VMLINUZ="$OUT/ubuntu-vmlinuz"
 UBUNTU_MODULES="$OUT/ubuntu-modules"
 
-PELAGOS_VERSION="0.65.2"
+# FALLBACK version — only downloaded when no local musl build exists at PELAGOS_LOCAL_BUILD.
+# Normal dev workflow (full-rebuild.sh) builds from source in the build VM and never hits this.
+# Keep this pin current with the latest release so the fallback isn't stale.
+PELAGOS_VERSION="0.65.39"
 PELAGOS_BIN="$WORK/pelagos-${PELAGOS_VERSION}-aarch64-linux"
 PELAGOS_URL="https://github.com/pelagos-containers/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-aarch64-linux"
 PELAGOS_DNS_BIN="$WORK/pelagos-dns-${PELAGOS_VERSION}-aarch64-linux"
 PELAGOS_DNS_URL="https://github.com/pelagos-containers/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-dns-aarch64-linux"
-# If a local build exists, use it instead of downloading.
+# If a local musl build exists (written by build VM via virtiofs), prefer it over the download.
 PELAGOS_LOCAL_BUILD="$HOME/Projects/pelagos/target/aarch64-unknown-linux-musl/release/pelagos"
 PELAGOS_DNS_LOCAL_BUILD="$HOME/Projects/pelagos/target/aarch64-unknown-linux-musl/release/pelagos-dns"
 
@@ -1187,6 +1190,11 @@ busybox mkdir -p /var/run/netns
 busybox mount -t tmpfs -o size=4m tmpfs /var/run/netns
 busybox ln -sf /var/run/netns /run/netns
 busybox mount -t tmpfs -o size=512m tmpfs /tmp
+
+# First-boot: ensure pelagos data directories exist with correct permissions.
+mkdir -p /var/lib/pelagos/images /var/lib/pelagos/layers /var/lib/pelagos/blobs /var/lib/pelagos/build-cache
+chmod 2775 /var/lib/pelagos/images /var/lib/pelagos/layers /var/lib/pelagos/blobs /var/lib/pelagos/build-cache
+mkdir -p /var/lib/pelagos/volumes /var/lib/pelagos/networks /var/lib/pelagos/rootfs
 
 # Gate on network readiness before pelagos-guest starts pulling images.
 i=0
